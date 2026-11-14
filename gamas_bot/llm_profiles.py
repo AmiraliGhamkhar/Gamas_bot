@@ -12,9 +12,10 @@ Why this module exists:
 
 Verified provider rules:
 
-* **Gemini** (``generativelanguage.googleapis.com/v1beta``): OpenAPI 3.0
-  ``Schema`` uses upper-case ``type`` names, honours ``required`` (without it,
-  every property is optional), and rejects ``additionalProperties``.
+* **Gemini** (``generativelanguage.googleapis.com/v1beta``): legacy
+  ``responseSchema`` uses OpenAPI-style upper-case ``type`` names, while the
+  Gemini 3 ``responseFormat.text.schema`` uses JSON Schema's lower-case types.
+  Both require explicit ``required`` fields and omit unsupported keywords.
 * **AvalAI** uses an OpenAI-compatible chat-completions dialect and has
   model-dependent JSON Schema support.
 * **OpenRouter**: treats ``response_format: {"type": "json_schema"}`` as an
@@ -91,7 +92,7 @@ _REASONING_FORMAT_MODEL_MARKERS = (
 
 
 def to_gemini_schema(node: object) -> object:
-    """Convert a JSON Schema into Google Gemini's OpenAPI 3.0 ``Schema`` dialect.
+    """Convert JSON Schema into Gemini's legacy OpenAPI ``responseSchema`` dialect.
 
     * Upper-cases ``type`` values (``"object"`` -> ``"OBJECT"``) and converts
       ``["<type>", "null"]`` type unions into ``nullable: True``.
@@ -139,6 +140,55 @@ def to_gemini_schema(node: object) -> object:
             }
             continue
         converted[key] = to_gemini_schema(value)
+    return converted
+
+
+def to_gemini_response_format_schema(node: object) -> object:
+    """Convert the supported JSON Schema subset for Gemini 3 ``responseFormat``.
+
+    Unlike the legacy ``responseSchema`` field, ``responseFormat.text.schema``
+    uses JSON Schema's lower-case type names and nullable type unions. Keep the
+    known Gemini keyword allowlist and explicit property requirements, but do
+    not apply the legacy upper-case/``nullable`` conversion.
+    """
+    if isinstance(node, list):
+        return [to_gemini_response_format_schema(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+
+    converted: dict[str, Any] = {}
+    raw_props = node.get("properties")
+    prop_names = set(raw_props) if isinstance(raw_props, dict) else None
+    for key, value in node.items():
+        if key in _GEMINI_UNSUPPORTED_SCHEMA_KEYS:
+            continue
+        if key == "type":
+            if isinstance(value, str):
+                converted["type"] = value.lower()
+            elif isinstance(value, list):
+                converted["type"] = [
+                    item.lower() if isinstance(item, str) else item for item in value
+                ]
+            else:
+                converted["type"] = value
+            continue
+        if key == "required" and isinstance(value, list):
+            kept = [
+                item
+                for item in value
+                if isinstance(item, str)
+                and (prop_names is None or item in prop_names)
+            ]
+            if kept:
+                converted["required"] = kept
+            continue
+        if key == "properties" and isinstance(value, dict):
+            converted["properties"] = {
+                name: to_gemini_response_format_schema(sub)
+                for name, sub in value.items()
+            }
+            continue
+        converted[key] = to_gemini_response_format_schema(value)
     return converted
 
 

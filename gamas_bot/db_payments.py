@@ -35,34 +35,68 @@ class PaymentsRepositoryMixin(DatabaseCore):
         "AND l.kind = 'credit') AS credit_ledger_id"
     )
 
-    async def sync_plans(self, catalog: list[dict[str, Any]]) -> None:
-        statements: list[tuple[str, tuple[Any, ...]]] = []
-        for plan in catalog:
-            statements.append(
-                (
-                    "INSERT INTO plans(code, hours, price, validity_days, is_custom, active) "
-                    "VALUES (?, ?, ?, ?, 0, 1) "
-                    "ON CONFLICT(code) DO UPDATE SET hours = excluded.hours, "
-                    "price = excluded.price, validity_days = excluded.validity_days "
-                    "WHERE is_custom = 0",
-                    (plan["code"], plan["hours"], plan["price"], plan["validity_days"]),
+    async def sync_plans(
+        self, catalog: list[dict[str, Any]], *, full_sync: bool = False
+    ) -> None:
+        """Upsert standard plans; only a full catalog sync retires omissions.
+
+        Custom plans are protected by every statement. Retirement only flips
+        ``active`` on obsolete standard rows, preserving their foreign-key
+        references from payment history and all immutable purchase snapshots.
+        """
+        codes: list[str] = []
+        async with self._transaction():
+            for plan in catalog:
+                code = str(plan["code"])
+                sale_price = int(plan["price"])
+                raw_original_price = plan.get("original_price")
+                if raw_original_price is None:
+                    raw_original_price = plan.get("original_price_toman")
+                original_price = (
+                    sale_price if raw_original_price is None else int(raw_original_price)
                 )
-            )
-        await self._write_many(statements)
+                codes.append(code)
+                await self.db.execute(
+                    "INSERT INTO plans(code, hours, price, validity_days, is_custom, active, original_price) "
+                    "VALUES (?, ?, ?, ?, 0, 1, ?) "
+                    "ON CONFLICT(code) DO UPDATE SET hours = excluded.hours, "
+                    "price = excluded.price, validity_days = excluded.validity_days, "
+                    "original_price = excluded.original_price, active = 1 "
+                    "WHERE is_custom = 0",
+                    (
+                        code,
+                        plan["hours"],
+                        sale_price,
+                        plan["validity_days"],
+                        original_price,
+                    ),
+                )
+            if full_sync:
+                if codes:
+                    placeholders = ",".join("?" for _ in codes)
+                    await self.db.execute(
+                        f"UPDATE plans SET active = 0 WHERE is_custom = 0 "
+                        f"AND code NOT IN ({placeholders})",
+                        tuple(codes),
+                    )
+                else:
+                    await self.db.execute(
+                        "UPDATE plans SET active = 0 WHERE is_custom = 0"
+                    )
 
     async def plans(self) -> list[dict[str, Any]]:
         rows = await _rows(
             self.read_db,
-            "SELECT code, hours, price, validity_days, is_custom, active FROM plans "
-            "WHERE active = 1 ORDER BY price",
+            "SELECT code, hours, price, original_price, validity_days, is_custom, active "
+            "FROM plans WHERE active = 1 ORDER BY price",
         )
         return [dict(row) for row in rows]
 
     async def plan(self, code: str) -> dict[str, Any] | None:
         rows = await _rows(
             self.read_db,
-            "SELECT code, hours, price, validity_days, is_custom, active FROM plans "
-            "WHERE code = ? AND active = 1",
+            "SELECT code, hours, price, original_price, validity_days, is_custom, active "
+            "FROM plans WHERE code = ? AND active = 1",
             (code,),
         )
         return dict(rows[0]) if rows else None

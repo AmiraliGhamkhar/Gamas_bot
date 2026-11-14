@@ -297,12 +297,14 @@ class GamasBot(
                 {
                     "code": plan.code,
                     "hours": plan.included_seconds / 3600,
+                    "original_price": plan.original_price_toman,
                     "price": plan.price_toman,
                     "validity_days": plan.validity_days,
                 }
                 for plan in plan_catalog(self.settings.tariff_values())
-                if not plan.is_free
-            ]
+                if not plan.is_free and plan.purchase_available
+            ],
+            full_sync=True,
         )
         await self.db.recover_interrupted()
         recovered = await self.db.recover_pending_free_uses()

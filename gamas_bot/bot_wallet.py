@@ -23,6 +23,7 @@ from .metrics import METRICS
 from .billing import (
     format_credits_number,
     format_credits_with_hours,
+    format_plan_price,
     format_seconds_as_credits,
     format_toman,
     format_validity,
@@ -111,7 +112,10 @@ class WalletWorkflowMixin:
                     + texts.WALLET_PLAN_ROW_TEMPLATE.format(
                         credits=format_credits_with_hours(credits, hours),
                         validity=validity,
-                        price=format_toman(plan["price"]),
+                        price=format_plan_price(
+                            int(plan["price"]),
+                            int(plan["original_price"]) if plan.get("original_price") is not None else None,
+                        ),
                     )
                 )
                 if self.settings.payment_card_number:

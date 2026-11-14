@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import unittest
 from unittest import mock
@@ -67,26 +68,31 @@ class StructuredOutputAndRoutingTests(unittest.TestCase):
         _url, _headers, payload = llm._build_request_for(route, settings, "S", "U")
         self.assertNotIn("response_format", payload)
 
-    def test_gemini_schema_uses_the_upper_case_dialect(self):
+    def test_gemini_35_uses_native_structured_output_and_thinking_level(self):
         settings = make_settings(
-            note_providers=("gemini",), gemini_api_key="k", note_structured_output=True
+            note_providers=("gemini",), gemini_api_key="k", note_structured_output=True,
+            gemini_thinking_level="medium",
         )
         route = note_routes(settings)[0]
         _url, _headers, payload = llm._build_request_for(
             route, settings, "S", "U", schema=self.schema
         )
         generation = payload["generationConfig"]
-        self.assertEqual(generation["responseMimeType"], "application/json")
-        self.assertEqual(generation["responseSchema"]["type"], "OBJECT")
-        section = generation["responseSchema"]["properties"]["sections"]
-        self.assertEqual(section["type"], "ARRAY")
-        self.assertEqual(section["items"]["type"], "OBJECT")
+        response_text = generation["responseFormat"]["text"]
+        self.assertEqual(response_text["mimeType"], "APPLICATION_JSON")
+        self.assertEqual(response_text["schema"]["type"], "object")
+        section = response_text["schema"]["properties"]["sections"]
+        self.assertEqual(section["type"], "array")
+        self.assertEqual(section["items"]["type"], "object")
         # Gemini requires explicit `required` arrays (properties are optional by
-        # default) and forbids `additionalProperties` inside `responseSchema`.
-        self.assertEqual(generation["responseSchema"]["required"], ["sections"])
+        # default) and forbids `additionalProperties` inside the native schema.
+        self.assertEqual(response_text["schema"]["required"], ["sections"])
         self.assertEqual(section["items"]["required"], ["heading"])
-        self.assertNotIn("additionalProperties", generation["responseSchema"])
+        self.assertNotIn("additionalProperties", response_text["schema"])
         self.assertNotIn("additionalProperties", section["items"])
+        self.assertEqual(generation["thinkingConfig"], {"thinkingLevel": "MEDIUM"})
+        for unsupported in ("temperature", "topP", "topK", "candidateCount", "responseSchema"):
+            self.assertNotIn(unsupported, generation)
 
     def test_openai_style_uses_json_schema_not_strict_mode(self):
         settings = make_settings(
@@ -101,7 +107,7 @@ class StructuredOutputAndRoutingTests(unittest.TestCase):
         self.assertEqual(response_format["json_schema"]["name"], "gamas_notes")
         self.assertNotIn("strict", response_format["json_schema"])
 
-    def test_a_rejected_schema_is_dropped_instead_of_failing_the_request(self):
+    def test_a_rejected_gemini_35_schema_is_dropped_but_json_mode_stays(self):
         settings = make_settings(
             note_providers=("gemini",), gemini_api_key="k", note_structured_output=True
         )
@@ -110,12 +116,17 @@ class StructuredOutputAndRoutingTests(unittest.TestCase):
             route, settings, "S", "U", schema=self.schema
         )
         changed = llm._adjust_rejected_request_param(
-            payload, "400: Unknown name 'responseSchema' at 'generation_config'"
+            payload,
+            "HTTP 400 INVALID_ARGUMENT: schema is unsupported for this model",
+            provider_slug="gemini",
         )
-        self.assertEqual(changed, "generationConfig.responseSchema")
-        self.assertNotIn("responseSchema", payload["generationConfig"])
-        # The JSON mime type stays: the answer must still be a JSON object.
-        self.assertEqual(payload["generationConfig"]["responseMimeType"], "application/json")
+        self.assertEqual(
+            changed, "generationConfig.responseFormat.text.schema_invalid_argument"
+        )
+        response_text = payload["generationConfig"]["responseFormat"]["text"]
+        self.assertNotIn("schema", response_text)
+        self.assertEqual(response_text["mimeType"], "APPLICATION_JSON")
+        self.assertEqual(payload["generationConfig"]["thinkingConfig"], {"thinkingLevel": "MINIMAL"})
 
     def test_openrouter_throughput_routing_is_opt_in_and_openrouter_only(self):
         off = make_settings(
@@ -220,7 +231,7 @@ class RequestBuildingTests(unittest.TestCase):
         self.assertTrue(avalai_url.endswith("/chat/completions"))
         self.assertEqual(avalai_headers["Authorization"], f"Bearer {avalai_route.api_key}")
 
-    def test_gemini_thinking_budget_is_zero_by_default(self):
+    def test_gemini_35_default_uses_the_configured_native_thinking_level(self):
         settings = make_settings(
             note_providers=("gemini",),
             note_provider="",
@@ -231,35 +242,26 @@ class RequestBuildingTests(unittest.TestCase):
         route = note_routes(settings)[0]
         url, _headers, payload = _build_request(settings, "S", "U", route=route)
         self.assertIn(f"models/{DEFAULT_GEMINI_MODEL}:generateContent", url)
+        generation = payload["generationConfig"]
+        self.assertEqual(generation["thinkingConfig"], {"thinkingLevel": "MINIMAL"})
         self.assertEqual(
-            payload["generationConfig"]["thinkingConfig"], {"thinkingBudget": 0}
+            generation["responseFormat"], {"text": {"mimeType": "APPLICATION_JSON"}}
         )
-        # The rest of the generation config is untouched.
-        self.assertEqual(
-            payload["generationConfig"]["responseMimeType"], "application/json"
-        )
+        self.assertNotIn("temperature", generation)
 
-    def test_minus_one_thinking_budget_sends_no_thinking_config(self):
+    def test_legacy_gemini_2_thinking_budget_remains_compatible(self):
         settings = make_settings(
             note_providers=("gemini",),
             note_provider="",
             note_api_key="",
             note_api_base_url="",
             gemini_api_key="g-key",
+            gemini_model="gemini-2.5-flash",
             gemini_thinking_budget=-1,
         )
         _url, _headers, payload = _build_request(settings, "S", "U")
         self.assertNotIn("thinkingConfig", payload["generationConfig"])
-
-    def test_positive_thinking_budget_is_sent_verbatim(self):
-        settings = make_settings(
-            note_providers=("gemini",),
-            note_provider="",
-            note_api_key="",
-            note_api_base_url="",
-            gemini_api_key="g-key",
-            gemini_thinking_budget=24576,
-        )
+        settings = replace(settings, gemini_thinking_budget=24576)
         _url, _headers, payload = _build_request(settings, "S", "U")
         self.assertEqual(
             payload["generationConfig"]["thinkingConfig"]["thinkingBudget"], 24576
@@ -641,6 +643,7 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
             note_api_key="",
             note_api_base_url="",
             gemini_api_key="gemini-key",
+            gemini_model="gemini-2.5-flash",
         )
         session = FakeSession([
             FakeResponse(400, {"error": {
@@ -669,6 +672,7 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
             note_api_key="",
             note_api_base_url="",
             gemini_api_key="gemini-key",
+            gemini_model="gemini-2.5-flash",
         )
         session = FakeSession([
             FakeResponse(400, {"error": {

@@ -93,21 +93,23 @@ class PaymentStateTests(DatabaseTestCase):
 
     async def test_plan_units_expiry_and_existing_balance_are_preserved(self):
         await self.db.sync_plans([
-            {"code": "paid_25h_30d", "hours": 25, "price": 150_000, "validity_days": 30},
-            {"code": "paid_50h_30d", "hours": 50, "price": 250_000, "validity_days": 30},
+            {"code": "paid_26h_30d", "hours": 26, "original_price": 460_000,
+             "price": 229_000, "validity_days": 30},
+            {"code": "paid_30h_30d", "hours": 30, "original_price": 600_000,
+             "price": 299_000, "validity_days": 30},
         ])
         await self.db.grant_free_plan_once(100, 3600)
-        pid = await self.db.create_payment(100, "paid_25h_30d")
+        pid = await self.db.create_payment(100, "paid_26h_30d")
         await self.db.set_payment_receipt(pid, "r.jpg", user_id=100)
         self.assertTrue(await self.db.review_payment(pid, True, 1))
-        self.assertEqual(await self.db.available_seconds(100), 3600 + 25 * 3600)
+        self.assertEqual(await self.db.available_seconds(100), 3600 + 26 * 3600)
         rows = await self.db.db.execute_fetchall(
             "SELECT seconds, created_at, expires_at, payment_id FROM ledger "
             "WHERE payment_id = ?",
             (pid,),
         )
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][0], 90_000)
+        self.assertEqual(rows[0][0], 93_600)
         self.assertEqual(rows[0][3], pid)
         lifetime = datetime.fromisoformat(rows[0][2]) - datetime.fromisoformat(rows[0][1])
         self.assertAlmostEqual(lifetime.total_seconds(), 30 * 86400, delta=2)

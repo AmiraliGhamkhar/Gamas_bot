@@ -82,6 +82,7 @@ from .learning import (
 )
 from .llm import LLMContextOverflowError, LLMOutputBudgetError
 from .metrics import METRICS
+from .notes import SENSITIVITY_UNKNOWN, resolve_note_sensitivity
 from .progress import (
     WORK_PROGRESS_HEADLINE,
     WorkProgress,
@@ -102,6 +103,33 @@ if TYPE_CHECKING:
     from .bot_deps import BotDependencies
 
 logger = logging.getLogger("gamas_bot.bot.learning")
+
+
+def _resolve_learning_sensitivity(
+    settings: Any, sensitivity_text: object, chunks: list[DocChunk]
+) -> str:
+    """Build one source view and classify it without logging source material."""
+    if not isinstance(sensitivity_text, str) or not sensitivity_text.strip():
+        sensitivity_text = "\n".join(str(chunk.text) for chunk in chunks)
+    return resolve_note_sensitivity(settings, sensitivity_text)
+
+
+def _log_quiz_dedupe_diagnostics(input_count: int, accepted_count: int, stage: str) -> None:
+    """Log only item counts when strict quiz deduplication removes repeats."""
+    removed = max(0, int(input_count) - int(accepted_count))
+    if removed:
+        logger.info(
+            "quiz deduplication removed duplicate items stage=%s count=%d",
+            stage,
+            removed,
+            extra={
+                "event": "quiz_dedupe_diagnostics",
+                "dedupe_stage": stage,
+                "dedupe_input_count": max(0, int(input_count)),
+                "dedupe_accepted_count": max(0, int(accepted_count)),
+                "dedupe_rejected_duplicate_count": removed,
+            },
+        )
 
 
 class LearningWorkflowMixin:
@@ -194,6 +222,7 @@ class LearningWorkflowMixin:
                 str(document.get("title") or ""), fallback=FALLBACK_DOCUMENT
             ),
             "chunks": chunks,
+            "sensitivity_text": str(document.get("text") or ""),
         }
 
     async def _claim_generation_budget(
@@ -281,7 +310,17 @@ class LearningWorkflowMixin:
         counts: list[int],
         placeholder: Any,
         stage: str = "در حال تولید محتوا",
+        requested_count: int | None = None,
+        data_sensitivity: str = SENSITIVITY_UNKNOWN,
     ) -> tuple[list[dict[str, Any]], int]:
+        job_requested_count = max(
+            1,
+            int(requested_count if requested_count is not None else sum(counts)),
+        )
+        job_task = (
+            "FLASHCARD_GENERATION" if kind == "deck" else
+            "QUIZ_20" if job_requested_count >= 20 else "QUIZ_GENERATION"
+        )
         schema = FLASHCARD_SCHEMA if kind == "deck" else QUIZ_SCHEMA
         concurrency = (
             1 if kind == "deck"
@@ -383,10 +422,8 @@ class LearningWorkflowMixin:
                         system=system,
                         user=user_prompt,
                         schema=schema,
-                        task=(
-                            "FLASHCARD_GENERATION" if kind == "deck" else
-                            ("QUIZ_20" if int(target_count) >= 20 else "QUIZ_GENERATION")
-                        ),
+                        task=job_task,
+                        data_sensitivity=data_sensitivity,
                         max_output_tokens=min(
                             int(self.settings.learning_max_output_tokens),
                             (2000 if batch <= 10 else 4000) if kind == "deck" else
@@ -415,7 +452,13 @@ class LearningWorkflowMixin:
                         anchored = anchor_items(
                             parsed, allowed, fallback_locator, target_chunk.text, text_key=text_key
                         )
-                        return dedupe([*items, *anchored])
+                        candidates = [*items, *anchored]
+                        merged_items = dedupe(candidates)
+                        if kind != "deck":
+                            _log_quiz_dedupe_diagnostics(
+                                len(candidates), len(merged_items), "chunk_batch"
+                            )
+                        return merged_items
 
                     prev_count = len(items)
                     merged = await run_file_io(validate_and_merge)
@@ -566,6 +609,25 @@ class LearningWorkflowMixin:
         if not chunks:
             await event.respond("متنی برای ساخت محتوا پیدا نشد. فایل دیگری بفرستید.")
             return
+        requested_count = max(1, int(wanted))
+        data_sensitivity = await run_file_io(
+            _resolve_learning_sensitivity,
+            self.settings,
+            source.get("sensitivity_text"),
+            source["chunks"],
+        )
+        logger.info(
+            "learning source sensitivity resolved kind=%s sensitivity=%s chunks=%d",
+            kind,
+            data_sensitivity,
+            len(chunks),
+            extra={
+                "event": "learning_source_sensitivity",
+                "learning_kind": kind,
+                "sensitivity": data_sensitivity,
+                "chunk_count": len(chunks),
+            },
+        )
         await self._ack(event)
         budget_task = asyncio.create_task(
             self._claim_generation_budget(event, user_id, kind, cost, note)
@@ -599,7 +661,7 @@ class LearningWorkflowMixin:
         label = "فلش‌کارت" if kind == "deck" else "سؤال"
         stage = f"آماده‌سازی {label}"
         try:
-            wanted = max(1, int(wanted))
+            wanted = requested_count
             counts = distribute_counts(
                 wanted, [topic_importance_weight(chunk.text) for chunk in chunks]
             )
@@ -622,8 +684,13 @@ class LearningWorkflowMixin:
                     counts=counts,
                     placeholder=progress,
                     stage=texts.LEARNING_PRODUCING.format(label=label),
+                    requested_count=requested_count,
+                    data_sensitivity=data_sensitivity,
                 )
+            generated_count = len(items)
             items = await run_file_io(dedupe_cards if kind == "deck" else dedupe_questions, items)
+            if kind != "deck":
+                _log_quiz_dedupe_diagnostics(generated_count, len(items), "job_merge")
             await progress.update(
                 94,
                 "اعتبارسنجی و آماده‌سازی پیش‌نمایش",
@@ -1246,6 +1313,7 @@ class LearningWorkflowMixin:
                 "doc_id": None,
                 "title": self._item_display_title(item),
                 "chunks": await run_file_io(self._learning_chunks, content),
+                "sensitivity_text": content,
             },
             wanted=int(count),
             cost=int(count) * self.settings.quiz_cost_seconds_per_question,
@@ -1776,6 +1844,7 @@ class LearningWorkflowMixin:
                 "doc_id": None,
                 "title": item_title,
                 "chunks": await run_file_io(self._learning_chunks, content),
+                "sensitivity_text": content,
             },
             wanted=size,
             cost=cost,

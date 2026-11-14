@@ -79,6 +79,7 @@ def deployment_env(**overrides):
         "NOTE_REASONING_EFFORT": "none",
         "NOTE_MAX_OUTPUT_TOKENS": "32768",
         "NOTE_GEMINI_THINKING_BUDGET": "-1",
+        "NOTE_GEMINI_THINKING_LEVEL": "minimal",
         "GEMINI_MODEL": GEMINI_MODEL,
         "OPENROUTER_MODEL": OPENROUTER_MODEL,
     }
@@ -109,6 +110,7 @@ def deployed_settings(**overrides):
         "note_reasoning_effort": "none",
         "note_max_output_tokens": 32768,
         "gemini_thinking_budget": -1,
+        "gemini_thinking_level": "minimal",
         "note_ttfb_timeout": 0.0,
         "note_hedge_after": 0.0,
     }
@@ -256,9 +258,15 @@ class ConfigurationTests(unittest.TestCase):
             self.assertNotIn("response_format", payload)
             if route.style == "gemini":
                 generation = payload["generationConfig"]
-                self.assertNotIn("responseSchema", generation)
-                self.assertNotIn("thinkingConfig", generation)
-                self.assertEqual(generation["responseMimeType"], "application/json")
+                self.assertEqual(
+                    generation["responseFormat"],
+                    {"text": {"mimeType": "APPLICATION_JSON"}},
+                )
+                self.assertEqual(
+                    generation["thinkingConfig"], {"thinkingLevel": "MINIMAL"}
+                )
+                for unsupported in ("responseSchema", "temperature", "topP", "topK", "candidateCount"):
+                    self.assertNotIn(unsupported, generation)
                 self.assertNotIn("reasoning_effort", payload)
             else:
                 self.assertEqual(payload["reasoning_effort"], "none")
@@ -285,7 +293,8 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("Structured output: disabled", summary)
         self.assertIn("Reasoning effort: none", summary)
         self.assertIn("Maximum output tokens: 32768", summary)
-        self.assertIn("Gemini thinking budget: disabled", summary)
+        self.assertIn("Gemini legacy thinking budget: disabled", summary)
+        self.assertIn("Gemini 3.x thinking level: minimal", summary)
         self.assertNotIn("g-key-not-a-secret", summary)
         self.assertNotIn("o-key-not-a-secret", summary)
 
@@ -316,24 +325,29 @@ class ConfigurationTests(unittest.TestCase):
 class GeminiCompatibilityTests(unittest.IsolatedAsyncioTestCase):
     """Non-structured payload, strict validation, bounded INVALID_ARGUMENT fallback."""
 
-    def test_the_tested_working_payload_has_no_schema_or_thinking_config(self):
+    def test_working_gemini_35_payload_uses_native_json_and_thinking_fields(self):
         settings = deployed_settings()
         _url, headers, payload = _build_request_for(
             note_routes(settings)[0], settings, "S", "U", schema=SCHEMA
         )
         self.assertEqual(headers["x-goog-api-key"], "g-key")
         generation = payload["generationConfig"]
-        self.assertEqual(generation["responseMimeType"], "application/json")
+        self.assertEqual(
+            generation["responseFormat"], {"text": {"mimeType": "APPLICATION_JSON"}}
+        )
+        self.assertEqual(generation["thinkingConfig"], {"thinkingLevel": "MINIMAL"})
         self.assertEqual(generation["maxOutputTokens"], 32768)
-        self.assertNotIn("responseSchema", generation)
-        self.assertNotIn("thinkingConfig", generation)
+        for unsupported in ("responseSchema", "temperature", "topP", "topK", "candidateCount"):
+            self.assertNotIn(unsupported, generation)
 
-    def test_structured_mode_still_builds_a_schema_when_enabled(self):
+    def test_structured_mode_builds_native_response_format_schema(self):
         settings = deployed_settings(note_structured_output=True)
         _url, _headers, payload = _build_request_for(
             note_routes(settings)[0], settings, "S", "U", schema=SCHEMA
         )
-        self.assertEqual(payload["generationConfig"]["responseSchema"]["type"], "OBJECT")
+        response_text = payload["generationConfig"]["responseFormat"]["text"]
+        self.assertEqual(response_text["mimeType"], "APPLICATION_JSON")
+        self.assertEqual(response_text["schema"]["type"], "object")
 
     async def test_non_structured_answer_is_parsed_and_domain_validated(self):
         settings = deployed_settings(note_providers=("gemini",))
@@ -343,7 +357,7 @@ class GeminiCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(notes.title, "فیزیولوژی کلیه")
         self.assertEqual(len(notes.sections), 4)
         first_call = session.calls[0]["json"]["generationConfig"]
-        self.assertNotIn("responseSchema", first_call)
+        self.assertNotIn("schema", first_call["responseFormat"]["text"])
 
     async def test_incomplete_notes_json_is_rejected_not_silently_accepted(self):
         settings = deployed_settings(note_providers=("gemini",))
@@ -367,12 +381,16 @@ class GeminiCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session.calls), 2)
         first = session.calls[0]["json"]["generationConfig"]
         second = session.calls[1]["json"]["generationConfig"]
-        self.assertIn("responseSchema", first)
-        self.assertNotIn("responseSchema", second)
-        self.assertEqual(second["responseMimeType"], "application/json")
+        first_text = first["responseFormat"]["text"]
+        second_text = second["responseFormat"]["text"]
+        self.assertIn("schema", first_text)
+        self.assertNotIn("schema", second_text)
+        self.assertEqual(second_text["mimeType"], "APPLICATION_JSON")
         self.assertEqual(second["maxOutputTokens"], 32768)
         # No other field was removed or changed by the compatibility retry.
-        self.assertEqual(set(first) - {"responseSchema"}, set(second))
+        expected = copy.deepcopy(first)
+        expected["responseFormat"]["text"].pop("schema")
+        self.assertEqual(expected, second)
 
     async def test_invalid_argument_without_a_schema_does_not_retry(self):
         settings = deployed_settings(note_providers=("gemini",))

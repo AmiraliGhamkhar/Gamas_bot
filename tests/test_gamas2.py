@@ -20,7 +20,7 @@ from pathlib import Path
 
 import av
 
-from gamas_bot import billing, config
+from gamas_bot import billing
 from gamas_bot.artifacts import (
     KIND_BOOKLET,
     KIND_DOCX,
@@ -106,27 +106,20 @@ class CreditArithmeticTests(unittest.TestCase):
                 self.assertEqual(billing.seconds_to_credits(value), 0)  # type: ignore[arg-type]
                 self.assertEqual(billing.credits_to_seconds(value), 0)  # type: ignore[arg-type]
 
-    def test_price_preview_never_changes_the_catalogue(self):
-        before = [(p.code, p.price_toman) for p in billing.plan_catalog()]
-        preview = billing.price_change_preview(65)
-        self.assertEqual(preview["live_price_toman_per_package"], 65_000)
-        self.assertEqual(preview["proposed_price_toman_per_package"], 65)
-        self.assertTrue(preview["major_discrepancy"])
-        self.assertFalse(preview["activated"])
+    def test_plan_prices_are_not_derived_from_a_global_credit_price(self):
+        plans = [plan for plan in billing.plan_catalog() if not plan.is_free]
         self.assertEqual(
-            [(p.code, p.price_toman) for p in billing.plan_catalog()], before
+            [(plan.included_hours, plan.original_price_toman, plan.price_toman) for plan in plans],
+            [
+                (3, 160_000, 79_000),
+                (6, 200_000, 99_000),
+                (10, 220_000, 109_000),
+                (20, 360_000, 179_000),
+                (26, 460_000, 229_000),
+                (30, 600_000, 299_000),
+            ],
         )
-
-    def test_confirmed_default_is_active_and_literal_65_is_diagnosed(self):
-        settings = make_settings(credit_price_per_100k_toman=65)
-        self.assertTrue(make_settings().v2_tariff_activated)
-        messages = config.check(settings)
-        self.assertTrue(any("CREDIT_PRICE_PER_100K_TOMAN=65" in item for item in messages))
-        # The confirmed 65,000-Toman default must not be treated as a
-        # discrepancy or an unactivated preview tariff.
-        self.assertFalse(
-            any("CREDIT_PRICE_PER_100K_TOMAN" in item for item in config.check(make_settings()))
-        )
+        self.assertFalse(hasattr(make_settings(), "credit_price_per_100k_toman"))
 
 
 # ------------------------------------------------------------ speaker turns --

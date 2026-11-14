@@ -25,7 +25,11 @@ from gamas_bot.learning import (
     parse_quiz_payload,
 )
 from gamas_bot.llm import extract_json_object
-from gamas_bot.llm_profiles import to_gemini_schema, to_strict_openai_json_schema
+from gamas_bot.llm_profiles import (
+    to_gemini_response_format_schema,
+    to_gemini_schema,
+    to_strict_openai_json_schema,
+)
 from gamas_bot.notes import (
     COVERAGE_FILL_SYSTEM_PROMPT,
     NoteSection,
@@ -260,6 +264,22 @@ class ProviderDialectContractTests(unittest.TestCase):
         self.assertNotIn("minItems", converted["properties"]["items"])
         self.assertNotIn("maxItems", converted["properties"]["items"])
 
+    def test_gemini_response_format_schema_keeps_json_schema_type_dialect(self) -> None:
+        raw = {
+            "type": "object",
+            "properties": {
+                "title": {"type": ["string", "null"]},
+                "ignored": {"type": "boolean"},
+            },
+            "required": ["title", "missing"],
+            "additionalProperties": False,
+        }
+        converted = to_gemini_response_format_schema(raw)
+        self.assertEqual(converted["type"], "object")
+        self.assertEqual(converted["properties"]["title"]["type"], ["string", "null"])
+        self.assertEqual(converted["required"], ["title"])
+        self.assertNotIn("additionalProperties", converted)
+
     def test_shared_schema_transform_keeps_required_tags_and_does_not_mutate_input(self) -> None:
         for schema in (QUIZ_SCHEMA, FLASHCARD_SCHEMA):
             original = copy.deepcopy(schema)
@@ -282,8 +302,12 @@ class ProviderDialectContractTests(unittest.TestCase):
         _url, _headers, payload = llm._build_request_for(
             route, settings, "S", "U", schema=QUIZ_SCHEMA
         )
-        self.assertNotIn("responseSchema", payload["generationConfig"])
-        self.assertEqual(payload["generationConfig"]["responseMimeType"], "application/json")
+        generation = payload["generationConfig"]
+        self.assertNotIn("schema", generation["responseFormat"]["text"])
+        self.assertEqual(
+            generation["responseFormat"]["text"]["mimeType"], "APPLICATION_JSON"
+        )
+        self.assertNotIn("temperature", generation)
 
     def test_avalai_sends_documented_json_schema_with_a_json_object_fallback(self) -> None:
         """AvalAI documents ``json_schema``; a refusal degrades, never fails.
@@ -653,9 +677,9 @@ class LearningRobustnessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(bot._learning_max_chars(), 56_000)
                 calls: list[dict] = []
 
-                async def fake_complete_json(_session, _settings, *, system, user, schema=None, max_output_tokens=None, wait_for_capacity=True, task=""):
+                async def fake_complete_json(_session, _settings, *, system, user, schema=None, max_output_tokens=None, wait_for_capacity=True, task="", data_sensitivity=""):
                     batch_no = len(calls)
-                    calls.append({"system": system, "user": user, "schema": schema, "task": task})
+                    calls.append({"system": system, "user": user, "schema": schema, "task": task, "data_sensitivity": data_sensitivity})
                     start = batch_no * 10
                     return {
                         "cards": [

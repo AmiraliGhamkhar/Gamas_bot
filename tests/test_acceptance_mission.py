@@ -17,7 +17,7 @@ from unittest import mock
 
 from PIL import Image
 
-from gamas_bot.billing import PLAN_36_CODE, PLAN_60_CODE, plan_catalog
+from gamas_bot.billing import PLAN_26_CODE, PLAN_30_CODE, plan_catalog
 from gamas_bot.bot import GamasBot, SUPPORT_CATEGORY_BUTTONS
 from gamas_bot.db import Database
 from gamas_bot.media import MediaInfo
@@ -55,6 +55,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
             {
                 "code": plan.code,
                 "hours": plan.included_seconds / 3600,
+                "original_price": plan.original_price_toman,
                 "price": plan.price_toman,
                 "validity_days": plan.validity_days,
             }
@@ -78,7 +79,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         return event
 
     async def new_order(self) -> int:
-        return await self.db.create_payment(USER, PLAN_36_CODE)
+        return await self.db.create_payment(USER, PLAN_30_CODE)
 
     async def upload_receipt_photo(self, payment_id: int):
         source = self.root / f"receipt-{payment_id}.png"
@@ -108,12 +109,12 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         buy = await self.press(USER, "wallet")
         screen = buy.edits[-1][0]
         self.assertIn("۱۰۰٬۰۰۰ اعتبار (۳ ساعت)", screen)
-        self.assertIn("۶۵٬۰۰۰ تومان", screen)
-        self.assertIn("۲٬۰۰۰٬۰۰۰ اعتبار (۶۰ ساعت)", screen)
-        self.assertIn("۱٬۳۰۰٬۰۰۰ تومان", screen)
+        self.assertIn("قیمت اصلی: ۱۶۰٬۰۰۰ تومان | قیمت نهایی: ۷۹٬۰۰۰ تومان", screen)
+        self.assertIn("۸۶۶٬۶۶۷ اعتبار (۲۶ ساعت)", screen)
+        self.assertIn("قیمت اصلی: ۴۶۰٬۰۰۰ تومان | قیمت نهایی: ۲۲۹٬۰۰۰ تومان", screen)
         self.assertIn("هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت", screen)
 
-        plan_tap = await self.press(USER, f"plan:{PLAN_36_CODE}")
+        plan_tap = await self.press(USER, f"plan:{PLAN_30_CODE}")
         order_id = (await self.db.pending_payments())[0]["payment_id"]
         self.assertEqual((await self.db.payment(order_id))["status"], "awaiting_payment")
         order_screen = plan_tap.responses[-1][0]
@@ -144,7 +145,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         caption = admin_deliveries[0]["caption"]
         for expected in (
             to_persian_digits(order_id), str(USER),
-            "۱٬۲۰۰٬۰۰۰ اعتبار", "۷۸۰٬۰۰۰ تومان",
+            "۱٬۰۰۰٬۰۰۰ اعتبار", "۲۹۹٬۰۰۰ تومان",
         ):
             self.assertIn(expected, caption)
 
@@ -166,7 +167,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(approved["status"], "approved")
         self.assertEqual(approved["reviewed_by"], ADMIN)
         self.assertIsNotNone(approved["reviewed_at"])
-        self.assertEqual(await self.db.available_seconds(USER), 36 * 3600)
+        self.assertEqual(await self.db.available_seconds(USER), 30 * 3600)
         self.assertTrue(any(
             text.startswith("✅ پرداخت شما تأیید شد. اشتراک شما فعال است.")
             for text in self.texts_to(USER)
@@ -174,7 +175,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
 
         # A repeated approval (stale keyboard / retry) never credits twice.
         await self.press(ADMIN, f"payv:{order_id}:a:yes")
-        self.assertEqual(await self.db.available_seconds(USER), 36 * 3600)
+        self.assertEqual(await self.db.available_seconds(USER), 30 * 3600)
         rows = await self.db.db.execute_fetchall(
             "SELECT COUNT(*) FROM ledger WHERE payment_id = ? AND kind = 'credit'",
             (order_id,),
@@ -232,13 +233,13 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_catalogue_units_and_free_plan_invariants(self):
         catalogue = {plan.code: plan for plan in plan_catalog(self.settings.tariff_values())}
-        standard = catalogue[PLAN_36_CODE]
-        plus = catalogue[PLAN_60_CODE]
+        standard = catalogue[PLAN_30_CODE]
+        plus = catalogue[PLAN_26_CODE]
         free = catalogue["free_1h"]
         self.assertEqual((standard.included_seconds, standard.price_toman, standard.validity_days),
-                         (36 * 3600, 780_000, 30))
+                         (30 * 3600, 299_000, 30))
         self.assertEqual((plus.included_seconds, plus.price_toman, plus.validity_days),
-                         (60 * 3600, 1_300_000, 30))
+                         (26 * 3600, 229_000, 30))
         self.assertEqual((free.included_seconds, free.price_toman), (3600, 0))
 
         self.assertTrue(await self.db.grant_free_plan_once(USER, 3600))
@@ -357,14 +358,14 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.count_ticket_messages(ticket["id"]), 2)
         self.assertEqual((await self.db.get_ticket(ticket["id"]))["status"], "awaiting_user")
 
-        await self.press(USER, f"plan:{PLAN_60_CODE}")
+        await self.press(USER, f"plan:{PLAN_26_CODE}")
         payment_id = (await self.db.pending_payments())[0]["payment_id"]
         await self.db.set_payment_receipt(payment_id, "receipt.jpg", user_id=USER)
         await self.press(ADMIN, f"payv:{payment_id}:a:yes")
         self.assertEqual((await self.db.payment(payment_id))["status"], "approved")
-        self.assertEqual(await self.db.available_seconds(USER), 60 * 3600)
+        self.assertEqual(await self.db.available_seconds(USER), 26 * 3600)
         await self.press(ADMIN, f"payv:{payment_id}:a:yes")
-        self.assertEqual(await self.db.available_seconds(USER), 60 * 3600)
+        self.assertEqual(await self.db.available_seconds(USER), 26 * 3600)
 
     # ------------------------------------------------------------ main menu
     async def test_upload_without_mode_button_runs_the_pipeline_and_offers_every_artifact(self):

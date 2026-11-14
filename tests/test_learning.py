@@ -79,6 +79,42 @@ class LearningHelperTests(unittest.TestCase):
         self.assertEqual(bound_content_text("  متن کوتاه  "), "متن کوتاه")
         self.assertEqual(bound_content_text(None), "")
 
+    def test_quiz_parser_diagnostics_are_count_only(self):
+        private_question = "private-question-should-not-be-logged"
+        private_source = "private-source-should-not-be-logged"
+        payload = {
+            "questions": [
+                {
+                    "question": private_question,
+                    "options": ["یک", "یک", "سه", "چهار"],
+                    "correct": 0,
+                    "explain": "توضیح",
+                    "source": private_source,
+                    "difficulty": "medium",
+                }
+            ]
+        }
+        with mock.patch("gamas_bot.learning.logger.info") as log_info:
+            self.assertEqual(parse_quiz_payload(payload, 1), [])
+        extra = log_info.call_args.kwargs["extra"]
+        self.assertEqual(extra["quiz_rejected_duplicate_option"], 1)
+        self.assertEqual(extra["quiz_rejected_item_count"], 1)
+        self.assertNotIn(private_question, repr(extra))
+        self.assertNotIn(private_source, repr(extra))
+
+    def test_quiz_parser_counts_an_item_once_even_if_multiple_fields_fail(self):
+        payload = {
+            "questions": [
+                {"options": ["یک", "دو", "سه", "چهار"], "correct": 0}
+            ]
+        }
+        with mock.patch("gamas_bot.learning.logger.info") as log_info:
+            self.assertEqual(parse_quiz_payload(payload, 1), [])
+        extra = log_info.call_args.kwargs["extra"]
+        self.assertEqual(extra["quiz_rejected_question"], 1)
+        self.assertEqual(extra["quiz_rejected_explanation"], 1)
+        self.assertEqual(extra["quiz_rejected_item_count"], 1)
+
     def test_quiz_payload_validation_drops_malformed_and_remaps_shuffle(self):
         payload = {
             "questions": [
@@ -134,7 +170,10 @@ class LearningHelperTests(unittest.TestCase):
         ]}
         with self.assertLogs("gamas_bot.learning", level="DEBUG") as logs:
             self.assertEqual(parse_quiz_payload(payload, 3), [])
-        self.assertEqual(len(logs.output), 3)
+        self.assertEqual(
+            sum("dropped quiz item with invalid option shape" in line for line in logs.output),
+            3,
+        )
 
     def test_quiz_payload_respects_requested_count(self):
         parsed = parse_quiz_payload(quiz_payload(10), 3, rng=random.Random(1))
@@ -1141,6 +1180,85 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
     def _labels(buttons) -> list[str]:
         return [button.text for row in buttons for button in row]
 
+    async def test_quiz_task_uses_original_requested_count_and_propagates_sensitivity(self):
+        from gamas_bot.doc_extract import DocChunk
+
+        requests = []
+
+        async def provider(_session, _settings, **kwargs):
+            requests.append(kwargs)
+            return quiz_payload(1)
+
+        chunk = DocChunk(0, "بخش ۱", ("بخش ۱",), "متن علمی برای آزمون")
+        with mock.patch("gamas_bot.bot.complete_json", new=provider):
+            for count in (5, 10, 20):
+                await self.bot._generate_chunks(
+                    kind="quiz",
+                    chunks=[chunk],
+                    counts=[1],
+                    placeholder=mock.AsyncMock(),
+                    requested_count=count,
+                    data_sensitivity="STANDARD_EDUCATIONAL",
+                )
+
+        self.assertEqual(
+            [request["task"] for request in requests],
+            ["QUIZ_GENERATION", "QUIZ_GENERATION", "QUIZ_20"],
+        )
+        self.assertEqual(
+            [request["data_sensitivity"] for request in requests],
+            ["STANDARD_EDUCATIONAL"] * 3,
+        )
+
+    async def test_source_sensitivity_is_resolved_once_and_passed_to_generation(self):
+        from gamas_bot.doc_extract import DocChunk
+
+        private_text = "private-source-sentinel شماره پروندهٔ ۱۲۳"
+        source = {
+            "item_id": self.item_id,
+            "doc_id": None,
+            "title": "جزوه",
+            "chunks": [DocChunk(0, "بخش ۱", ("بخش ۱",), "محتوای آموزشی")],
+            "sensitivity_text": private_text,
+        }
+        questions = [
+            {
+                "question": f"سؤال {index}",
+                "options": ["الف", "ب", "ج", "د"],
+                "correct_index": 0,
+                "explanation": "توضیح معتبر",
+                "source": "بخش ۱",
+                "difficulty": "medium",
+            }
+            for index in range(5)
+        ]
+        with mock.patch(
+            "gamas_bot.bot_learning.resolve_note_sensitivity",
+            return_value="SENSITIVE",
+        ) as resolve, mock.patch.object(
+            self.bot,
+            "_claim_generation_budget",
+            new=mock.AsyncMock(return_value=(False, False, None)),
+        ), mock.patch.object(
+            self.bot,
+            "_generate_chunks",
+            new=mock.AsyncMock(return_value=(questions, 0)),
+        ) as generate, mock.patch("gamas_bot.bot_learning.logger.info") as log_info:
+            await self.bot._generate_learning(
+                self._event(b"quiz:hub"),
+                user_id=OWNER,
+                kind="quiz",
+                source=source,
+                wanted=5,
+                cost=0,
+                note="test",
+                title="جزوه",
+            )
+
+        resolve.assert_called_once_with(self.settings, private_text)
+        self.assertEqual(generate.await_args.kwargs["data_sensitivity"], "SENSITIVE")
+        self.assertNotIn(private_text, repr(log_info.call_args_list))
+
     async def test_paid_quiz_generation_shortfall_refunds_on_save(self):
         from gamas_bot.doc_extract import DocChunk
 
@@ -1619,7 +1737,7 @@ class CallbackBudgetTests(unittest.TestCase):
             f"quiz:next:{big}",
             f"fc:flip:{big}:{big}",
             f"fc:delok:{big}",
-            f"adm:bgok:{big}:paid_50h_30d",
+            f"adm:bgok:{big}:paid_30h_30d",
             f"lib:it:{big}",
         ]
         for sample in samples:

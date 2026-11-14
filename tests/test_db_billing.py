@@ -443,26 +443,90 @@ class AtomicityTests(DatabaseTestCase):
 
 
 class PlanTests(DatabaseTestCase):
-    async def test_catalog_sync_and_custom_protection(self):
-        catalog = [
-            {"code": plan.code, "hours": plan.included_seconds / 3600,
-             "price": plan.price_toman, "validity_days": plan.validity_days}
-            for plan in plan_catalog() if not plan.is_free
+    @staticmethod
+    def catalog(*, only: tuple[str, ...] | None = None) -> list[dict[str, object]]:
+        return [
+            {
+                "code": plan.code,
+                "hours": plan.included_seconds / 3600,
+                "original_price": plan.original_price_toman,
+                "price": plan.price_toman,
+                "validity_days": plan.validity_days,
+            }
+            for plan in plan_catalog()
+            if not plan.is_free and (only is None or plan.code in only)
         ]
+
+    async def test_catalog_sync_uses_explicit_original_and_sale_prices(self):
+        catalog = self.catalog()
         await self.db.sync_plans(catalog)
         plans = await self.db.plans()
         codes = {plan["code"] for plan in plans}
-        self.assertIn("paid_3h_30d", codes)
-        self.assertIn("paid_60h_30d", codes)
+        self.assertEqual(len([plan for plan in plans if not plan["is_custom"]]), 7)
+        self.assertIn("paid_30h_30d", codes)
+        self.assertNotIn("paid_60h_30d", codes)
+        self.assertNotIn("paid_50h_30d", codes)
         self.assertNotIn("free_1h", codes)  # the free plan is granted, not sold
 
-        # Re-sync updates the price.
-        await self.db.sync_plans([
-            {"code": "paid_3h_30d", "hours": 3, "price": 65000, "validity_days": 30},
-        ])
         plan = await self.db.plan("paid_3h_30d")
         assert plan is not None
-        self.assertEqual(plan["price"], 65000)
+        self.assertEqual((plan["original_price"], plan["price"]), (160_000, 79_000))
+
+    async def test_payment_snapshot_and_charge_keep_the_final_sale_price(self):
+        await self.db.sync_plans(self.catalog(only=("paid_3h_30d",)))
+        payment_id = await self.db.create_payment(100, "paid_3h_30d")
+        payment = await self.db.payment(payment_id)
+        assert payment is not None
+        self.assertEqual(payment["purchased_price"], 79_000)
+        self.assertEqual(payment["purchased_seconds"], 3 * 3600)
+
+        # A later price change affects only future orders, not this snapshot.
+        await self.db.sync_plans([
+            {"code": "paid_3h_30d", "hours": 3, "original_price": 170_000,
+             "price": 89_000, "validity_days": 30},
+        ])
+        unchanged = await self.db.payment(payment_id)
+        assert unchanged is not None
+        self.assertEqual(unchanged["purchased_price"], 79_000)
+        self.assertEqual(unchanged["purchased_seconds"], 3 * 3600)
+
+        await self.db.set_payment_receipt(payment_id, "receipt.jpg", user_id=100)
+        self.assertTrue(await self.db.review_payment(payment_id, True, 1))
+        self.assertEqual(await self.db.available_seconds(100), 3 * 3600)
+        stats = await self.db.stats()
+        self.assertEqual(stats["toman_approved"], 79_000)
+
+    async def test_partial_sync_is_non_destructive_and_full_sync_retires_only_standard_rows(self):
+        payment_id = await self.db.create_payment(100, "paid_5h_30d")
+        await self.db.db.execute(
+            "INSERT INTO plans(code, hours, price, original_price, validity_days, is_custom, active) "
+            "VALUES ('custom_7h', 7, 12000, 15000, 30, 1, 1)"
+        )
+        await self.db.db.commit()
+        catalog = self.catalog()
+
+        # The default partial sync never hides omitted standard or custom rows.
+        await self.db.sync_plans(catalog)
+        old = await self.db.plan("paid_5h_30d")
+        self.assertIsNotNone(old)
+
+        # Full startup sync deactivates omitted standard plans, but never deletes
+        # or deactivates custom rows and never rewrites a historical payment.
+        await self.db.sync_plans(catalog, full_sync=True)
+        self.assertIsNone(await self.db.plan("paid_5h_30d"))
+        custom = await self.db.plan("custom_7h")
+        self.assertIsNotNone(custom)
+        assert custom is not None
+        self.assertEqual(custom["is_custom"], 1)
+        row = await self.db.db.execute_fetchall(
+            "SELECT active, is_custom FROM plans WHERE code = 'paid_5h_30d'"
+        )
+        self.assertEqual(tuple(row[0]), (0, 0))
+        history = await self.db.payment(payment_id)
+        assert history is not None
+        self.assertEqual(history["status"], "awaiting_payment")
+        self.assertEqual(history["purchased_price"], 50_000)
+        self.assertEqual(history["purchased_seconds"], 5 * 3600)
 
 
 class SubmissionTests(DatabaseTestCase):

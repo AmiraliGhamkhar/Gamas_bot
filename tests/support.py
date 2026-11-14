@@ -24,9 +24,11 @@ from gamas_bot.config import (
     DEFAULT_AVALAI_MODEL,
     DEFAULT_GEMINI_MODEL,
     DEFAULT_GEMINI_THINKING_BUDGET,
+    DEFAULT_GEMINI_THINKING_LEVEL,
     DEFAULT_OPENROUTER_MODEL,
     Settings,
 )
+from gamas_bot.billing import FREE_PLAN_HOURS, PAID_PLAN_SPECS
 
 AUDIO_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/audio"
 VIDEO_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/video"
@@ -419,6 +421,20 @@ def docx_text(docx_bytes: bytes) -> str:
     return "\n".join(parts)
 
 
+def _default_plan_settings() -> dict[str, int]:
+    values = {"free_plan_hours": FREE_PLAN_HOURS}
+    for spec in PAID_PLAN_SPECS:
+        values.update(
+            {
+                f"{spec.key}_hours": spec.hours,
+                f"{spec.key}_original_price_toman": spec.original_price_toman,
+                f"{spec.key}_price_toman": spec.price_toman,
+                f"{spec.key}_validity_days": spec.validity_days,
+            }
+        )
+    return values
+
+
 def make_settings(**overrides) -> Settings:
     """A valid v3 Settings object; ``overrides`` may replace any field."""
     base = Settings(
@@ -507,6 +523,7 @@ def make_settings(**overrides) -> Settings:
         # Zero by default, matching the shipped configuration: note requests
         # must never wait on hidden reasoning tokens.
         gemini_thinking_budget=DEFAULT_GEMINI_THINKING_BUDGET,
+        gemini_thinking_level=DEFAULT_GEMINI_THINKING_LEVEL,
         note_context_tokens=131072,
         note_mode="full",
         note_max_output_tokens=4096,
@@ -547,25 +564,7 @@ def make_settings(**overrides) -> Settings:
         receipt_retention_days=90,
         max_payment_receipt_bytes=5_000_000,
         transcript_retention_days=0,
-        free_plan_hours=1,
-        plan_3_hours=3,
-        plan_3_price_toman=65_000,
-        plan_3_validity_days=30,
-        plan_9_hours=9,
-        plan_9_price_toman=195_000,
-        plan_9_validity_days=30,
-        plan_12_hours=12,
-        plan_12_price_toman=260_000,
-        plan_12_validity_days=30,
-        plan_24_hours=24,
-        plan_24_price_toman=520_000,
-        plan_24_validity_days=30,
-        plan_36_hours=36,
-        plan_36_price_toman=780_000,
-        plan_36_validity_days=30,
-        plan_60_hours=60,
-        plan_60_price_toman=1_300_000,
-        plan_60_validity_days=30,
+        **_default_plan_settings(),
         max_concurrent_downloads=2,
         max_concurrent_uploads=2,
         office_job_concurrency=2,
@@ -587,9 +586,18 @@ def make_settings(**overrides) -> Settings:
         subscription_cache_seconds=0.0,
         subscription_timeout_seconds=20.0,
         telegram_api_base_url="https://api.telegram.org",
-        plan_values={},
+        plan_values=_default_plan_settings(),
     )
-    return replace(base, **overrides) if overrides else base
+    if not overrides:
+        return base
+    changes = dict(overrides)
+    if "plan_values" not in changes:
+        values = dict(base.plan_values)
+        values.update(
+            {name: value for name, value in overrides.items() if name in values}
+        )
+        changes["plan_values"] = values
+    return replace(base, **changes)
 
 
 def wav_bytes(

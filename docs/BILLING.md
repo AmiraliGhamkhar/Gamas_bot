@@ -4,29 +4,35 @@ Credit («اعتبار») is the user-facing unit. The ledger itself stores **in
 seconds** and is append-only: never edit history to repair a balance, use the
 audited operations instead.
 
-## The unit
+## The unit and standard catalog
 
-**100 000 credits = 3 hours = 10 800 seconds = 65 000 Toman** (≈ 21 667 T/hour).
-`seconds_to_credits()` rounds up, `credits_to_seconds()` rounds down, so a shown
-balance is never overstated. The arithmetic uses exact fractions — no float
-crosses a billing boundary.
+**100 000 credits = 3 hours = 10 800 seconds.** This is only the usage-unit
+conversion; it does not define plan prices. `seconds_to_credits()` rounds up,
+`credits_to_seconds()` rounds down, so a shown balance is never overstated. The
+arithmetic uses exact fractions — no float crosses a billing boundary.
 
-| Plan code | Duration | Credit | Toman |
-| --- | --- | --- | --- |
-| `free_1h` | 1 h | 33 334 (grant) | 0 |
-| `paid_3h_30d` | 3 h | 100 000 | 65 000 |
-| `paid_9h_30d` | 9 h | 300 000 | 195 000 |
-| `paid_12h_30d` | 12 h | 400 000 | 260 000 |
-| `paid_24h_30d` | 24 h | 800 000 | 520 000 |
-| `paid_36h_30d` | 36 h | 1 200 000 | 780 000 |
-| `paid_60h_30d` | 60 h | 2 000 000 | 1 300 000 |
+| Plan code | Duration | Credit | Original/list price | Final/sale price |
+| --- | ---: | ---: | ---: | ---: |
+| `free_1h` | 1 h | 33 334 (grant) | — | 0 |
+| `paid_3h_30d` | 3 h | 100 000 | 160 000 | 79 000 |
+| `paid_6h_30d` | 6 h | 200 000 | 200 000 | 99 000 |
+| `paid_10h_30d` | 10 h | 333 334 | 220 000 | 109 000 |
+| `paid_20h_30d` | 20 h | 666 667 | 360 000 | 179 000 |
+| `paid_26h_30d` | 26 h | 866 667 | 460 000 | 229 000 |
+| `paid_30h_30d` | 30 h | 1 000 000 | 600 000 | 299 000 |
 
-Every paid plan is a whole number of 3-hour packages with 30-day validity, so the
-hourly price is identical everywhere. Plans come from `PLAN_*` values in `.env`
-(see [Configuration](CONFIGURATION.md#tariff)); a non-positive override falls
-back to the default and `--check` reports it. Startup synchronizes only the
-built-in active catalogue — orders, snapshots, custom plans and balances are
-never rewritten.
+All six paid plans have 30-day validity. Original/list and final/sale prices
+are explicit per plan; they are not derived from hours or the credit conversion.
+The wallet shows both prices, and new payment snapshots and charges use only the
+final/sale price. The 50-hour tier is intentionally not configured or sold
+until both of its prices are supplied.
+
+Plans are centralized in `billing.PAID_PLAN_SPECS`. Optional `PLAN_*` settings
+in `.env` override each duration, original price, sale price and validity;
+non-positive overrides fall back to the corresponding catalog default and
+`--check` reports them. A full startup sync retires obsolete built-in plans
+without touching custom plans, payment history, snapshots or balances; partial
+syncs do not deactivate unrelated plans.
 
 ## Transcription charges
 
