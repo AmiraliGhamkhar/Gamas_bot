@@ -241,6 +241,7 @@ class NotesDocxTests(unittest.TestCase):
         document = docx_library.Document(io.BytesIO(data))
         self.assertEqual(document.core_properties.title, "فارماکولوژی دیابت")
         self.assertEqual(document.core_properties.author, "Gamas Bot")
+        self.assertEqual(document.core_properties.comments, "")
 
 
 class PracticalTipsAndTablesTests(unittest.TestCase):
@@ -488,7 +489,8 @@ class RtlAlignmentContractTests(unittest.TestCase):
                     bad_bidi.append(paragraph_text(paragraph)[:40])
         self.assertEqual(bad_right_jc, [])
         self.assertEqual(bad_bidi, [])
-        self.assertGreater(paragraphs, 20)
+        # Operational-date lines are intentionally absent from booklets.
+        self.assertGreaterEqual(paragraphs, 20)
 
     def test_body_uses_logical_start_for_headings_and_justifies_prose(self):
         data = build_notes_docx(full_notes(), meta=META)

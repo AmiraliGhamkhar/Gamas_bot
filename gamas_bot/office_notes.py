@@ -20,9 +20,12 @@ from .learning import MAX_MODEL_INPUT_CHARS
 from .llm import LLMError, complete_json
 from .notes import (
     MAX_SOURCE_LOCATORS_PER_SECTION,
+    NoteQualityError,
     NoteSection,
     StructuredNotes,
     StructuringError,
+    enforce_final_acceptance,
+    ensure_structured_booklet,
     gate_notes,
     structure_document,
 )
@@ -319,7 +322,15 @@ def basic_source_booklet(
         )
     if not sections:
         raise StructuringError("متن قابل استفاده‌ای برای ساخت جزوهٔ منبع‌محور پیدا نشد.")
-    return StructuredNotes(title=title or "جزوهٔ منبع‌محور", sections=tuple(sections))
+    review_source = next(
+        (paragraph for section in reversed(sections) for paragraph in reversed(section.paragraphs) if paragraph),
+        "",
+    )
+    return StructuredNotes(
+        title=title or "جزوهٔ منبع‌محور",
+        sections=tuple(sections),
+        final_review=(review_source,) if review_source else (),
+    )
 
 
 def _locator_source_map(chunks: Iterable[OfficeSourceChunk]) -> dict[str, str]:
@@ -378,9 +389,17 @@ def _full_result_is_grounded(
     allowed_locators: tuple[str, ...],
     locator_sources: dict[str, str],
 ) -> bool:
+    try:
+        notes = ensure_structured_booklet(notes, source)
+    except StructuringError:
+        return False
     if not notes.has_content or not notes.sections:
         return False
-    _, report = gate_notes(notes, source, strict=True, mode="full")
+    notes, report = gate_notes(notes, source, strict=True, mode="full")
+    try:
+        enforce_final_acceptance(notes, report, mode="full", stage="office_final")
+    except NoteQualityError:
+        return False
     if not _audit_meets_office_floor(report.audit, compact=False):
         logger.warning("Office full booklet rejected by evidence gate %s", report.audit.summary())
         return False
@@ -415,6 +434,13 @@ async def generate_full_booklet(
             "و سند را به چند بخش کوچک‌تر تقسیم و دوباره بفرستید."
         )
     fallback = basic_source_booklet(chunks, title=title)
+    fallback = ensure_structured_booklet(fallback, source)
+    fallback, fallback_report = gate_notes(fallback, source, strict=True, mode="full")
+    # The extractive fallback is still a booklet path: it must clear the same
+    # final contract before any caller can render or deliver it.
+    fallback = enforce_final_acceptance(
+        fallback, fallback_report, mode="full", stage="office_fallback"
+    )
     if not settings.note_configured or session is None:
         return fallback, True
     locator_sources = _locator_source_map(chunks)

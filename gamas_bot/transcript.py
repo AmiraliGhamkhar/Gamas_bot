@@ -363,8 +363,16 @@ class TranscriptDocument:
         return "\n\n".join(lines)
 
     def llm_document(self) -> str:
-        """The text passed to the note model: clean paragraphs, no timestamps."""
-        return self.plain()
+        """Educational source text: clean paragraphs without transcript metadata.
+
+        Speaker identities and timing remain available to transcript persistence,
+        billing and diarization workflows, but they are deliberately excluded
+        from every booklet-generation input so the booklet model cannot turn
+        conversation mechanics into educational content.
+        """
+        return "\n\n".join(
+            paragraph.text.strip() for paragraph in self.paragraphs if paragraph.text.strip()
+        )
 
 
 

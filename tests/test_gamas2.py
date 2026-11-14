@@ -51,7 +51,7 @@ from gamas_bot.media_worker import (
     _transcode,
     adaptive_filters,
 )
-from gamas_bot.notes import StructuredNotes
+from gamas_bot.notes import NoteSection, StructuredNotes
 from gamas_bot.stt import PROVIDERS, order_specs_for_diarization
 from gamas_bot.transcript import (
     Paragraph,
@@ -448,18 +448,22 @@ class DeliveryMarkupTests(unittest.TestCase):
         self.assertNotIn(texts.DELIVERY_ROW_LEARNING, body)
         self.assertIn(texts.LEARNING_GENERATION_UNAVAILABLE, body)
 
-    def test_booklet_appendix_is_source_derived(self):
+    def test_booklet_contract_excludes_transcript_metadata(self):
         notes = StructuredNotes(
-            title="جزوه", summary="خلاصه",
-            speakers=("استاد — ۱۲۰ واژه",),
-            timeline=("[۰۰:۳۰] مقدمه",),
+            title="جزوه",
+            summary="خلاصه",
+            sections=(NoteSection(heading="مبحث", paragraphs=("محتوای آموزشی",)),),
+            final_review=("محتوای آموزشی",),
         )
         payload = notes.to_payload()
-        self.assertEqual(payload["speakers"], ["استاد — ۱۲۰ واژه"])
-        self.assertEqual(payload["timeline"], ["[۰۰:۳۰] مقدمه"])
+        forbidden = {
+            "speaker", "speakers", "speaker_id", "speaker_name", "speaker_turn",
+            "timeline", "timestamp", "timestamps", "start_time", "end_time",
+        }
+        self.assertFalse(forbidden & set(payload))
         restored = StructuredNotes.from_payload(payload)
-        self.assertEqual(restored.speakers, notes.speakers)
-        self.assertIn("گویندگان", notes.to_markdown())
+        self.assertFalse(any(field in forbidden for field in restored.__dataclass_fields__))
+        self.assertNotIn("گویندگان", notes.to_markdown())
 
 
 # --------------------------------------------------------- DB / migration ---

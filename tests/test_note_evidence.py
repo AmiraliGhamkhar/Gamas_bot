@@ -22,6 +22,7 @@ from gamas_bot.notes import (
     NoteTable, PracticalTip, StructuredNotes,
     assess_completeness,
     booklet_skeleton,
+    instructional_source_text,
 )
 from gamas_bot.notes_evidence import (
     STANDARD_EQUIVALENTS,
@@ -301,7 +302,7 @@ class CorpusBenchmarkTests(unittest.TestCase):
         for entry in CORPUS["fixtures"]:
             with self.subTest(fixture=entry["id"]):
                 transcript, reference = load_fixture(entry)
-                audit = audit_notes(transcript, reference)
+                audit = audit_notes(instructional_source_text(transcript), reference)
                 self.assertGreaterEqual(
                     audit.number_coverage, entry["min_number_coverage"], msg=audit.summary()
                 )
@@ -321,7 +322,7 @@ class CorpusBenchmarkTests(unittest.TestCase):
         for entry in CORPUS["fixtures"]:
             with self.subTest(fixture=entry["id"]):
                 transcript, reference = load_fixture(entry)
-                audit = audit_notes(transcript, reference)
+                audit = audit_notes(instructional_source_text(transcript), reference)
                 self.assertEqual(
                     [signal.label for signal in audit.missing if signal.kind == "number"],
                     [],
@@ -334,7 +335,7 @@ class CorpusBenchmarkTests(unittest.TestCase):
         for entry in CORPUS["fixtures"]:
             with self.subTest(fixture=entry["id"]):
                 transcript, reference = load_fixture(entry)
-                audit = audit_notes(transcript, reference)
+                audit = audit_notes(instructional_source_text(transcript), reference)
                 if entry["id"] == "05_code_switching_tech":
                     self.assertGreaterEqual(audit.term_coverage, 0.8, msg=audit.summary())
                     self.assertTrue(audit.missing)
@@ -365,21 +366,29 @@ class CorpusBenchmarkTests(unittest.TestCase):
         entry = next(item for item in CORPUS["fixtures"] if item["id"] == "04_persian_only_literature")
         transcript, reference = load_fixture(entry)
         self.assertEqual(extract_signals(transcript), frozenset())
-        audit = audit_notes(transcript, reference)
+        audit = audit_notes(instructional_source_text(transcript), reference)
         self.assertEqual(audit.missing, ())
         self.assertEqual(audit.fabricated, ())
 
-    def test_slide_numbers_are_not_content_but_the_semester_is(self):
+    def test_presentation_semester_metadata_is_not_booklet_content(self):
         entry = next(item for item in CORPUS["fixtures"] if item["id"] == "06_pptx_slide_outline")
         transcript, _ = load_fixture(entry)
+        # The archive keeps the original slide metadata, while the booklet
+        # grounding projection excludes it so no semester/source label appears
+        # in a learner-facing artifact or becomes a required source number.
         numbers = [signal.value for signal in extract_signals(transcript) if signal.kind == "number"]
         self.assertEqual(numbers, ["1405"])
+        self.assertEqual(
+            [signal.value for signal in extract_signals(instructional_source_text(transcript))
+             if signal.kind == "number"],
+            [],
+        )
 
     def test_reference_coverage_meets_the_runtime_floors(self):
         for entry in CORPUS["fixtures"]:
             with self.subTest(fixture=entry["id"]):
                 transcript, reference = load_fixture(entry)
-                audit = audit_notes(transcript, reference)
+                audit = audit_notes(instructional_source_text(transcript), reference)
                 number_floor, term_floor = coverage_thresholds("full")
                 self.assertGreaterEqual(audit.number_coverage, number_floor)
                 if entry.get("min_term_coverage", 1.0) >= term_floor:

@@ -596,11 +596,11 @@ class Settings:
     note_compile: bool
     note_compile_max_chars: int
     note_reasoning_effort: str
-    #: Evidence gate: audit the generated notes against the source and repair
-    #: what is missing. Off restores the pre-v4 behaviour exactly.
+    #: Enables early chunk-level grounding cleanup and bounded LLM repair. The
+    #: canonical final evidence/completeness acceptance gate remains mandatory.
     note_strict_grounding: bool
-    #: ``repair`` performs the one bounded repair request; ``warn`` only audits
-    #: and logs, which is the safe first-week setting for a new deployment.
+    #: ``repair`` performs bounded LLM repair; ``warn`` skips those provider
+    #: edits but still cannot bypass deterministic final acceptance.
     note_quality_gate: str
     #: Ask OpenRouter to route to the fastest upstream of the model
     #: (``provider.sort=throughput``) instead of its price-weighted default.

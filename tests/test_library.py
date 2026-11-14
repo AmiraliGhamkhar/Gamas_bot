@@ -101,6 +101,7 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
             reference="GMS-1",
             meta=meta,
             progress=_Progress(),
+            plain_text=f"{lesson_title}. خلاصهٔ درس. محتوای آموزشی.",
         )
 
         items = await self.db.library_list(OWNER, limit=10)

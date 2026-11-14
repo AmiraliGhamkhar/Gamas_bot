@@ -68,6 +68,8 @@ dev = [
     "mypy>=1.11",
     # Reads PDFs produced by the standalone document-export tests.
     "pypdf>=4.0,<7.0",
+    # Rasterizes booklet PDFs for visual/layout QA in tests.
+    "PyMuPDF>=1.24,<2.0",
 ]
 
 [project.scripts]

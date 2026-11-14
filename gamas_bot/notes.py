@@ -109,6 +109,41 @@ MAX_TEXT_CHARS = 20000
 MAX_SOURCE_LOCATORS_PER_SECTION = 100
 VALID_CALLOUT_KINDS = ("نکته", "هشدار", "یادآوری")
 
+# These fields belong to transcription/operational records, never to the
+# educational booklet contract.  Keeping the deny-list next to the canonical
+# model makes both the permissive parser and strict provider schemas fail
+# closed when a provider attempts to smuggle transcript metadata into a note.
+FORBIDDEN_BOOKLET_METADATA_FIELDS = frozenset(
+    {
+        "speaker",
+        "speakers",
+        "speaker_id",
+        "speaker_name",
+        "speaker_turn",
+        "speaker_turns",
+        "timeline",
+        "timestamp",
+        "timestamps",
+        "start_time",
+        "end_time",
+        "start",
+        "end",
+    }
+)
+
+
+def _contains_forbidden_booklet_metadata(value: object) -> bool:
+    """Return whether a structured booklet payload carries transcript metadata."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).casefold() in FORBIDDEN_BOOKLET_METADATA_FIELDS:
+                return True
+            if _contains_forbidden_booklet_metadata(item):
+                return True
+    elif isinstance(value, (list, tuple)):
+        return any(_contains_forbidden_booklet_metadata(item) for item in value)
+    return False
+
 #: A merge below this size is not worth an editorial compile call.
 COMPILE_MIN_NOTES_CHARS = 400
 #: Worst-case size of the editorial message scaffolding (headings, separators,
@@ -643,6 +678,7 @@ class StructuredNotes:
     """The validated note structure the LLM must produce as strict JSON."""
 
     title: str = ""
+    subtitle: str = ""
     summary: str = ""
     sections: tuple[NoteSection, ...] = ()
     key_points: tuple[str, ...] = ()
@@ -652,13 +688,12 @@ class StructuredNotes:
     review_questions: tuple[str, ...] = ()
     #: The lecturer's own practical advice, surfaced with its source basis.
     practical_tips: tuple[PracticalTip, ...] = ()
-    #: Anonymous speaker labels actually resolved for this class (Persian
-    #: defaults or the owner's chosen names). Never inferred from the model:
-    #: the pipeline fills this from the stored speaker turns.
-    speakers: tuple[str, ...] = ()
-    #: Timestamped chapter markers derived from paragraph timings, e.g.
-    #: «[۰۲:۳۰] مقدمهٔ درس». Purely source-derived, never generated.
-    timeline: tuple[str, ...] = ()
+    #: Only source-supported pitfalls belong here; this is never a generic
+    #: study-skills list.
+    common_mistakes: tuple[str, ...] = ()
+    #: A closing high-value recall list. It is derived from source-backed
+    #: content and must exist before a full booklet is accepted.
+    final_review: tuple[str, ...] = ()
     #: Internal outcome only. It intentionally is not serialized into the
     #: established StructuredNotes JSON contract or renderer input.
     quality_state: str = QUALITY_VERIFIED
@@ -670,18 +705,22 @@ class StructuredNotes:
     @property
     def has_content(self) -> bool:
         return bool(
-            self.summary
+            self.subtitle
+            or self.summary
             or self.sections
             or self.key_points
             or self.glossary
             or self.learning_objectives
             or self.review_questions
             or self.practical_tips
+            or self.common_mistakes
+            or self.final_review
         )
 
     def to_payload(self) -> dict:
         return {
             "title": self.title,
+            "subtitle": self.subtitle,
             "summary": self.summary,
             # CR-3: the field stays for backward compatibility with archived
             # booklets, but is always emitted as "full" (legacy values normalise).
@@ -726,12 +765,12 @@ class StructuredNotes:
             ],
             "key_points": list(self.key_points),
             "review_questions": list(self.review_questions),
+            "common_mistakes": list(self.common_mistakes),
+            "final_review": list(self.final_review),
             "glossary": [
                 {"term": entry.term, "term_en": entry.term_en, "definition": entry.definition}
                 for entry in self.glossary
             ],
-            "speakers": list(self.speakers),
-            "timeline": list(self.timeline),
         }
 
     def to_json(self) -> str:
@@ -742,6 +781,8 @@ class StructuredNotes:
     def to_markdown(self) -> str:
         """Render as the Markdown subset the Telegram renderer understands."""
         parts: list[str] = [f"# {self.display_title}"]
+        if self.subtitle:
+            parts.append(f"**{self.subtitle}**")
         if self.summary:
             parts.append(f"**{self.summary}**")
         if self.learning_objectives:
@@ -800,6 +841,9 @@ class StructuredNotes:
                 f"{index}. {question}"
                 for index, question in enumerate(self.review_questions, start=1)
             )
+        if self.common_mistakes:
+            parts.append("## خطاها و دام‌های رایج")
+            parts.extend(f"- {item}" for item in self.common_mistakes)
         if self.glossary:
             parts.append("## واژه\u200cنامه")
             parts.extend(
@@ -808,10 +852,9 @@ class StructuredNotes:
                 + f":** {entry.definition}"
                 for entry in self.glossary
             )
-        if self.speakers or self.timeline:
-            parts.append("## گویندگان و زمان\u200cبندی")
-            parts.extend(f"- {line}" for line in self.speakers)
-            parts.extend(f"- {line}" for line in self.timeline)
+        if self.final_review:
+            parts.append("## مرور نهایی")
+            parts.extend(f"- {item}" for item in self.final_review)
         return "\n\n".join(parts)
 
     @classmethod
@@ -821,6 +864,8 @@ class StructuredNotes:
         """Validate and normalise a model-supplied JSON payload."""
         if not isinstance(payload, dict):
             raise StructuringError("پاسخ سرویس تولید جزوه یک شیء JSON نبود.")
+        if _contains_forbidden_booklet_metadata(payload):
+            raise StructuringError("پاسخ جزوه شامل فرادادهٔ ممنوعِ گفتار یا زمان بود.")
         raw_sections = payload.get("sections")
         sections = tuple(
             filter(
@@ -855,6 +900,7 @@ class StructuredNotes:
         )
         notes = cls(
             title=_bounded_text(payload.get("title"), MAX_TITLE_CHARS),
+            subtitle=_bounded_text(payload.get("subtitle"), MAX_TITLE_CHARS),
             summary=_bounded_text(payload.get("summary")),
             sections=sections,
             key_points=tuple(_string_list(payload.get("key_points"))),
@@ -863,8 +909,8 @@ class StructuredNotes:
             learning_objectives=tuple(_string_list(payload.get("learning_objectives"))),
             review_questions=tuple(_string_list(payload.get("review_questions"))),
             practical_tips=practical_tips,
-            speakers=tuple(_string_list(payload.get("speakers")))[:12],
-            timeline=tuple(_string_list(payload.get("timeline")))[:40],
+            common_mistakes=tuple(_string_list(payload.get("common_mistakes"))),
+            final_review=tuple(_string_list(payload.get("final_review"))),
         )
         if not notes.has_content:
             raise StructuringError("ساختار جزوهٔ دریافتی خالی بود.")
@@ -1096,73 +1142,61 @@ def headings_overlap(first: str, second: str, *, threshold: float = 0.5) -> bool
 #: that caches by prefix. See that module for the contract itself.
 
 def notes_response_schema() -> dict:
-    """A JSON schema for the note document the prompts already describe.
+    """Strict JSON Schema for the canonical educational booklet contract.
 
-    This is a *shape* constraint, not a content one: every field is optional
-    except the top-level ``sections`` array (a booklet without sections is the
-    failure the prompt itself forbids), and the string arrays are the ones
-    ``_load_json_payload`` reads. Providers that enforce it cannot answer with
-    prose, which is what removes the second "valid JSON only" request from the
-    failure path.
+    The provider-facing shape deliberately has no transcript identity, turn or
+    timing fields.  Optional instructional structures remain optional because
+    a source cannot justify every kind of table, formula, example or warning.
     """
     text_array = {"type": "array", "items": {"type": "string"}}
+    definition = {
+        "type": "object",
+        "properties": {
+            "term": {"type": "string"},
+            "term_en": {"type": "string"},
+            "definition": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+    table = {
+        "type": "object",
+        "properties": {
+            "caption": {"type": "string"},
+            "headers": text_array,
+            "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+        },
+        "additionalProperties": False,
+    }
     section = {
         "type": "object",
         "properties": {
             "heading": {"type": "string"},
-            "source_locators": {
-                "type": "array",
-                "items": {"type": "string"},
-                "maxItems": MAX_SOURCE_LOCATORS_PER_SECTION,
-            },
+            "source_locators": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_SOURCE_LOCATORS_PER_SECTION},
             "paragraphs": text_array,
             "bullets": text_array,
-            "definitions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "term": {"type": "string"},
-                        "term_en": {"type": "string"},
-                        "definition": {"type": "string"},
-                    },
-                },
-            },
+            "definitions": {"type": "array", "items": definition},
             "examples": text_array,
             "steps": text_array,
             "formulas": text_array,
             "key_points": text_array,
-            "tables": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "caption": {"type": "string"},
-                        "headers": text_array,
-                        "rows": {
-                            "type": "array",
-                            "items": {"type": "array", "items": {"type": "string"}},
-                        },
-                    },
-                },
-            },
+            "tables": {"type": "array", "items": table},
             "callouts": {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "properties": {
-                        "kind": {"type": "string"},
-                        "text": {"type": "string"},
-                    },
+                    "properties": {"kind": {"type": "string"}, "text": {"type": "string"}},
+                    "additionalProperties": False,
                 },
             },
         },
         "required": ["heading"],
+        "additionalProperties": False,
     }
     return {
         "type": "object",
         "properties": {
             "title": {"type": "string"},
+            "subtitle": {"type": "string"},
             "summary": {"type": "string"},
             "learning_objectives": text_array,
             "sections": {"type": "array", "items": section},
@@ -1175,24 +1209,18 @@ def notes_response_schema() -> dict:
                         "basis": {"type": "string"},
                         "kind": {"type": "string"},
                     },
+                    "additionalProperties": False,
                 },
             },
             "key_points": text_array,
             "review_questions": text_array,
-            "glossary": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "term": {"type": "string"},
-                        "definition": {"type": "string"},
-                    },
-                },
-            },
+            "common_mistakes": text_array,
+            "final_review": text_array,
+            "glossary": {"type": "array", "items": definition},
         },
         "required": ["sections"],
+        "additionalProperties": False,
     }
-
 
 def _response_schema(settings: Settings) -> dict | None:
     """The schema to send, or ``None`` when structured output is off."""
@@ -1472,6 +1500,7 @@ def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
         chunk_starts.add(cursor)
     merged = StructuredNotes(
         title=next((item.title for item in notes if item.title), ""),
+        subtitle=next((item.subtitle for item in notes if item.subtitle), ""),
         summary=_merge_summaries(notes),
         sections=_merge_sections(
             [section for item in notes for section in item.sections],
@@ -1490,6 +1519,12 @@ def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
             [item for note in notes for item in note.review_questions], _compare_key
         ),
         practical_tips=_dedupe_tips([tip for note in notes for tip in note.practical_tips]),
+        common_mistakes=_dedupe_by_key(
+            [item for note in notes for item in note.common_mistakes], _compare_key
+        ),
+        final_review=_dedupe_by_key(
+            [item for note in notes for item in note.final_review], _compare_key
+        ),
     )
     if not merged.has_content:
         raise StructuringError("ساختار جزوهٔ دریافتی خالی بود.")
@@ -1625,11 +1660,14 @@ def context_block_for(
 # Completeness validator & coverage-gap fill (CR-4)
 # ===========================================================================
 
-#: Minimum share of source instructional units the draft must cover.
-COMPLETENESS_THRESHOLD = 0.60
-#: A source unit counts as covered when at least this share of its content words
-#: appear in the draft (or its topic clearly overlaps a section heading).
-COMPLETENESS_UNIT_RATIO = 0.5
+# A 60% source match is a partial summary, not a complete booklet. These
+# floors operate on instructional units and hard signals, never character
+# similarity; a source-preserving fallback remains available after bounded repair.
+COMPLETENESS_THRESHOLD = 0.85
+#: A source unit counts as covered when a substantial share of its content words
+#: appears in the draft (or its topic clearly overlaps a section heading).
+COMPLETENESS_UNIT_RATIO = 0.65
+FINAL_SENTENCE_COVERAGE_FLOOR = 0.85
 #: Hard bound on targeted fill requests per booklet (a cost/loop guard).
 MAX_COVERAGE_GAPS = 6
 #: Characters of source text handed to one targeted fill request.
@@ -1670,6 +1708,40 @@ class CompletenessReport:
         )
 
 
+# Presentation extractors preserve their own structure so the model can orient
+# itself, but these labels are not lesson facts and must never become required
+# booklet content. Keep the actual slide/narration prose intact; only explicit
+# source mechanics (speaker identity and semester/session labels) are removed.
+_SOURCE_METADATA_LINE = re.compile(
+    r"^\s*(?:[-*•]\s*)?(?:گوینده|speaker|نیم[\s‌-]*سال)\s*[:：]",
+    re.IGNORECASE,
+)
+_SPEAKER_NOTE_PREFIX = re.compile(r"^(\s*)یادداشت\s+گوینده\s*[:：]\s*", re.IGNORECASE)
+_SLIDE_PREFIX = re.compile(
+    r"^(\s*)#{1,6}\s*اسلاید\s*[0-9۰-۹٠-٩]+\s*[—–-]?\s*", re.IGNORECASE
+)
+_LESSON_LABEL_PREFIX = re.compile(r"^(\s*)[-*•]\s*درس\s*[:：]\s*", re.IGNORECASE)
+
+
+def instructional_source_text(source: str) -> str:
+    """Return source prose eligible for booklet grounding and fallback output.
+
+    Operational presentation labels remain in the archived source/transcript;
+    this projection only prevents them from becoming educational requirements or
+    visible booklet text. It intentionally does not remove ordinary dates,
+    numbers or speaker *content* embedded in lesson prose.
+    """
+    lines: list[str] = []
+    for line in str(source or "").splitlines():
+        if _SOURCE_METADATA_LINE.match(line):
+            continue
+        line = _SPEAKER_NOTE_PREFIX.sub(r"\1", line)
+        line = _SLIDE_PREFIX.sub(r"\1", line)
+        line = _LESSON_LABEL_PREFIX.sub(r"\1", line)
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def booklet_skeleton(notes: StructuredNotes) -> dict[str, bool]:
     """Report which skeleton blocks are present in a structured booklet."""
     sections = list(notes.sections)
@@ -1690,18 +1762,20 @@ def booklet_skeleton(notes: StructuredNotes) -> dict[str, bool]:
         "tables": any(section.all_tables for section in sections),
         "callouts": any(section.callouts for section in sections),
         "key_points": bool(notes.key_points) or any(s.key_points for s in sections),
-        # final one-page «جمع‌بندی» is rendered from summary / key_points
-        "end_summary": bool(notes.summary.strip()) or bool(notes.key_points),
+        # A closing review is a real canonical field, not a renderer duplicate.
+        "end_summary": bool(notes.final_review),
         # English-term glossary is rendered from glossary or section definitions
         "glossary": bool(notes.glossary) or any(s.definitions for s in sections),
     }
 
 
 def _drafted_text(notes: StructuredNotes) -> str:
-    parts: list[str] = [notes.title, notes.summary]
+    parts: list[str] = [notes.title, notes.subtitle, notes.summary]
     parts.extend(notes.learning_objectives)
     parts.extend(notes.key_points)
     parts.extend(notes.review_questions)
+    parts.extend(notes.common_mistakes)
+    parts.extend(notes.final_review)
     parts.extend(f"{tip.text} {tip.basis}" for tip in notes.practical_tips)
     parts.extend(f"{entry.term} {entry.definition}" for entry in notes.glossary)
     parts.extend(section_plain_text(section) for section in notes.sections)
@@ -1742,6 +1816,7 @@ def find_coverage_gaps(
     unit_ratio: float = COMPLETENESS_UNIT_RATIO,
 ) -> tuple[str, ...]:
     """Source instructional units that the drafted sections do not represent."""
+    source = instructional_source_text(source)
     covered = _coverage_inputs(notes, unit_ratio)
     gaps: list[str] = []
     for unit in split_sentences(source):
@@ -1760,6 +1835,7 @@ def assess_completeness(
     unit_ratio: float = COMPLETENESS_UNIT_RATIO,
 ) -> CompletenessReport:
     """Validate a draft's skeleton and source coverage (pure, no LLM)."""
+    source = instructional_source_text(source)
     units = split_sentences(source)
     covered = _coverage_inputs(notes, unit_ratio)
     missing = tuple(unit for unit in units if not covered(unit))
@@ -1954,6 +2030,8 @@ def compact_notes_payload(notes: StructuredNotes) -> dict:
     payload: dict = {}
     if notes.title:
         payload["title"] = notes.title
+    if notes.subtitle:
+        payload["subtitle"] = notes.subtitle
     if notes.summary:
         payload["summary"] = notes.summary
     if notes.learning_objectives:
@@ -1964,6 +2042,10 @@ def compact_notes_payload(notes: StructuredNotes) -> dict:
         payload["key_points"] = list(notes.key_points)
     if notes.review_questions:
         payload["review_questions"] = list(notes.review_questions)
+    if notes.common_mistakes:
+        payload["common_mistakes"] = list(notes.common_mistakes)
+    if notes.final_review:
+        payload["final_review"] = list(notes.final_review)
     if notes.practical_tips:
         payload["practical_tips"] = [
             {"text": tip.text, "basis": tip.basis, "kind": tip.kind}
@@ -2105,6 +2187,7 @@ def gate_notes(
     deployment without any effect on what the user receives.
     """
     resolved_mode = resolve_note_mode(mode)
+    source = instructional_source_text(source)
     source_index = build_source_index(source)
     source_words = source_index.masked_words
     tables_seen = tables_accepted = tips_seen = tips_accepted = 0
@@ -2220,19 +2303,12 @@ def notes_need_repair(report: NoteQualityReport, *, mode: str = "full") -> bool:
         or report.unsupported_claims
         or audit.number_coverage < number_floor
         or audit.term_coverage < term_floor
-        or report.coverage.ratio < 0.75
+        or report.coverage.ratio < FINAL_SENTENCE_COVERAGE_FLOOR
     )
 
 
-def acceptance_failure(report: NoteQualityReport) -> str | None:
-    """Whether unsafe assertions remain after repair/salvage.
-
-    Missing source information and sentence-coverage proxies are completeness
-    signals, never hard rejection rules. Fabricated numbers/terms/URLs and prose
-    claims with no source vocabulary must first be corrected or removed; the
-    pipeline then falls back to the source-preserving booklet rather than
-    rejecting the whole document.
-    """
+def safety_failure(report: NoteQualityReport) -> str | None:
+    """Return an unsupported-claim failure that cannot wait for coverage fill."""
     if report.audit.fabricated:
         return "unsupported_facts"
     if report.unsupported_claims:
@@ -2240,11 +2316,64 @@ def acceptance_failure(report: NoteQualityReport) -> str | None:
     return None
 
 
+def acceptance_failure(report: NoteQualityReport) -> str | None:
+    """Return the critical grounding/completeness defect, if any.
+
+    The final gate is intentionally stricter than a repair hint: a delivery
+    cannot claim to be a complete booklet while it has lost a source number,
+    technical term, or a material share of instructional units.  Callers use a
+    bounded repair first and then the source-preserving fallback rather than
+    silently delivering a partial synthesis.
+    """
+    if safety := safety_failure(report):
+        return safety
+    number_floor, term_floor = coverage_thresholds("full")
+    if report.audit.number_coverage < number_floor:
+        return "missing_numbers"
+    if report.audit.term_coverage < term_floor:
+        return "missing_terms"
+    if report.coverage.ratio < FINAL_SENTENCE_COVERAGE_FLOOR:
+        return "low_instructional_coverage"
+    return None
+
+
+_BOOKLET_TIMELINE_MARKER = re.compile(
+    r"(?:\[|\(|در\s+(?:دقیقه|ثانیه|زمان))\s*[0-9۰-۹٠-٩]{1,3}\s*[:٫]\s*[0-9۰-۹٠-٩]{2}"
+)
+_BOOKLET_SPEAKER_MARKER = re.compile(
+    r"(?:یادداشت\s+گوینده\s*[:：]|(?:گوینده|speaker)\s*[:：]|"
+    r"گوینده(?:ٔ|\s+)\s*[0-9۰-۹٠-٩]+|speaker\s*\d+|"
+    r"(?:استاد|سخنران|گوینده)\s+(?:گفت|ذکر کرد|بیان کرد|اشاره کرد))",
+    re.IGNORECASE,
+)
+_BOOKLET_SOURCE_METADATA_MARKER = re.compile(
+    r"(?:نیم[\s‌-]*سال\s*[:：]|اسلاید\s*[0-9۰-۹٠-٩]+)",
+    re.IGNORECASE,
+)
+
+
+def booklet_output_violations(notes: StructuredNotes) -> tuple[str, ...]:
+    """Detect transcript/timeline leakage in educational content, not STT data."""
+    if any(name in FORBIDDEN_BOOKLET_METADATA_FIELDS for name in notes.__dataclass_fields__):
+        return ("forbidden_booklet_field",)
+    violations: list[str] = []
+    text = json.dumps(notes.to_payload(), ensure_ascii=False)
+    if _BOOKLET_TIMELINE_MARKER.search(text):
+        violations.append("timeline_marker")
+    if _BOOKLET_SPEAKER_MARKER.search(text):
+        violations.append("speaker_reference")
+    if _BOOKLET_SOURCE_METADATA_MARKER.search(text):
+        violations.append("source_metadata_reference")
+    return tuple(dict.fromkeys(violations))
+
+
 def structurally_valid_booklet(notes: StructuredNotes) -> bool:
     """Mandatory schema/content check shared by renderers and final acceptance."""
     if not notes.title.strip() or normalize_for_compare(notes.title) in _GENERIC_BOOKLET_TITLES:
         return False
-    if not notes.sections or not notes.has_content:
+    if not notes.sections or not notes.has_content or not notes.final_review:
+        return False
+    if booklet_output_violations(notes):
         return False
     for section in notes.sections:
         if not section.heading.strip():
@@ -2267,8 +2396,8 @@ def completeness_failure(report: NoteQualityReport, *, mode: str = "full") -> st
         return "missing_numbers"
     if audit.missing:
         return "missing_terms"
-    if report.coverage.ratio < 0.75:
-        return "low_sentence_coverage"
+    if report.coverage.ratio < FINAL_SENTENCE_COVERAGE_FLOOR:
+        return "low_instructional_coverage"
     return None
 
 
@@ -2286,6 +2415,9 @@ def enforce_final_acceptance(
     ``stage`` is diagnostic only and appears in the log line.
     """
     reason = acceptance_failure(report)
+    if reason is None and not structurally_valid_booklet(notes):
+        violations = booklet_output_violations(notes)
+        reason = violations[0] if violations else "invalid_booklet_structure"
     if reason is None:
         return notes
     logger.warning(
@@ -2437,7 +2569,7 @@ def build_repair_issues(
         )
     # Signal coverage has priority. Sentence gaps are supplemental and are
     # capped so repair never becomes an unbounded source resend.
-    if report.coverage.ratio < 0.75:
+    if report.coverage.ratio < FINAL_SENTENCE_COVERAGE_FLOOR:
         for gap in find_coverage_gaps(source, notes, max_gaps=3):
             section_index = _section_for_evidence(notes, gap)
             issues.append(
@@ -2871,15 +3003,16 @@ def scrub_unsupported_content(
     scrubbed = replace(
         notes,
         title=scrub(notes.title),
+        subtitle=scrub(notes.subtitle),
         summary=scrub(notes.summary),
         sections=tuple(sections),
         key_points=scrub_tuple(notes.key_points),
         learning_objectives=scrub_tuple(notes.learning_objectives),
         review_questions=scrub_tuple(notes.review_questions),
+        common_mistakes=scrub_tuple(notes.common_mistakes),
+        final_review=scrub_tuple(notes.final_review),
         practical_tips=tips,
         glossary=glossary,
-        speakers=scrub_tuple(notes.speakers),
-        timeline=scrub_tuple(notes.timeline),
         quality_state=QUALITY_DEGRADED,
     )
     if removed:
@@ -3032,7 +3165,7 @@ def deterministic_fallback_notes(
     both in the content and section metadata, so the fallback never invents a
     citation while still being usable in the DOCX/PDF renderers.
     """
-    raw = (source or "").strip()
+    raw = instructional_source_text(source)
     if not is_usable_transcript(raw):
         raise StructuringError("متن پیاده‌سازی‌شده برای ساخت جزوه محتوای قابل‌استفاده‌ای نداشت.")
     paragraphs: list[str] = []
@@ -3081,9 +3214,18 @@ def deterministic_fallback_notes(
     flush()
     if not sections:
         raise StructuringError("متن ورودی قابل‌استفاده نبود.")
+    # The fallback is intentionally source-preserving rather than pretending to
+    # be a synthesized study guide. Its closing review is a verbatim source
+    # passage so the canonical rendering contract remains complete without an
+    # invented recap.
+    review_source = next(
+        (paragraph for section in reversed(sections) for paragraph in reversed(section.paragraphs) if paragraph),
+        "",
+    )
     return StructuredNotes(
         title=title.strip() or _fallback_title(raw),
         sections=tuple(sections),
+        final_review=(review_source,) if review_source else (),
         quality_state=QUALITY_RECOVERED,
     )
 
@@ -3116,11 +3258,35 @@ def ensure_structured_booklet(notes: StructuredNotes, source: str) -> Structured
     if not title or normalize_for_compare(title) in _GENERIC_BOOKLET_TITLES:
         title = _fallback_title(source)
         changed = True
+
+    # A final review is mandatory for a delivered full booklet. When a provider
+    # omits it, reuse already source-grounded material rather than fabricate a
+    # new recap or spend another whole-booklet request.
+    final_review = tuple(item for item in notes.final_review if item.strip())
+    if not final_review:
+        candidates = list(notes.key_points)
+        if not candidates:
+            candidates = [point for section in sections for point in section.key_points]
+        if not candidates:
+            candidates = [
+                value
+                for section in reversed(sections)
+                for value in (*section.paragraphs, *section.bullets)
+                if value.strip()
+            ]
+        final_review = tuple(dict.fromkeys(candidates[:8]))
+        changed = True
     if changed and notes.quality_state == QUALITY_VERIFIED:
         state = QUALITY_REPAIRED
     else:
         state = notes.quality_state
-    return replace(notes, title=title, sections=tuple(sections), quality_state=state)
+    return replace(
+        notes,
+        title=title,
+        sections=tuple(sections),
+        final_review=final_review,
+        quality_state=state,
+    )
 
 
 # ===========================================================================
@@ -3307,6 +3473,7 @@ async def _audit_and_repair(
     data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> tuple[StructuredNotes, NoteQualityReport]:
     """Run ordered, bounded repairs and preserve the best known-safe artifact."""
+    notes = ensure_structured_booklet(notes, source)
     if not settings.note_strict_grounding:
         return notes, gate_notes(notes, source, strict=False, mode=mode)[1]
 
@@ -3366,7 +3533,10 @@ async def _audit_and_repair(
     # exact disproved spans/claims and re-audit; if anything unsafe remains (or
     # the local edits leave no valid structure), use the source-only fallback
     # rather than reject an otherwise usable transcript.
-    if acceptance_failure(report) is not None:
+    # Missing coverage is repairable by the dedicated bounded completeness pass
+    # after map/reduce. Only source-disproved prose requires immediate local
+    # removal or a source-only fallback here.
+    if safety_failure(report) is not None:
         scrubbed, removed = scrub_unsupported_content(gated, report, source=source)
         signal_only_failure = bool(report.audit.fabricated) and not report.unsupported_claims
         if removed:
@@ -3386,7 +3556,7 @@ async def _audit_and_repair(
             else:
                 gated, report = scrubbed, report
         if (
-            acceptance_failure(report) is not None
+            safety_failure(report) is not None
             or not structurally_valid_booklet(gated)
         ) and getattr(settings, "note_enable_deterministic_fallback", True):
             fallback = deterministic_fallback_notes(source)
@@ -3412,7 +3582,11 @@ async def _audit_and_repair(
             gated = replace(gated, quality_state=QUALITY_RECOVERED)
         else:
             raise StructuringError("ساختار جزوه برای رندر معتبر نبود.")
-    return enforce_final_acceptance(gated, report, mode=mode, stage="audit"), report
+    # This is an early repair/audit boundary, not a delivery boundary. Preserve
+    # a structurally safe but incomplete draft so ``finalize`` can run the
+    # bounded completeness pass; the one canonical final acceptance gate makes
+    # the delivery decision afterwards.
+    return gated, report
 
 def repair_request_document(
     notes: StructuredNotes,
@@ -4004,13 +4178,37 @@ async def _structure_booklet(
     semaphore = _note_semaphore(settings, len(chunks))
 
     async def finalize(result: StructuredNotes) -> StructuredNotes:
-        """CR-4: optionally run the bounded coverage-gap fill pass."""
-        if getattr(settings, "note_completeness_fill", False):
-            return await fill_coverage_gaps(
-                session, settings, document, result, semaphore=semaphore,
-                data_sensitivity=data_sensitivity,
+        """Apply the one canonical acceptance gate to every delivery path."""
+        # Reject fabricated or unsupported provider prose before asking the
+        # model to fill omissions. Completeness work itself must run before the
+        # final coverage gate, even when strict early repair is enabled.
+        prefill, prefill_report = gate_notes(result, document, strict=True, mode=resolved_mode)
+        if safety_failure(prefill_report) is not None:
+            result = prefill
+        else:
+            result = prefill
+            if getattr(settings, "note_completeness_fill", False):
+                result = await fill_coverage_gaps(
+                    session, settings, document, result, semaphore=semaphore,
+                    data_sensitivity=data_sensitivity,
+                )
+        result = ensure_structured_booklet(result, document)
+        # NOTE_STRICT_GROUNDING controls earlier repair work, not whether a
+        # user-facing booklet may bypass the final safety/completeness gate.
+        gated, report = gate_notes(result, document, strict=True, mode=resolved_mode)
+        try:
+            return enforce_final_acceptance(gated, report, mode=resolved_mode, stage="final")
+        except NoteQualityError:
+            if not getattr(settings, "note_enable_deterministic_fallback", True):
+                raise
+            fallback = deterministic_fallback_notes(document)
+            fallback, fallback_report = gate_notes(
+                fallback, document, strict=True, mode=resolved_mode
             )
-        return result
+            fallback = replace(fallback, quality_state=QUALITY_RECOVERED)
+            return enforce_final_acceptance(
+                fallback, fallback_report, mode=resolved_mode, stage="final_fallback"
+            )
 
     # A presentation says so in the user message: its source is slides plus
     # narration, not a transcript. The rest of the template is shared.
@@ -4216,11 +4414,16 @@ async def _structure_booklet(
                 data_sensitivity=data_sensitivity,
             )
         except NoteQualityError:
-            if not getattr(settings, "note_enable_deterministic_fallback", True):
-                raise
-            logger.warning("note audit outcome=RECOVERED baseline=source_preserving_fallback")
-            merged = deterministic_fallback_notes(document)
+            # Do not discard a merely incomplete draft before the bounded
+            # completeness pass gets a chance to recover its missing units.
+            # Fabrication remains a hard stop at the canonical final gate.
             _, merged_report = gate_notes(merged, document, strict=True, mode=resolved_mode)
+            if safety_failure(merged_report) is not None:
+                if not getattr(settings, "note_enable_deterministic_fallback", True):
+                    raise
+                logger.warning("note audit outcome=RECOVERED baseline=source_preserving_fallback")
+                merged = deterministic_fallback_notes(document)
+                _, merged_report = gate_notes(merged, document, strict=True, mode=resolved_mode)
     if on_merged is not None and compile_will_run(
         merged, settings, mode=resolved_mode, presentation=presentation
     ):
