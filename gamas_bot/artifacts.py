@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 #: independent buttons because a student may want to read it now or save it.
 KIND_BOOKLET = "booklet"   # PDF (primary student deliverable)
 KIND_DOCX = "docx"         # editable Word version
+KIND_REVIEW_HTML = "review_html"  # offline interactive review sheet (self-contained HTML)
 KIND_TRANSCRIPT = "transcript"
 KIND_TXT = "txt"
 KIND_KEYPOINTS = "keypoints"
@@ -51,6 +52,7 @@ KIND_FLASHCARDS = "flashcards"
 KINDS = (
     KIND_BOOKLET,
     KIND_DOCX,
+    KIND_REVIEW_HTML,
     KIND_TRANSCRIPT,
     KIND_TXT,
     KIND_KEYPOINTS,
@@ -179,6 +181,7 @@ def delivery_markup(
     * 📝 دریافت متن خام
     * ⭐ دریافت نکات کلیدی
     * 📄 دریافت نسخه Word  (when the DOCX artifact is available)
+    * 🌐 دریافت جزوه مرور تعاملی HTML  (when the review sheet is available)
 
     Nothing appears here unless it really exists: ``kinds`` comes from the
     central submission artifact registry. Every button retrieves a persisted
@@ -217,6 +220,16 @@ def delivery_markup(
     if KIND_DOCX in kinds:
         rows.append(
             [Button.inline(texts.BTN_GET_DOCX, callback_for(reference, KIND_DOCX))]
+        )
+    # The interactive HTML review sheet is also an independent persisted file.
+    if KIND_REVIEW_HTML in kinds:
+        rows.append(
+            [
+                Button.inline(
+                    texts.BTN_GET_REVIEW_HTML,
+                    callback_for(reference, KIND_REVIEW_HTML),
+                )
+            ]
         )
     # Learning buttons (quiz / flashcards)
     learning: list[Any] = []

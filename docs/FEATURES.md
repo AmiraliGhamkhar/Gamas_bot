@@ -51,6 +51,16 @@ merge, split/repair and grounding gates remain enabled as configured. See
   install `Vazirmatn` from `assets/fonts/` on the PC that opens the file.
 - PDF built from the same validated `StructuredNotes` model, with an embedded
   Vazirmatn subset, a topic map and selectable text.
+- Interactive HTML review sheet (`🌐 دریافت جزوه مرور تعاملی HTML`): a single
+  self-contained `.html` file with the Vazirmatn fonts embedded, so it works
+  offline. It has a 30-minute study plan split into 5–12 sections (the last one
+  a one-minute self-test), collapsible questions, exam traps and comparison
+  pairs. Every question, answer and trap cites source units from the validated
+  booklet; unsupported items are omitted. No scripts or styles come from the
+  model, and the page runs only the fixed script pinned by its
+  Content-Security-Policy. It is generated only from a completed AI booklet, so
+  deterministic fallback and degraded booklets never get one. Downloading it is
+  free and never re-renders the file; billing rules are unchanged.
 - Nothing is pushed automatically: the final message lists what was produced and
   offers one button per artifact. Re-downloading is free and never re-renders.
 - Quality gates (`NOTE_STRICT_GROUNDING`, `NOTE_QUALITY_GATE`,

@@ -116,6 +116,19 @@ matching code + `.env` + the complete data set, reinstall dependencies, run
 `-wal`/`-shm` files, never run older code against a newer schema, and never
 connect two copies of one Telegram session.
 
+## Interactive HTML review sheets
+
+Each completed AI booklet can store one `review_html` artifact next to its PDF and
+DOCX. The HTML is validated before it is stored: a hard error (for example an
+external resource, a model-written script or a Latin/Persian digit mismatch in a
+timing attribute) blocks storage and the notice `🌐 جزوه مرور تعاملی HTML آماده
+نشد` is shown while the PDF and DOCX stay delivered. Warnings are logged only.
+Look for `review HTML generation failed` or `review sheet skipped` in the logs
+to diagnose a missing sheet. Migration `033_review_html_artifacts.sql` rebuilds
+the binary artifact table once at startup. It keeps every row, id and
+delivery counter; the backup rule above applies before the first start of this
+version.
+
 ## Updates
 
 Follow [Windows step 7](WINDOWS.md#7-update) or

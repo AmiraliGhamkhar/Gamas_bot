@@ -54,6 +54,13 @@ BTN_NEXT: Final = "بعدی ▶️"
 BTN_REDOWNLOAD: Final = "دریافت مجدد"
 BTN_GET_BOOKLET: Final = "دریافت جزوه PDF"
 BTN_GET_DOCX: Final = "دریافت نسخه Word"
+BTN_GET_REVIEW_HTML: Final = "🌐 دریافت جزوه مرور تعاملی HTML"
+DELIVERY_ROW_REVIEW_HTML: Final = "جزوهٔ مرور تعاملی HTML (آفلاین) آماده است."
+REVIEW_STAGE_PLANNING: Final = "طراحی جزوهٔ مرور تعاملی"
+REVIEW_STAGE_RENDERING: Final = "ساخت فایل HTML"
+REVIEW_STAGE_VALIDATING: Final = "بررسی ساختار و امنیت HTML"
+NOTICE_REVIEW_HTML: Final = "\n\nنکته: جزوهٔ مرور تعاملی HTML آماده نشد؛ فایل‌های دیگر جزوه سالم هستند."
+NOTICE_REVIEW_HTML_STORAGE: Final = "\n\nنکته: ذخیرهٔ جزوهٔ مرور تعاملی HTML انجام نشد."
 BTN_GET_TRANSCRIPT: Final = "خواندن متن خام در گفتگو"
 BTN_DOWNLOAD_TXT: Final = "دانلود متن خام (TXT)"
 BTN_GET_KEYPOINTS: Final = "دریافت نکات کلیدی"
@@ -252,6 +259,7 @@ def delivery_screen(
     has_transcript: bool = True,
     has_txt: bool = False,
     has_docx: bool = False,
+    has_review_html: bool = False,
     has_learning_item: bool = True,
 ) -> str:
     """Describe only the artifacts and actions exposed by this message."""
@@ -280,6 +288,8 @@ def delivery_screen(
         lines.append(DELIVERY_ROW_KEYPOINTS)
     if has_docx:
         lines.append(DELIVERY_ROW_DOCX)
+    if has_review_html:
+        lines.append(DELIVERY_ROW_REVIEW_HTML)
     if has_booklet and has_learning_item and learning_available:
         lines.append(DELIVERY_ROW_LEARNING)
     elif has_booklet and not learning_available:
@@ -292,6 +302,7 @@ def delivery_screen(
             has_keypoints,
             notes_pending,
             has_docx,
+            has_review_html,
         )
     )
     if not has_any_output:
