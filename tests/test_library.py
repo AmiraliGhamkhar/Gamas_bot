@@ -15,7 +15,7 @@ from gamas_bot.bot import GamasBot
 from gamas_bot.db import MIGRATIONS_DIR, Database
 from gamas_bot.docx_export import DocumentMeta
 from gamas_bot.jobs import Job
-from gamas_bot.notes import StructuredNotes
+from gamas_bot.notes import NoteSection, StructuredNotes
 from tests.support import FakeJobEvent, FakeTelegramClient, make_settings
 from tests.test_bot import FakeCallbackEvent, menu_payloads
 
@@ -83,7 +83,11 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         # A model-written lesson title is a full sentence; the artifact is named
         # with the 2–4-word contract instead, and that one name is the cover.
         lesson_title = "جزوهٔ جامع فیزیولوژی قلب و عروق برای آزمون پایان ترم"
-        notes = StructuredNotes(title=lesson_title, summary="خلاصهٔ درس")
+        notes = StructuredNotes(
+            title=lesson_title,
+            summary="خلاصهٔ درس",
+            sections=(NoteSection(heading="فیزیولوژی", paragraphs=("محتوای آموزشی",)),),
+        )
         meta = DocumentMeta(
             reference="GMS-1",
             source_name="lecture.ogg",

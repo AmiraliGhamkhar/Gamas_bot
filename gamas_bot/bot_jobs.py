@@ -54,7 +54,10 @@ from .metrics import METRICS
 from .notes import (
     NoteQualityError,
     StructuredNotes,
+    StructuringError,
     build_presentation_document,
+    ensure_structured_booklet,
+    structurally_valid_booklet,
     structure_presentation,
 )
 from .presentations import (
@@ -497,7 +500,10 @@ class JobPipelineMixin:
                 await self._process_presentation(job, workdir, progress)
             else:
                 await self._process_media(job, workdir, progress)
-            job.transition_to("completed")
+            if job.meta.get("delivery_failed"):
+                job.transition_to("failed")
+            else:
+                job.transition_to("completed")
         except InsufficientBalanceError as exc:
             job.transition_to("failed")
             await self.db.set_submission_status(
@@ -587,13 +593,16 @@ class JobPipelineMixin:
     async def _release(self, job: Job, reason: str) -> bool:
         return await self.db.release_hold(job.submission_id, reason)
 
-    async def _reply(self, job: Job, text: str, *, buttons: Any = None) -> None:
+    async def _reply(self, job: Job, text: str, *, buttons: Any = None) -> bool:
+        """Send a user-facing message and report whether it actually succeeded."""
         if job.message is None:
-            return
+            return False
         try:
             await job.message.reply(text, buttons=buttons)
+            return True
         except Exception:
             logger.warning("could not reply to user submission=%s", job.submission_id)
+            return False
 
     async def _process_media(
         self, job: Job, workdir: Path, progress: Any
@@ -709,7 +718,6 @@ class JobPipelineMixin:
         )
         await self._settle(job, duration)
         if not self.settings.note_configured:
-            await self.db.set_submission_status(job.submission_id, "done")
             await self._deliver_results(
                 job,
                 document,
@@ -994,7 +1002,6 @@ class JobPipelineMixin:
         settled_duration = prepared.source_duration if prepared is not None else 0
         await self._settle(job, settled_duration)
         if not self.settings.note_configured:
-            await self.db.set_submission_status(job.submission_id, "done")
             await self._deliver_results(
                 job,
                 document,
@@ -1096,6 +1103,7 @@ class JobPipelineMixin:
                 on_stage=self._note_stage_callback(job, progress),
                 on_incomplete=self._note_incomplete_callback(job),
             )
+            notes = ensure_structured_booklet(notes, document_text)
             quality_state = getattr(notes, "quality_state", "VERIFIED")
             if job_meta is not None:
                 job_meta["note_quality"] = quality_state
@@ -1156,6 +1164,8 @@ class JobPipelineMixin:
                 on_stage=self._note_stage_callback(job, progress),
                 on_incomplete=self._note_incomplete_callback(job),
             )
+            source_document = document or build_presentation_document(outline, transcript_text)
+            notes = ensure_structured_booklet(notes, source_document)
             job.meta["note_quality"] = getattr(notes, "quality_state", "VERIFIED")
             logger.info(
                 "note final job=%s quality=%s outcome=delivered",
@@ -1211,51 +1221,95 @@ class JobPipelineMixin:
         presentation pipeline; an unstructured fallback is deliberately not
         advertised as a polished booklet.
         """
-        del workdir, plain_title, plain_text  # legacy call compatibility only
+        del workdir, plain_title  # legacy call compatibility only
+        if notes is not None:
+            source_text = str(plain_text or "")
+            if not source_text.strip():
+                document_text = getattr(document, "llm_document", None)
+                if callable(document_text):
+                    try:
+                        source_text = str(document_text() or "")
+                    except Exception:
+                        logger.warning("booklet source could not be read for structural check")
+            try:
+                if not structurally_valid_booklet(notes):
+                    notes = ensure_structured_booklet(notes, source_text)
+                if not structurally_valid_booklet(notes):
+                    raise StructuringError("booklet structure is invalid")
+                if isinstance(getattr(job, "meta", None), dict):
+                    job.meta["note_quality"] = getattr(notes, "quality_state", "VERIFIED")
+            except StructuringError:
+                logger.warning(
+                    "booklet rejected at render boundary: no usable structure submission=%s",
+                    job.submission_id,
+                )
+                notes = None
+                job.meta["note_failure"] = "structure"
         booklet_title = short_title(
             getattr(notes, "title", "") if notes is not None else "",
             fallback=FALLBACK_BOOKLET,
         )
         pdf_ready = False
         docx_ready = False
-        notice = ""
-        notice_kind = ""
+        notice_parts: list[tuple[str, str]] = []
+
+        def add_notice(kind: str, text: str) -> None:
+            if text and all(existing != text for _code, existing in notice_parts):
+                notice_parts.append((kind, text))
 
         if notes is None or not notes.has_content:
             if job.meta.get("note_failure") == "quality":
-                notice = (
+                add_notice(
+                    "notes_quality",
                     "\n\nنکته: جزوهٔ ساختارمند به‌دلیل نبود پشتوانهٔ کافی در متن درس "
-                    "تأیید نشد؛ متن خام در دسترس است."
+                    "تأیید نشد؛ متن خام در دسترس است.",
                 )
-                notice_kind = "notes_quality"
+            elif job.meta.get("note_failure") == "structure":
+                add_notice(
+                    "notes_structure",
+                    "\n\nنکته: متن خام ذخیره شد، اما ساختار جزوه برای رندر معتبر نبود.",
+                )
             else:
-                notice = (
+                add_notice(
+                    "notes",
                     "\n\nنکته: جزوهٔ ساختارمند برای این فایل ساخته نشد؛ "
-                    "متن خام در دسترس است."
+                    "متن خام در دسترس است.",
                 )
-                notice_kind = "notes"
         else:
             # Accepted, but still missing source facts the bounded repair could
             # not restore: deliver it and say so, instead of calling it verified.
             quality = str(job.meta.get("note_quality") or getattr(notes, "quality_state", "VERIFIED"))
             if quality == "RECOVERED":
-                notice = (
+                add_notice(
+                    "notes_recovered",
                     "\n\nنکته: بخشی از جزوه با بازیابی محافظه‌کارانه و فقط از متن منبع "
-                    "ساخته شد؛ متن خام را نیز بررسی کنید."
+                    "ساخته شد؛ متن خام را نیز بررسی کنید.",
                 )
-                notice_kind = "notes_recovered"
             elif quality == "DEGRADED":
-                notice = (
+                add_notice(
+                    "notes_degraded",
                     "\n\nنکته: ادعای بدون پشتوانه از جزوه حذف شد؛ برای جزئیات جاافتاده، "
-                    "متن خام را نیز بررسی کنید."
+                    "متن خام را نیز بررسی کنید.",
                 )
-                notice_kind = "notes_degraded"
-            if job.meta.get("note_incomplete"):
-                notice = (
-                    "\n\nنکته: بخشی از داده‌های عددی یا اصطلاحات متن درس در جزوه "
-                    "نیامده است؛ برای اطمینان، متن خام را هم بررسی کنید."
+            incomplete_reason = job.meta.get("note_incomplete")
+            if incomplete_reason == "missing_numbers":
+                add_notice(
+                    "notes_incomplete",
+                    "\n\nنکته: بخشی از داده‌های عددی متن درس در جزوه نیامده است؛ "
+                    "برای اطمینان، متن خام را هم بررسی کنید.",
                 )
-                notice_kind = "notes_incomplete"
+            elif incomplete_reason == "missing_terms":
+                add_notice(
+                    "notes_incomplete",
+                    "\n\nنکته: بخشی از اصطلاحات متن درس در جزوه نیامده است؛ "
+                    "برای اطمینان، متن خام را هم بررسی کنید.",
+                )
+            elif incomplete_reason:
+                add_notice(
+                    "notes_incomplete",
+                    "\n\nنکته: پوشش جزوه نسبت به متن درس کامل نیست؛ "
+                    "برای جزئیات جاافتاده، متن خام را هم بررسی کنید.",
+                )
             duration_seconds = (
                 int(job.duration_hint)
                 if job.duration_hint is not None and job.duration_hint > 0
@@ -1275,8 +1329,10 @@ class JobPipelineMixin:
             except Exception:
                 pdf_bytes = None
                 logger.exception("structured PDF generation failed submission=%s", job.submission_id)
-                notice = "\n\nنکته: فایل PDF جزوه ساخته نشد؛ نسخه‌های دیگر در دسترس‌اند."
-                notice_kind = "pdf"
+                add_notice(
+                    "pdf",
+                    "\n\nنکته: فایل PDF جزوه آماده نشد.",
+                )
             try:
                 await progress.update(94, "آماده‌سازی فایل Word")
                 docx_bytes = await asyncio.to_thread(
@@ -1290,9 +1346,10 @@ class JobPipelineMixin:
             except Exception:
                 docx_bytes = None
                 logger.exception("structured DOCX generation failed submission=%s", job.submission_id)
-                if not notice:
-                    notice = "\n\nنکته: فایل Word جزوه ساخته نشد؛ نسخه‌های دیگر در دسترس‌اند."
-                    notice_kind = "docx"
+                add_notice(
+                    "docx",
+                    "\n\nنکته: فایل Word جزوه آماده نشد.",
+                )
 
             if pdf_bytes is not None:
                 try:
@@ -1307,8 +1364,10 @@ class JobPipelineMixin:
                     pdf_ready = True
                 except Exception:
                     logger.exception("could not persist PDF booklet submission=%s", job.submission_id)
-                    notice = "\n\nنکته: فایل PDF جزوه ذخیره نشد؛ لطفاً بعداً دوباره تلاش کنید."
-                    notice_kind = "pdf_storage"
+                    add_notice(
+                        "pdf_storage",
+                        "\n\nنکته: ذخیرهٔ فایل PDF جزوه انجام نشد.",
+                    )
             if docx_bytes is not None:
                 try:
                     await self.db.binary_artifact_upsert(
@@ -1325,9 +1384,10 @@ class JobPipelineMixin:
                     docx_ready = True
                 except Exception:
                     logger.exception("could not persist DOCX booklet submission=%s", job.submission_id)
-                    if not notice:
-                        notice = "\n\nنکته: فایل Word جزوه ذخیره نشد؛ لطفاً بعداً دوباره تلاش کنید."
-                        notice_kind = "docx_storage"
+                    add_notice(
+                        "docx_storage",
+                        "\n\nنکته: ذخیرهٔ فایل Word جزوه انجام نشد.",
+                    )
 
             # The Library retains the editable source text and learning entry
             # points.  It is a virtual record (no automatic Telegram upload);
@@ -1373,16 +1433,17 @@ class JobPipelineMixin:
                         job.submission_id,
                         exc_info=True,
                     )
+            if not pdf_ready and not docx_ready:
+                add_notice(
+                    "booklet_unavailable",
+                    "\n\nنکته: فایل‌های جزوه ذخیره نشدند؛ متن خام درس در دسترس است.",
+                )
 
-        await self.db.set_submission_status(
-            job.submission_id,
-            "partial" if notice else "done",
-            error=notice.strip() or None,
-            error_kind=notice_kind or None,
+        notice = "".join(text for _kind, text in notice_parts)
+        notice_kinds = tuple(dict.fromkeys(kind for kind, _text in notice_parts))
+        notice_kind = notice_kinds[0] if len(notice_kinds) == 1 else (
+            "booklet_partial" if notice_kinds else ""
         )
-        if notice:
-            job.meta["outcome"] = "partial"
-        await progress.complete()
         await self._deliver_results(
             job,
             document,
@@ -1390,7 +1451,9 @@ class JobPipelineMixin:
             has_booklet=pdf_ready,
             has_docx=docx_ready,
             has_keypoints=bool(getattr(notes, "key_points", ()) or ()),
+            progress=progress,
             notice=notice,
+            notice_kind=notice_kind,
         )
 
     async def _send_telegram_file(
@@ -1517,7 +1580,8 @@ class JobPipelineMixin:
         has_docx: bool = False,
         progress: Any | None = None,
         notice: str = "",
-    ) -> None:
+        notice_kind: str = "",
+    ) -> bool:
         """End the job with one message and a button per artifact.
 
         This replaces the old two-push ending (transcript file, a chat preview,
@@ -1606,18 +1670,46 @@ class JobPipelineMixin:
         # Quality notices are a suffix to the single results message: do not
         # create a competing Telegram interaction or expose any source text.
         body += notice
-        try:
-            await self._reply(job, body, buttons=buttons)
-        except Exception:
+        notified = await self._reply(job, body, buttons=buttons)
+        if not notified:
             logger.warning(
                 "results message could not be delivered submission=%s",
                 job.submission_id,
-                exc_info=True,
             )
+            job.meta["delivery_failed"] = True
+        status = "done" if notified and not notice else "partial"
+        status_error = notice.strip() or None
+        status_kind = notice_kind or None
+        if not notified:
+            status_error = "\n".join(
+                part for part in ("results notification failed", status_error) if part
+            )
+            status_kind = "notification"
+        try:
+            await self.db.set_submission_status(
+                job.submission_id,
+                status,
+                error=status_error,
+                error_kind=status_kind,
+            )
+        except Exception:
+            job.meta["delivery_failed"] = True
+            job.meta["delivery_status_failed"] = True
+            logger.exception(
+                "could not persist final submission outcome submission=%s",
+                job.submission_id,
+            )
+        job.meta["outcome"] = status
         if progress is not None:
-            await progress.complete(
-                texts.DELIVERY_READY_HEADER.format(reference=reference)
-            )
+            if notified:
+                await progress.complete(
+                    texts.DELIVERY_READY_HEADER.format(reference=reference)
+                )
+            else:
+                fail = getattr(progress, "fail", None)
+                if callable(fail):
+                    await fail(str(job.submission_id))
+        return notified
 
     async def _fetch_artifact(self, event: Any, user_id: int, data: str) -> None:
         """Send one owner-scoped artifact without regenerating a booklet.

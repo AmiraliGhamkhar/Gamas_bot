@@ -4,6 +4,18 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Safe booklet recovery and delivery status.** Numeric/term evidence retains
+original text spans so the final scrub removes only disproved occurrences and
+unsupported clauses; high-risk medical claims are prioritized and removed as a
+unit when a value cannot be safely isolated. A scrubbed booklet is re-audited,
+with a source-only structured outline as the deterministic fallback. Structural
+validity is checked before rendering. Safe content loss (including after compile)
+is reported as `partial` rather than discarding the booklet solely for a
+coverage ratio; notices are aggregated. Final `done`/progress completion now
+requires a successful results reply, while failed notifications remain `partial`.
+Failed/restarted submissions with a saved non-empty transcript recover as
+`partial`; the one-time status backfill covers older rows too.
+
 **Billing catalog and Gemini 3.5 request contract.** The current commercial
 catalog is six explicit 30-day plans (3, 6, 10, 20, 26 and 30 hours), each with
 separate list and sale prices; the unconfirmed 50-hour tier is not offered.

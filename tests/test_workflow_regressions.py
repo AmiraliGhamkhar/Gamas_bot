@@ -104,6 +104,31 @@ class CreditLotTests(DatabaseTestCase):
         await self.db.settle_hold(sid, 100)
         self.assertEqual(await self.db.available_seconds(100), 1000)
         await self.db.set_submission_status(sid, "failed")
+        # Billing settlement is not evidence that a transcript or booklet was saved.
+        self.assertEqual((await self.db.submission(sid)).status, "failed")
+
+    async def test_failed_job_with_persisted_transcript_is_partial_not_done(self):
+        sid = await self.db.create_submission(100, "audio", "a")
+        await self.db.save_transcription(
+            sid, engine="test", text="source transcript", notes_json=""
+        )
+        await self.db.set_submission_status(sid, "failed", error="booklet render failed")
+        self.assertEqual((await self.db.submission(sid)).status, "partial")
+
+    async def test_status_backfill_upgrades_old_failed_rows_with_transcripts(self):
+        sid = await self.db.create_submission(100, "audio", "a")
+        await self.db.save_transcription(
+            sid, engine="test", text="source transcript", notes_json=""
+        )
+        await self.db._write(
+            "UPDATE submissions SET status='failed' WHERE submission_id=?", (sid,)
+        )
+        # Simulate a database that already completed the credit-lot migration,
+        # but has not yet run the newer transcript/status recovery backfill.
+        await self.db._write(
+            "DELETE FROM billing_migrations WHERE name='failed_transcript_partial_v1'"
+        )
+        await self.db._backfill_allocations()
         self.assertEqual((await self.db.submission(sid)).status, "partial")
 
     async def test_two_connections_cannot_overreserve(self):
@@ -269,6 +294,9 @@ class TransactionAndPaymentTests(DatabaseTestCase):
         sid = await self.db.create_submission(100, "audio", "a")
         await self.db.set_submission_status(sid, "processing", duration_seconds=100)
         await self.db.reserve(100, sid, 100)
+        await self.db.save_transcription(
+            sid, engine="test", text="source transcript", notes_json=""
+        )
         await self.db.settle_hold(sid, 100)
         self.assertEqual(await self.db.recover_interrupted(), 1)
         self.assertEqual((await self.db.submission(sid)).status, "partial")
@@ -471,6 +499,8 @@ class LegacyAllocationMigrationTests(DatabaseTestCase):
                 VALUES(100, 1000, 'credit', '2026-01-02T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
             INSERT INTO submissions(user_id, kind, status, duration_seconds, created_at)
                 VALUES(100, 'audio', 'processing', 100, '2026-01-01T00:00:00+00:00');
+            INSERT INTO transcriptions(submission_id, engine, text, notes_json, created_at)
+                VALUES(1, 'test', 'source transcript', '', '2026-01-01T00:00:00+00:00');
             INSERT INTO holds(submission_id, user_id, seconds, created_at, released_at, settled)
                 VALUES(1, 100, 100, '2026-01-01T01:00:00+00:00', '2026-01-03T00:00:00+00:00', 1);
             INSERT INTO ledger(user_id, seconds, kind, note, created_at)

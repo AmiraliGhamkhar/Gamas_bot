@@ -544,11 +544,14 @@ class StatusStampTests(ReportingTestCase):
         )
         self.assertEqual(rows[0][0], "stt")
 
-    async def test_failed_after_delivery_becomes_partial_with_its_category(self):
+    async def test_failed_with_saved_transcript_becomes_partial_with_its_category(self):
         submission = await self.add_submission(status="done")
         await self.db._write(
             "UPDATE submissions SET delivered_at = ? WHERE submission_id = ?",
             (iso_at(timedelta(minutes=-20)), submission),
+        )
+        await self.db.save_transcription(
+            submission, engine="test", text="source transcript", notes_json=""
         )
         await self.db.set_submission_status(
             submission, "failed", error="booklet", error_kind="notes"

@@ -21,7 +21,7 @@ from gamas_bot.billing import PLAN_26_CODE, PLAN_30_CODE, plan_catalog
 from gamas_bot.bot import GamasBot, SUPPORT_CATEGORY_BUTTONS
 from gamas_bot.db import Database
 from gamas_bot.media import MediaInfo
-from gamas_bot.notes import StructuredNotes
+from gamas_bot.notes import NoteSection, StructuredNotes
 from gamas_bot.progress import to_persian_digits
 from gamas_bot.transcript import RawTranscript
 from tests.support import FakeJobEvent, FakeTelegramClient, make_settings, wav_bytes
@@ -379,7 +379,11 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         event.message.attach_voice(duration=12)
         self.bot.client = event.client
         raw = RawTranscript.from_text("متن کامل جلسه", engine="deepgram")
-        notes = StructuredNotes(title="جزوهٔ خودکار", summary="خلاصهٔ جلسه")
+        notes = StructuredNotes(
+            title="جزوهٔ خودکار",
+            summary="خلاصهٔ جلسه",
+            sections=(NoteSection(heading="گزارش جلسه", paragraphs=("متن کامل جلسه",)),),
+        )
 
         with (
             mock.patch(

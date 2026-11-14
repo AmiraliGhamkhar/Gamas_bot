@@ -24,7 +24,7 @@ from gamas_bot.bot import (
     _parse_telegram_user_id,
 )
 from gamas_bot.db import Database
-from gamas_bot.notes import NoteQualityError, StructuredNotes
+from gamas_bot.notes import NoteQualityError, NoteSection, StructuredNotes
 from gamas_bot.jobs import Job
 from gamas_bot.media import MediaInfo, MediaToolError
 from gamas_bot.presentations import PreparedAudio, PresentationContent, SlideText
@@ -502,7 +502,9 @@ class FileDeliveryTests(BotPipelineTestCase):
         with mock.patch(
             "gamas_bot.bot.structure_transcript",
             new=mock.AsyncMock(return_value=StructuredNotes(
-                title="جزوهٔ فایل", summary="خلاصهٔ کلاس"
+                title="جزوهٔ فایل",
+                summary="خلاصهٔ کلاس",
+                sections=(NoteSection(heading="محتوای درس", paragraphs=("متن آزمایشی",)),),
             )),
         ):
             submission = await self.run_media_job(event, transcribe=self._raw())
@@ -520,6 +522,51 @@ class FileDeliveryTests(BotPipelineTestCase):
         assert row is not None
         self.assertEqual(row.status, "done")
 
+    async def test_render_boundary_withholds_structurally_invalid_booklet(self):
+        event = self.media_event()
+        submission = await self.db.create_submission(USER_ID, "audio", "a.wav")
+        progress = await JobProgress.create(event, submission_id=submission, animate=False)
+        job = Job(
+            submission_id=submission,
+            user_id=USER_ID,
+            kind="audio",
+            filename="a.wav",
+            message=event.message,
+            is_admin=False,
+            meta={"progress": progress},
+        )
+        invalid_notes = StructuredNotes(title="", sections=())
+        document = SimpleNamespace(llm_document=lambda: "")
+
+        with (
+            mock.patch("gamas_bot.bot_jobs.build_notes_pdf") as render_pdf,
+            mock.patch("gamas_bot.bot_jobs.build_notes_docx") as render_docx,
+        ):
+            await self.bot._deliver_booklet(
+                job,
+                Path(self._tmp.name),
+                invalid_notes,
+                document,
+                f"GMS-{submission}",
+                SimpleNamespace(),
+                progress,
+            )
+
+        render_pdf.assert_not_called()
+        render_docx.assert_not_called()
+        self.assertEqual(job.meta.get("note_failure"), "structure")
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "partial")
+        self.assertEqual(
+            (await self.db.read_db.execute_fetchall(
+                "SELECT error_kind FROM submissions WHERE submission_id=?", (submission,)
+            ))[0][0],
+            "notes_structure",
+        )
+        self.assertTrue(any("ساختار جزوه" in reply for reply in event.replies))
+        self.assertIsNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
+
     async def test_invalid_pdf_bytes_are_not_persisted_as_a_successful_booklet(self):
         event = self.media_event()
         self.bot.settings = replace(
@@ -531,7 +578,9 @@ class FileDeliveryTests(BotPipelineTestCase):
             mock.patch(
                 "gamas_bot.bot.structure_transcript",
                 new=mock.AsyncMock(return_value=StructuredNotes(
-                    title="جزوه", summary="خلاصه"
+                    title="جزوه",
+                    summary="خلاصه",
+                    sections=(NoteSection(heading="محتوای درس", paragraphs=("متن آزمایشی",)),),
                 )),
             ),
             mock.patch(
@@ -594,14 +643,11 @@ class FileDeliveryTests(BotPipelineTestCase):
         self.assertEqual(await self.debit_count(USER_ID), 1)
         self.assertEqual(await self.db.available_seconds(USER_ID), 3600 - 100)
 
-    async def test_unreachable_chat_still_charges_once_and_keeps_the_transcript(self):
-        """A chat that refuses messages cannot make the work disappear.
+    async def test_unreachable_chat_is_partial_and_keeps_the_transcript(self):
+        """A failed results message must not be recorded as successful delivery.
 
-        Settlement no longer depends on a push succeeding: the transcript is
-        produced and stored (that is what the user paid for), and every artifact
-        is fetched later from that row for free. So an unreachable chat fails
-        nothing and refunds nothing — it only means the results message has to be
-        read when the chat works again.
+        The transcript and its charge are durable, but the notification failed;
+        the submission is therefore partial and can be recovered from its row.
         """
         event = self.media_event()
 
@@ -614,14 +660,58 @@ class FileDeliveryTests(BotPipelineTestCase):
 
         row = await self.db.submission(submission)
         assert row is not None
-        self.assertEqual(row.status, "done")
+        self.assertEqual(row.status, "partial")
         self.assertEqual(await self.db.available_seconds(USER_ID), 3600 - 100)
         self.assertEqual(await self.debit_count(USER_ID), 1)
+        errors = await self.db.read_db.execute_fetchall(
+            "SELECT error, error_kind FROM submissions WHERE submission_id=?", (submission,)
+        )
+        self.assertEqual(errors[0][1], "notification")
+        self.assertIn("results notification failed", errors[0][0])
         # The finished transcription survives the failed delivery attempt and is
         # still what the transcript button will render.
         transcript = await self.db.transcription(submission)
         assert transcript is not None
         self.assertIn("سلام دوستان. امروز", transcript["text"])
+
+    async def test_failed_results_reply_marks_partial_and_fails_progress(self):
+        event = self.wire(FakeJobEvent())
+        submission = await self.db.create_submission(USER_ID, "audio", "a.wav")
+        job = Job(
+            submission_id=submission,
+            user_id=USER_ID,
+            kind="audio",
+            filename="a.wav",
+            message=event.message,
+            is_admin=False,
+            meta={},
+        )
+        progress = mock.AsyncMock()
+
+        async def refuse(*_args, **_kwargs):
+            raise RuntimeError("Telegram unavailable")
+
+        event.client.send_message = refuse
+        notified = await self.bot._deliver_results(
+            job,
+            SimpleNamespace(speakers=0),
+            f"GMS-{submission}",
+            has_booklet=False,
+            has_keypoints=False,
+            progress=progress,
+        )
+
+        self.assertFalse(notified)
+        self.assertTrue(job.meta["delivery_failed"])
+        progress.fail.assert_awaited_once_with(str(submission))
+        progress.complete.assert_not_awaited()
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "partial")
+        errors = await self.db.read_db.execute_fetchall(
+            "SELECT error_kind FROM submissions WHERE submission_id=?", (submission,)
+        )
+        self.assertEqual(errors[0][0], "notification")
 
     async def debit_count(self, user_id: int) -> int:
         rows = await self.db.db.execute_fetchall(
@@ -801,7 +891,7 @@ class IncompleteBookletDeliveryTests(BotPipelineTestCase):
         kinds = await self.db.read_db.execute_fetchall(
             "SELECT error_kind FROM submissions WHERE submission_id=?", (submission,)
         )
-        self.assertEqual(kinds[0][0], "notes_incomplete")
+        self.assertEqual(kinds[0][0], "booklet_partial")
         # The accepted booklet is still delivered; only the claim of a complete,
         # verified booklet is withdrawn.
         self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
@@ -2133,7 +2223,11 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         event = FakeJobEvent(source=audio_path, chat_id=user_id)
         event.message.attach_voice(duration=12)
         self.bot.client = event.client
-        notes = StructuredNotes(title="جزوهٔ خودکار", summary="خلاصهٔ درس")
+        notes = StructuredNotes(
+            title="جزوهٔ خودکار",
+            summary="خلاصهٔ درس",
+            sections=(NoteSection(heading="جلسهٔ نخست", paragraphs=("سلام به همگی",)),),
+        )
         raw = STTRawTranscript.from_text("سلام به همگی در جلسهٔ نخست", engine="deepgram")
         with (
             mock.patch(

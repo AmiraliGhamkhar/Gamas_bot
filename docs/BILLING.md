@@ -43,11 +43,14 @@ syncs do not deactivate unrelated plans.
   transcript.
 - Pre-delivery failure or cancel releases the hold; startup recovery releases
   interrupted holds.
-- A later booklet failure leaves a `partial` job when the base transcript was
-  retained. The measured transcription charge stands even if no PDF booklet was
-  persisted: booklet generation is optional and has no separate user charge.
-  Only a persisted PDF artifact counts as a booklet-ready result; a DOCX alone
-  does not count as the PDF booklet.
+- A later booklet or results-notification failure leaves a `partial` job when
+  the base transcript was retained. The measured transcription charge stands
+  even if no PDF booklet was persisted: booklet generation is optional and has
+  no separate user charge. Only a persisted PDF artifact counts as a
+  booklet-ready result; a DOCX alone does not count as the PDF booklet.
+- Failure/restart recovery uses a saved non-empty transcript to distinguish
+  `partial` from `failed`; a billing settlement or `delivered_at` timestamp by
+  itself is not evidence that transcript content was persisted.
 - PowerPoint charges the source narration, not inserted silence. A deck without
   narration is free.
 
