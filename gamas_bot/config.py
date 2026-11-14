@@ -29,6 +29,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 
+from .billing import FREE_PLAN_HOURS, PAID_PLAN_SPECS
+
 logger = logging.getLogger(__name__)
 
 TRUTHY = {"1", "true", "yes", "on"}
@@ -97,14 +99,12 @@ DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 #: (https://docs.avalai.ir/en/providers/deepseek).
 DEFAULT_AVALAI_BASE_URL = "https://api.avalai.ir/v1"
 DEFAULT_AVALAI_MODEL = "deepseek-v4.1-flash"
-#: Gemini thinking budget sent as ``generationConfig.thinkingConfig.thinkingBudget``:
-#:
-#: * ``0`` (default) disables thinking outright — the note task is extraction
-#:   and organisation, so hidden reasoning tokens are pure latency; the model
-#:   answers as soon as it starts emitting JSON.
-#: * a positive value caps the reasoning tokens the model may spend.
-#: * ``-1`` sends no ``thinkingConfig`` field at all (pre-flag behaviour).
+#: Legacy Gemini 2.x thinking budget. Gemini 3.x models use the documented
+#: ``thinkingLevel`` enum instead; the default model's ``minimal`` default keeps
+#: extraction fast without sending a deprecated numeric budget.
 DEFAULT_GEMINI_THINKING_BUDGET = 0
+DEFAULT_GEMINI_THINKING_LEVEL = "minimal"
+GEMINI_THINKING_LEVELS = ("minimal", "low", "medium", "high")
 NOTE_BASE_URL_DEFAULTS = {
     "openrouter": DEFAULT_OPENROUTER_BASE_URL,
     "gemini": "https://generativelanguage.googleapis.com/v1beta",
@@ -167,28 +167,33 @@ MIN_NOTE_INPUT_TOKENS = 4096
 #: Headroom for the note system prompt and provider/request scaffolding.
 MIN_NOTE_PROMPT_TOKENS = 4096
 
-#: Environment variable -> resolved settings attribute for the tariff. The
-#: attribute spelling matches the dataclass field exactly.
-PLAN_ENV_FIELDS = (
-    ("FREE_PLAN_HOURS", "free_plan_hours", 1),
-    ("PLAN_3_HOURS", "plan_3_hours", 3),
-    ("PLAN_3_PRICE_TOMAN", "plan_3_price_toman", 65_000),
-    ("PLAN_3_VALIDITY_DAYS", "plan_3_validity_days", 30),
-    ("PLAN_9_HOURS", "plan_9_hours", 9),
-    ("PLAN_9_PRICE_TOMAN", "plan_9_price_toman", 195_000),
-    ("PLAN_9_VALIDITY_DAYS", "plan_9_validity_days", 30),
-    ("PLAN_12_HOURS", "plan_12_hours", 12),
-    ("PLAN_12_PRICE_TOMAN", "plan_12_price_toman", 260_000),
-    ("PLAN_12_VALIDITY_DAYS", "plan_12_validity_days", 30),
-    ("PLAN_24_HOURS", "plan_24_hours", 24),
-    ("PLAN_24_PRICE_TOMAN", "plan_24_price_toman", 520_000),
-    ("PLAN_24_VALIDITY_DAYS", "plan_24_validity_days", 30),
-    ("PLAN_36_HOURS", "plan_36_hours", 36),
-    ("PLAN_36_PRICE_TOMAN", "plan_36_price_toman", 780_000),
-    ("PLAN_36_VALIDITY_DAYS", "plan_36_validity_days", 30),
-    ("PLAN_60_HOURS", "plan_60_hours", 60),
-    ("PLAN_60_PRICE_TOMAN", "plan_60_price_toman", 1_300_000),
-    ("PLAN_60_VALIDITY_DAYS", "plan_60_validity_days", 30),
+#: Environment variable -> resolved Settings attribute -> canonical default.
+#: Plan amounts are derived from the one catalog in ``billing.PAID_PLAN_SPECS``;
+#: configuration parsing cannot drift to a second set of prices.
+PLAN_ENV_FIELDS: tuple[tuple[str, str, int], ...] = (
+    (("FREE_PLAN_HOURS", "free_plan_hours", FREE_PLAN_HOURS),)
+    + tuple(
+        field
+        for spec in PAID_PLAN_SPECS
+        for field in (
+            (f"PLAN_{spec.hours}_HOURS", f"{spec.key}_hours", spec.hours),
+            (
+                f"PLAN_{spec.hours}_ORIGINAL_PRICE_TOMAN",
+                f"{spec.key}_original_price_toman",
+                spec.original_price_toman,
+            ),
+            (
+                f"PLAN_{spec.hours}_PRICE_TOMAN",
+                f"{spec.key}_price_toman",
+                spec.price_toman,
+            ),
+            (
+                f"PLAN_{spec.hours}_VALIDITY_DAYS",
+                f"{spec.key}_validity_days",
+                spec.validity_days,
+            ),
+        )
+    )
 )
 
 #: Default failover order for speech-to-text. Only configured providers are
@@ -313,7 +318,7 @@ def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int | None =
 def _plan_value(name: str, default: int) -> int:
     """Read one tariff value *without* clamping it.
 
-    ``_env_int`` clamps to its minimum, which turned ``PLAN_5_PRICE_TOMAN=0``
+    ``_env_int`` clamps to its minimum, which turned ``PLAN_3_PRICE_TOMAN=0``
     into a 1-Toman price instead of a visible configuration error — the exact
     kind of silently-quoted number this project refuses elsewhere. The raw
     integer is kept here so ``billing._resolved`` can fall back to the
@@ -427,6 +432,12 @@ def resolve_note_reasoning_effort(effort: str | None) -> str:
     if value == "ultra":
         value = "max"
     return value if value in NOTE_REASONING_EFFORTS else ""
+
+
+def resolve_gemini_thinking_level(level: str | None) -> str:
+    """Resolve the documented Gemini 3.x thinking level enum."""
+    value = (level or "").strip().lower()
+    return value if value in GEMINI_THINKING_LEVELS else DEFAULT_GEMINI_THINKING_LEVEL
 
 
 def _ocr_language(value: str | None) -> str:
@@ -574,6 +585,7 @@ class Settings:
     #: ``0`` disables Gemini thinking, a positive value caps it, ``-1`` sends no
     #: ``thinkingConfig`` field at all (see ``DEFAULT_GEMINI_THINKING_BUDGET``).
     gemini_thinking_budget: int
+    gemini_thinking_level: str
     note_context_tokens: int
     note_mode: str
     note_max_output_tokens: int
@@ -635,23 +647,29 @@ class Settings:
     transcript_retention_days: int
     free_plan_hours: int
     plan_3_hours: int
+    plan_3_original_price_toman: int
     plan_3_price_toman: int
     plan_3_validity_days: int
-    plan_9_hours: int
-    plan_9_price_toman: int
-    plan_9_validity_days: int
-    plan_12_hours: int
-    plan_12_price_toman: int
-    plan_12_validity_days: int
-    plan_24_hours: int
-    plan_24_price_toman: int
-    plan_24_validity_days: int
-    plan_36_hours: int
-    plan_36_price_toman: int
-    plan_36_validity_days: int
-    plan_60_hours: int
-    plan_60_price_toman: int
-    plan_60_validity_days: int
+    plan_6_hours: int
+    plan_6_original_price_toman: int
+    plan_6_price_toman: int
+    plan_6_validity_days: int
+    plan_10_hours: int
+    plan_10_original_price_toman: int
+    plan_10_price_toman: int
+    plan_10_validity_days: int
+    plan_20_hours: int
+    plan_20_original_price_toman: int
+    plan_20_price_toman: int
+    plan_20_validity_days: int
+    plan_26_hours: int
+    plan_26_original_price_toman: int
+    plan_26_price_toman: int
+    plan_26_validity_days: int
+    plan_30_hours: int
+    plan_30_original_price_toman: int
+    plan_30_price_toman: int
+    plan_30_validity_days: int
 
     # --- Stage concurrency, non-blocking provider capacity & deduplication ---
     max_concurrent_downloads: int = DEFAULT_MAX_CONCURRENT_DOWNLOADS
@@ -783,13 +801,6 @@ class Settings:
     #: Deepgram diarizer version (``latest``/``v1``/``v2``). Empty keeps the
     #: legacy ``diarize=true`` (v1). See docs/PROVIDERS.md.
     deepgram_diarize_model: str = ""
-    #: Confirmed per-100k-credit tariff. Business-confirmed: 65,000 Toman per
-    #: 100,000 credits (3 hours). Override via CREDIT_PRICE_PER_100K_TOMAN only
-    #: with operator approval; changes trigger a startup diagnostic.
-    credit_price_per_100k_toman: int = 65_000
-    #: Deprecated compatibility flag; the confirmed tariff is always live.
-    v2_tariff_activated: bool = True
-
     # ------------------------------------------------------------------ views
     @property
     def speechmatics_configured(self) -> bool:
@@ -1157,7 +1168,8 @@ def note_route_summary(settings: Settings) -> list[str]:
         f"Structured output: {'enabled' if settings.note_structured_output else 'disabled'}",
         f"Reasoning effort: {settings.note_reasoning_effort or '(provider default)'}",
         f"Maximum output tokens: {settings.note_max_output_tokens}",
-        f"Gemini thinking budget: {thinking_text}",
+        f"Gemini legacy thinking budget: {thinking_text}",
+        f"Gemini 3.x thinking level: {settings.gemini_thinking_level}",
         "Active providers:",
     ]
     if not routes:
@@ -1387,10 +1399,6 @@ def from_env(env_file: str | None = None) -> Settings:
         stt_preprocess=_env_bool("STT_PREPROCESS", True),
         stt_preserve_stereo=_env_bool("STT_PRESERVE_STEREO", False),
         deepgram_diarize_model=_env("DEEPGRAM_DIARIZE_MODEL", ""),
-        credit_price_per_100k_toman=_env_int(
-            "CREDIT_PRICE_PER_100K_TOMAN", 65_000, minimum=1
-        ),
-        v2_tariff_activated=_env_bool("V2_TARIFF_ACTIVATED", True),
         stt_speaker_sensitivity=_env_float(
             "STT_SPEAKER_SENSITIVITY", 0.5, minimum=0.0, maximum=1.0
         ),
@@ -1431,6 +1439,9 @@ def from_env(env_file: str | None = None) -> Settings:
             DEFAULT_GEMINI_THINKING_BUDGET,
             minimum=-1,
             maximum=32768,
+        ),
+        gemini_thinking_level=resolve_gemini_thinking_level(
+            _env("NOTE_GEMINI_THINKING_LEVEL", DEFAULT_GEMINI_THINKING_LEVEL)
         ),
         note_context_tokens=_env_int(
             "NOTE_CONTEXT_TOKENS", DEFAULT_NOTE_CONTEXT_TOKENS, minimum=2048
@@ -1993,30 +2004,6 @@ def _check_admin_and_subscription(settings: Settings) -> list[ConfigDiagnostic]:
     return items
 
 
-def _check_v2_tariff_activation(settings: Settings) -> list[ConfigDiagnostic]:
-    """Guard the tariff configuration at startup.
-
-    The business-confirmed tariff is 65,000 Toman per 100,000 credits
-    (3 hours). A CREDIT_PRICE_PER_100K_TOMAN that differs materially
-    (e.g. the obsolete literal ``65`` value from the early brief) is reported
-    loudly so a misconfiguration never silently applies a 1000x wrong price.
-    """
-    from .billing import PRICE_TOMAN_PER_PACKAGE, price_change_preview
-
-    preview = price_change_preview(settings.credit_price_per_100k_toman)
-    items: list[ConfigDiagnostic] = []
-    price = int(settings.credit_price_per_100k_toman)
-    if bool(preview["major_discrepancy"]):
-        items.append(
-            ConfigDiagnostic(
-                f"CREDIT_PRICE_PER_100K_TOMAN={price} differs from the confirmed "
-                f"tariff {PRICE_TOMAN_PER_PACKAGE} by more than 10x. Verify the "
-                "value (canonical is 65000, not 65)."
-            )
-        )
-    return items
-
-
 def _check_tariff_overrides(settings: Settings) -> list[ConfigDiagnostic]:
     if not settings.plan_values:
         return []
@@ -2028,6 +2015,16 @@ def _check_tariff_overrides(settings: Settings) -> list[ConfigDiagnostic]:
                 ConfigDiagnostic(
                     f"{name}={value!r} is not a positive number; the built-in "
                     f"{attribute}={default} is used instead. Fix or remove {name}."
+                )
+            )
+    for spec in PAID_PLAN_SPECS:
+        original = settings.plan_values.get(f"{spec.key}_original_price_toman")
+        sale = settings.plan_values.get(f"{spec.key}_price_toman")
+        if original is not None and sale is not None and original > 0 and sale > 0 and original <= sale:
+            items.append(
+                ConfigDiagnostic(
+                    f"PLAN_{spec.hours}_ORIGINAL_PRICE_TOMAN must exceed "
+                    f"PLAN_{spec.hours}_PRICE_TOMAN; review the list and sale prices."
                 )
             )
     return items
@@ -2043,7 +2040,6 @@ CONFIG_CHECK_RULES: tuple[ConfigCheckRule, ...] = (
     _check_media_deadlines,
     _check_admin_and_subscription,
     _check_tariff_overrides,
-    _check_v2_tariff_activation,
 )
 
 

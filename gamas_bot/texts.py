@@ -604,7 +604,7 @@ TRACKING_CODE_TEMPLATE: Final = "کد پیگیری: {reference}"
 WALLET_TITLE: Final = "💳 اعتبار و خرید بسته"
 WALLET_NO_PLANS: Final = "فعلاً بسته‌ای برای خرید موجود نیست."
 WALLET_CHOOSE_PLAN: Final = "بسته را انتخاب کنید؛ اعتبار خرید به موجودی شما اضافه می‌شود."
-WALLET_PLAN_ROW_TEMPLATE: Final = "• {credits}\n  اعتبار: {validity} | مبلغ: {price}"
+WALLET_PLAN_ROW_TEMPLATE: Final = "• {credits}\n  اعتبار: {validity} | {price}"
 WALLET_PLAN_BUTTON_TEMPLATE: Final = "{credits} — {price}"
 #: The credit amount as it appears inside a plan button.
 WALLET_PLAN_BUTTON_CREDITS: Final = "{credits} اعتبار"

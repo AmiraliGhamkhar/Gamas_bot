@@ -129,6 +129,6 @@ ran; a partial run is not a pass.
 
 ## Additional developer CLIs
 
-- `python -m scripts.credit_price_preview` prints the tariff and plan catalogue.
+- `python -m scripts.plan_catalog_preview` prints the explicit catalog and usage-unit conversion; it never derives prices.
 - `python -m scripts.smoke_avalai` checks AvalAI metadata; generation is opt-in and uses provider quota.
 - `python -m scripts.evaluate_diarization` evaluates diarization and transcription from a reference and hypothesis.

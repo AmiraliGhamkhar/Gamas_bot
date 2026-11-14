@@ -6,6 +6,19 @@ startup. Use `python -m gamas_bot --check` for offline configuration diagnostics
 See [Providers](PROVIDERS.md) for routing and [Operations](OPERATIONS.md) for
 paths, retention and host sizing.
 
+## Subscription plans
+
+`gamas_bot.billing.PAID_PLAN_SPECS` is the canonical six-plan catalog. Each
+plan has explicit `PLAN_<hours>_ORIGINAL_PRICE_TOMAN` and
+`PLAN_<hours>_PRICE_TOMAN` settings plus hours and 30-day validity; the latter
+is the final price charged and frozen in the payment snapshot. Defaults are
+listed in [Billing](BILLING.md). Prices are not calculated from the credit unit
+or plan duration. No 50-hour plan code or configuration keys are defined;
+that tier stays unavailable until both prices are confirmed. On full startup
+sync, obsolete standard plans are marked inactive while custom plans, payments,
+snapshots and balances are preserved; partial sync never retires unrelated
+plans.
+
 ## Text-generation credentials
 
 Only **Gemini**, **AvalAI** and **OpenRouter** are routable. Each needs its own
@@ -15,6 +28,16 @@ skips that route. The models shipped with the code are Gemini
 `nvidia/nemotron-3.5-super-vl:free`. Override them with `GEMINI_MODEL`,
 `AVALAI_MODEL` or `OPENROUTER_MODEL`; the two gateway bases are configurable too.
 These defaults do not establish live availability or account entitlement.
+
+The native Gemini 3.5 Flash-Lite GenerateContent request uses the documented
+`contents`, `systemInstruction`, `generationConfig.maxOutputTokens`,
+`generationConfig.responseFormat.text` JSON MIME type/schema, and
+`generationConfig.thinkingConfig.thinkingLevel` fields. The request omits
+sampling parameters (`temperature`, `topP`, `topK`) and `candidateCount`; local
+JSON and domain validation remain authoritative if a provider rejects optional
+structured-output fields. `NOTE_GEMINI_THINKING_LEVEL` accepts `minimal`, `low`,
+`medium` or `high` for Gemini 3.x. The numeric
+`NOTE_GEMINI_THINKING_BUDGET` remains only for older Gemini models.
 
 `NOTE_PROVIDERS=avalai,gemini,openrouter` controls available providers, not an
 escape from task policy: known tasks have fixed priorities and OpenRouter is

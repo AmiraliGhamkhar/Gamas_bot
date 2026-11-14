@@ -11,6 +11,7 @@ from gamas_bot.config import (
     DEFAULT_DEEPGRAM_MODEL,
     DEFAULT_GEMINI_MODEL,
     DEFAULT_GEMINI_THINKING_BUDGET,
+    DEFAULT_GEMINI_THINKING_LEVEL,
     DEFAULT_NOTE_CHUNK_CHARS,
     DEFAULT_NOTE_CONTEXT_TOKENS,
     DEFAULT_NOTE_REQUEST_TIMEOUT_SECONDS,
@@ -145,12 +146,18 @@ class FromEnvTests(unittest.TestCase):
         self.assertEqual(settings.presentation_silence_seconds, 60.0)
 
     def test_plan_overrides(self):
-        values = {"PLAN_3_HOURS": "7", "PLAN_3_PRICE_TOMAN": "99000"}
+        values = {
+            "PLAN_3_HOURS": "7",
+            "PLAN_3_ORIGINAL_PRICE_TOMAN": "180000",
+            "PLAN_3_PRICE_TOMAN": "99000",
+        }
         with mock.patch.dict(os.environ, env(**values), clear=False):
             settings = from_env(env_file="/nonexistent")
         self.assertEqual(settings.plan_3_hours, 7)
+        self.assertEqual(settings.plan_3_original_price_toman, 180000)
         self.assertEqual(settings.plan_3_price_toman, 99000)
         self.assertEqual(settings.plan_values["plan_3_hours"], 7)
+        self.assertEqual(settings.tariff_values()["plan_3_original_price_toman"], 180000)
 
     def test_tariff_values_cover_every_plan_field(self):
         # Every plan field on the dataclass appears in tariff_values().
@@ -467,6 +474,7 @@ class GeminiConfigurationTests(unittest.TestCase):
         default = self.settings(GEMINI_API_KEY="g")
         self.assertEqual(default.gemini_model, DEFAULT_GEMINI_MODEL)
         self.assertEqual(default.gemini_thinking_budget, DEFAULT_GEMINI_THINKING_BUDGET)
+        self.assertEqual(default.gemini_thinking_level, DEFAULT_GEMINI_THINKING_LEVEL)
         self.assertEqual(DEFAULT_GEMINI_THINKING_BUDGET, 0)
         settings = self.settings(
             GEMINI_API_KEY="g", GEMINI_MODEL="synthetic-gemini-model",
@@ -479,6 +487,16 @@ class GeminiConfigurationTests(unittest.TestCase):
         for raw, expected in (("-1", -1), ("-5", -1), ("999999", 32768)):
             with self.subTest(raw=raw):
                 self.assertEqual(self.settings(NOTE_GEMINI_THINKING_BUDGET=raw).gemini_thinking_budget, expected)
+
+    def test_gemini_3_thinking_level_is_enum_validated(self):
+        self.assertEqual(
+            self.settings(NOTE_GEMINI_THINKING_LEVEL="HIGH").gemini_thinking_level,
+            "high",
+        )
+        self.assertEqual(
+            self.settings(NOTE_GEMINI_THINKING_LEVEL="unsupported").gemini_thinking_level,
+            DEFAULT_GEMINI_THINKING_LEVEL,
+        )
 
     def test_missing_generation_configuration_names_only_supported_credentials(self):
         settings = self.settings()

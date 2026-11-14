@@ -11,6 +11,7 @@ the billing-then-generation discipline in ``bot.py`` easy to follow.
 
 from __future__ import annotations
 
+from collections import Counter
 import json
 import logging
 import math
@@ -685,6 +686,34 @@ def _list_from_payload(payload: dict[str, Any], keys: tuple[str, ...]) -> list[A
     return None
 
 
+def _log_quiz_parse_diagnostics(
+    requested_count: int,
+    input_count: int,
+    accepted_count: int,
+    rejected_item_count: int,
+    rejected: Counter[str],
+) -> None:
+    """Emit content-free counts for strict quiz admission decisions."""
+    rejected_count = max(0, int(rejected_item_count))
+    extra: dict[str, object] = {
+        "event": "quiz_parse_diagnostics",
+        "quiz_requested_count": max(0, int(requested_count)),
+        "quiz_input_item_count": max(0, int(input_count)),
+        "quiz_accepted_item_count": max(0, int(accepted_count)),
+        "quiz_rejected_item_count": rejected_count,
+    }
+    for reason, amount in sorted(rejected.items()):
+        extra[f"quiz_rejected_{reason}"] = int(amount)
+    logger.info(
+        "quiz parser diagnostics requested=%d input=%d accepted=%d rejected=%d",
+        max(0, int(requested_count)),
+        max(0, int(input_count)),
+        max(0, int(accepted_count)),
+        rejected_count,
+        extra=extra,
+    )
+
+
 def parse_quiz_payload(
     payload: dict[str, Any],
     count: int,
@@ -703,14 +732,21 @@ def parse_quiz_payload(
     source locator and a valid ``medium``/``hard`` difficulty tag on every
     question, so both requirements are the default here — the flags only exist
     for explicitly permissive callers parsing pre-existing untagged content.
+    Rejection diagnostics contain counts only, never question or source text.
     """
+    rejected: Counter[str] = Counter()
+    rejected_item_count = 0
     raw_questions = _list_from_payload(payload, _QUIZ_LIST_KEYS)
     if not isinstance(raw_questions, list):
+        rejected["payload_shape"] = 1
+        _log_quiz_parse_diagnostics(count, 0, 0, 0, rejected)
         return []
     one_based = _one_based_correct(raw_questions)
     validated: list[dict[str, Any]] = []
     for entry in raw_questions:
         if not isinstance(entry, dict):
+            rejected["item_shape"] += 1
+            rejected_item_count += 1
             continue
         question = _clean_str(
             _entry_text(entry, "question", "q", "stem", "prompt", "سوال", "سؤال", "پرسش"),
@@ -727,19 +763,32 @@ def parse_quiz_payload(
             # The quiz schema requires four options. In particular, a three-option
             # numeric key is ambiguous and must never be silently mis-graded.
             logger.debug("dropped quiz item with invalid option shape")
+            rejected["option_shape"] += 1
+            rejected_item_count += 1
             continue
         if not question or not explain:
+            if not question:
+                rejected["question"] += 1
+            if not explain:
+                rejected["explanation"] += 1
+            rejected_item_count += 1
             continue
         if len(options) != 4 or any(not option for option in options):
+            rejected["empty_option"] += 1
+            rejected_item_count += 1
             continue
         option_keys = [normalize_front(option) for option in options]
         if any(not key for key in option_keys) or len(set(option_keys)) != 4:
             # Duplicate options make "single correct answer" ambiguous.
+            rejected["duplicate_option"] += 1
+            rejected_item_count += 1
             continue
         correct = _parse_correct(
             _correct_field(entry), one_based=one_based, options=options
         )
         if not isinstance(correct, int) or isinstance(correct, bool) or not 0 <= correct <= 3:
+            rejected["answer_key"] += 1
+            rejected_item_count += 1
             continue
         order = list(range(4))
         if rng is None:
@@ -764,16 +813,23 @@ def parse_quiz_payload(
         elif require_difficulty:
             # Invalid tag (missing, wrong type, or an unrecognized label): the
             # schema lists difficulty as required, so the item is inadmissible.
+            rejected["difficulty"] += 1
+            rejected_item_count += 1
             continue
         source = _clean_source(_source_field(entry))
         if source:
             record["source"] = source
         elif require_source:
             # Unanchored item: nothing in the document says where it came from.
+            rejected["source"] += 1
+            rejected_item_count += 1
             continue
         validated.append(record)
         if len(validated) >= int(count):
             break
+    _log_quiz_parse_diagnostics(
+        count, len(raw_questions), len(validated), rejected_item_count, rejected
+    )
     return validated
 
 

@@ -50,6 +50,7 @@ from .http_util import (
 )
 from .llm_profiles import (
     get_provider_profile,
+    to_gemini_response_format_schema,
     to_gemini_schema,
 )
 from .metrics import METRICS
@@ -735,6 +736,12 @@ def _gemini_model_id(model: str) -> str:
     return quote(raw.strip(), safe="")
 
 
+def _gemini_uses_v3_config(model: str) -> bool:
+    """Gemini 3+ uses responseFormat and thinkingLevel, not legacy fields."""
+    model_id = model.strip().lower().removeprefix("models/")
+    return bool(re.match(r"^gemini-[3-9](?:[.-])", model_id))
+
+
 def _openrouter_model_path(model: str) -> str:
     """Encode an OpenRouter ``author/slug[:variant]`` model id for URL paths."""
     parts = [part for part in model.strip().split("/") if part]
@@ -742,8 +749,13 @@ def _openrouter_model_path(model: str) -> str:
 
 
 def _gemini_schema(node: object) -> object:
-    """Convert a JSON Schema to Gemini's OpenAPI 3.0 ``responseSchema`` dialect."""
+    """Convert JSON Schema for Gemini's legacy ``responseSchema`` field."""
     return to_gemini_schema(node)
+
+
+def _gemini_response_format_schema(node: object) -> object:
+    """Convert JSON Schema for Gemini 3's native ``responseFormat`` field."""
+    return to_gemini_response_format_schema(node)
 
 
 #: Gemini FinishReason values that report safety, policy or recitation blocks
@@ -974,18 +986,32 @@ class GeminiDialect:
         model_id = _gemini_model_id(route.model.strip())
         url = _endpoint(route.base_url, f"models/{model_id}:generateContent")
         generation_config: dict[str, Any] = {
-            "temperature": NOTE_TEMPERATURE,
             "maxOutputTokens": settings.note_max_output_tokens,
-            "responseMimeType": "application/json",
         }
-        if schema is not None and bool(
-            getattr(settings, "note_structured_output", True)
-        ):
-            generation_config["responseSchema"] = _gemini_schema(schema)
-        if settings.gemini_thinking_budget >= 0:
+        if _gemini_uses_v3_config(route.model):
+            response_text: dict[str, Any] = {"mimeType": "APPLICATION_JSON"}
+            if schema is not None and bool(
+                getattr(settings, "note_structured_output", True)
+            ):
+                response_text["schema"] = _gemini_response_format_schema(schema)
+            generation_config["responseFormat"] = {"text": response_text}
             generation_config["thinkingConfig"] = {
-                "thinkingBudget": settings.gemini_thinking_budget,
+                "thinkingLevel": settings.gemini_thinking_level.upper(),
             }
+        else:
+            # Gemini 2.x retains the legacy request shape. The 3.x models
+            # deprecate sampling parameters and recommend thinkingLevel, so
+            # those are isolated above rather than retried on the hot path.
+            generation_config["temperature"] = NOTE_TEMPERATURE
+            generation_config["responseMimeType"] = "application/json"
+            if schema is not None and bool(
+                getattr(settings, "note_structured_output", True)
+            ):
+                generation_config["responseSchema"] = _gemini_schema(schema)
+            if settings.gemini_thinking_budget >= 0:
+                generation_config["thinkingConfig"] = {
+                    "thinkingBudget": settings.gemini_thinking_budget,
+                }
         payload: dict[str, Any] = {
             "contents": [{"role": "user", "parts": [{"text": user}]}],
             "systemInstruction": {"parts": [{"text": system}]},
@@ -1295,11 +1321,11 @@ def _adjust_rejected_request_param(
 ) -> str | None:
     """Adjust a request field after an explicit 400/404/422 parameter rejection.
 
-    ``provider_slug`` is used only for one narrow Gemini compatibility case: a
-    structured request that gets a 400 ``INVALID_ARGUMENT`` drops *only*
-    ``generationConfig.responseSchema`` and is retried once. The JSON mime type
-    and every other field stay, so the answer still goes through the existing
-    strict JSON parser and note validation.
+    Gemini compatibility is narrowly scoped to rejected documented fields: a
+    400 ``INVALID_ARGUMENT`` on a structured request removes only its optional
+    schema, retaining the JSON MIME type for local parsing. Explicitly rejected
+    request-shape fields are removed one at a time, within the global bounded
+    adjustment budget.
     """
     lower = error_text.lower()
     rejected_markers = (
@@ -1409,6 +1435,35 @@ def _adjust_rejected_request_param(
 
     generation_config = payload.get("generationConfig")
     if isinstance(generation_config, dict):
+        response_format = generation_config.get("responseFormat")
+        if isinstance(response_format, dict):
+            response_text = response_format.get("text")
+            text_config = response_text if isinstance(response_text, dict) else {}
+            if (
+                provider_slug == "gemini"
+                and "schema" in text_config
+                and _is_gemini_invalid_argument(error_text)
+            ):
+                # Keep the documented JSON MIME type and local strict parsing;
+                # only the provider-rejected optional schema is removed.
+                text_config.pop("schema", None)
+                return "generationConfig.responseFormat.text.schema_invalid_argument"
+            if (
+                "responseformat" in lower
+                and any(marker in lower for marker in rejected_markers)
+            ):
+                if "schema" in text_config and "schema" in lower:
+                    text_config.pop("schema", None)
+                    return "generationConfig.responseFormat.text.schema"
+                generation_config.pop("responseFormat", None)
+                return "generationConfig.responseFormat"
+            if (
+                "schema" in text_config
+                and "schema" in lower
+                and any(marker in lower for marker in rejected_markers)
+            ):
+                text_config.pop("schema", None)
+                return "generationConfig.responseFormat.text.schema"
         # The 2026-11-07 Gemini test failed with HTTP 400 INVALID_ARGUMENT when
         # structured output was enabled and succeeded with it disabled. The
         # exact rejected field was never isolated from the failing payload, so
@@ -1454,6 +1509,8 @@ def _adjust_rejected_request_param(
                     "thinking_config",
                     "thinkingbudget",
                     "thinking_budget",
+                    "thinkinglevel",
+                    "thinking_level",
                 )
             )
             and any(marker in lower for marker in rejected_markers)
@@ -2053,6 +2110,14 @@ async def _complete_on_route(
                         adjustment,
                         compatibility_adjustments,
                         MAX_COMPATIBILITY_ADJUSTMENTS,
+                        extra={
+                            "event": "llm_provider_compatibility_retry",
+                            "provider_slug": route.slug,
+                            "model_id": _sanitize_error_text(route.model, limit=80),
+                            "adjustment": adjustment,
+                            "retry_number": compatibility_adjustments,
+                            "retry_limit": MAX_COMPATIBILITY_ADJUSTMENTS,
+                        },
                     )
                     continue
                 if compatibility_adjustments >= MAX_COMPATIBILITY_ADJUSTMENTS:
@@ -2759,11 +2824,28 @@ def _log_route_policy(
             reasons.append(f"{route.slug}:unapproved")
         else:
             reasons.append(f"{route.slug}:blocked_by_{label.lower() or 'unknown'}")
+    task_label = (task or "UNSPECIFIED").strip().upper() or "UNSPECIFIED"
     logger.info(
         "LLM route policy task=%s sensitivity=%s routes=%s",
-        (task or "UNSPECIFIED").strip().upper() or "UNSPECIFIED",
+        task_label,
         label,
         ", ".join(reasons) or "none",
+        extra={
+            "event": "llm_route_policy",
+            "llm_task": task_label,
+            "data_sensitivity": label,
+            "configured_provider_count": len(configured),
+            "eligible_provider_count": len(eligible),
+            "eligible_providers": ",".join(
+                route.slug for route in eligible
+            ),
+            "route_gemini_eligible": "gemini" in allowed,
+            "route_avalai_eligible": "avalai" in allowed,
+            "route_openrouter_eligible": "openrouter" in allowed,
+            "blocked_provider_reasons": ",".join(
+                reason for reason in reasons if ":blocked_by_" in reason
+            ),
+        },
     )
 
 

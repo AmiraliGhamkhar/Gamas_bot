@@ -32,11 +32,11 @@ from .progress import to_persian_digits
 #: Canonical plan codes. ``free_1h`` is the lifetime free grant.
 FREE_PLAN_CODE = "free_1h"
 PLAN_3_CODE = "paid_3h_30d"
-PLAN_9_CODE = "paid_9h_30d"
-PLAN_12_CODE = "paid_12h_30d"
-PLAN_24_CODE = "paid_24h_30d"
-PLAN_36_CODE = "paid_36h_30d"
-PLAN_60_CODE = "paid_60h_30d"
+PLAN_6_CODE = "paid_6h_30d"
+PLAN_10_CODE = "paid_10h_30d"
+PLAN_20_CODE = "paid_20h_30d"
+PLAN_26_CODE = "paid_26h_30d"
+PLAN_30_CODE = "paid_30h_30d"
 
 # Canonical catalogue. These are defaults: an operator may override the tariff
 # through the ``FREE_PLAN_HOURS`` / ``PLAN_*`` environment variables, and the
@@ -56,22 +56,15 @@ SECONDS_PER_HOUR = 3_600
 # The credit currency
 # ---------------------------------------------------------------------------
 
-#: Minimum purchase unit, and the unit the tariff is quoted in.
-CREDIT_PACKAGE_SIZE = 100_000
-#: Canonical credit unit: ``CREDITS_PER_UNIT`` credits are ``SECONDS_PER_UNIT``
-#: seconds of audio. The pair is the single definition every screen shares.
+#: One exact usage-conversion unit; it is not a purchase or price unit.
 CREDITS_PER_UNIT = 100_000
 SECONDS_PER_UNIT = 10_800
-#: Hours of audio one purchase unit pays for.
-HOURS_PER_PACKAGE = 3
-#: Canonical selling price of one purchase unit, in toman.
-#: Business-confirmed tariff: 100 000 credits = 3 hours = 65 000 Toman.
-PRICE_TOMAN_PER_PACKAGE = 65_000
+HOURS_PER_UNIT = SECONDS_PER_UNIT // SECONDS_PER_HOUR
 #: Credits per second of processed audio (100 000 / 10 800 s).
-CREDITS_PER_SECOND = Fraction(CREDIT_PACKAGE_SIZE, SECONDS_PER_UNIT)
+CREDITS_PER_SECOND = Fraction(CREDITS_PER_UNIT, SECONDS_PER_UNIT)
 #: Exact rational credits per hour (100 000 / 3). Never use this as a float
 #: in accounting; conversion helpers below round with integer arithmetic.
-CREDITS_PER_HOUR = Fraction(CREDIT_PACKAGE_SIZE, HOURS_PER_PACKAGE)
+CREDITS_PER_HOUR = Fraction(CREDITS_PER_UNIT, HOURS_PER_UNIT)
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -132,44 +125,8 @@ def credits_per_hour(hours: int | float) -> int:
     if fraction is None:
         return 0
     numerator = fraction.numerator * CREDITS_PER_UNIT
-    denominator = fraction.denominator * HOURS_PER_PACKAGE
+    denominator = fraction.denominator * HOURS_PER_UNIT
     return _ceil_div(numerator, denominator)
-
-
-def price_change_preview(
-    proposed_price_toman: int | None = None,
-) -> dict[str, object]:
-    """Compare the live catalogue with a proposed per-package price.
-
-    Pure and side-effect free: it never changes a plan. With no argument it
-    reports the canonical confirmed tariff (65 000 T per 3-hour package).
-    A proposed override is shown side-by-side so an operator can verify a
-    configuration change before deploying it.
-    """
-    live = PRICE_TOMAN_PER_PACKAGE
-    if proposed_price_toman is None:
-        proposed = live
-    else:
-        proposed = int(proposed_price_toman)
-    ratio = (live / proposed) if proposed > 0 else float("inf")
-    is_override = proposed != live
-    return {
-        "live_price_toman_per_package": live,
-        "proposed_price_toman_per_package": proposed,
-        "live_per_hour_toman": live // HOURS_PER_PACKAGE,
-        "proposed_per_hour_toman": proposed / HOURS_PER_PACKAGE if proposed else 0,
-        "ratio_live_over_proposed": ratio,
-        "major_discrepancy": is_override and (ratio > 10 or ratio < 0.1),
-        "activated": not is_override,
-        "note": (
-            "Canonical confirmed tariff: 100,000 credits = 3 hours = 65,000 Toman."
-            if not is_override
-            else (
-                "Proposed price is NOT activated. Live plans keep their frozen "
-                "snapshots; activation requires an explicit PLAN_* change."
-            )
-        ),
-    }
 
 
 def plan_seconds(hours: int) -> int:
@@ -205,32 +162,33 @@ def format_seconds_as_credits(seconds: int | float | None) -> str:
 
 @dataclass(frozen=True, slots=True)
 class PlanSpec:
-    """One canonical purchasable plan and the configuration keys behind it.
+    """One canonical plan and its configuration keys.
 
     ``key`` is the :meth:`gamas_bot.config.Settings.plan_values` prefix
-    (``plan_3_hours`` / ``plan_3_price_toman`` / ``plan_3_validity_days``).
+    (for example ``plan_3_hours``). Original and sale prices are explicit,
+    independent amounts.
     """
 
     code: str
     key: str
     hours: int
+    original_price_toman: int
     price_toman: int
     validity_days: int
     sort_order: int
 
 
-#: The purchasable catalogue, cheapest first. The free plan is not listed: it
-#: is granted by the database, never sold, and therefore has no price keys.
-#: Prices are proportional to the credited hours at the canonical
-#: :data:`PRICE_TOMAN_PER_PACKAGE` rate (65 000 T for 3 hours), so a longer
-#: plan is a convenience bundle and never a hidden discount or surcharge.
+#: Explicit six-plan commercial catalog, ordered for display. List and sale
+#: prices are intentionally independent; do not derive one from hours or from
+#: the credit conversion ratio. No 50-hour tier is represented until both
+#: missing prices are confirmed.
 PAID_PLAN_SPECS: tuple[PlanSpec, ...] = (
-    PlanSpec(PLAN_3_CODE, "plan_3", 3, 65_000, 30, 1),
-    PlanSpec(PLAN_9_CODE, "plan_9", 9, 195_000, 30, 2),
-    PlanSpec(PLAN_12_CODE, "plan_12", 12, 260_000, 30, 3),
-    PlanSpec(PLAN_24_CODE, "plan_24", 24, 520_000, 30, 4),
-    PlanSpec(PLAN_36_CODE, "plan_36", 36, 780_000, 30, 5),
-    PlanSpec(PLAN_60_CODE, "plan_60", 60, 1_300_000, 30, 6),
+    PlanSpec(PLAN_3_CODE, "plan_3", 3, 160_000, 79_000, 30, 1),
+    PlanSpec(PLAN_6_CODE, "plan_6", 6, 200_000, 99_000, 30, 2),
+    PlanSpec(PLAN_10_CODE, "plan_10", 10, 220_000, 109_000, 30, 3),
+    PlanSpec(PLAN_20_CODE, "plan_20", 20, 360_000, 179_000, 30, 4),
+    PlanSpec(PLAN_26_CODE, "plan_26", 26, 460_000, 229_000, 30, 5),
+    PlanSpec(PLAN_30_CODE, "plan_30", 30, 600_000, 299_000, 30, 6),
 )
 
 
@@ -243,25 +201,29 @@ class Plan:
     validity_days: int | None
     sort_order: int
     is_free: bool = False
+    original_price_toman: int | None = None
+    purchase_available: bool = True
 
     @property
     def included_credits(self) -> int:
-        """What the user is promised, in the currency they think in.
-
-        A free grant keeps its whole hours (1 h → 100 000 credits) so the free
-        and paid screens quote the same conversion.
-        """
-        if self.is_free:
-            return self.included_hours * CREDIT_PACKAGE_SIZE // HOURS_PER_PACKAGE
+        """Convert the plan's granted seconds to credits, rounding up safely."""
         return seconds_to_credits(self.included_seconds)
 
     @property
     def included_hours(self) -> int:
         return int(round(self.included_seconds / SECONDS_PER_HOUR))
 
+    @property
+    def discount_percent(self) -> float:
+        """The explicit list-to-sale discount, or zero for plans without one."""
+        original = self.original_price_toman
+        if original is None or original <= 0 or self.price_toman <= 0:
+            return 0.0
+        return max(0.0, (original - self.price_toman) * 100 / original)
+
 
 def _resolved(values: Mapping[str, int] | None, key: str, default: int) -> int:
-    """Read one integer override, ignoring anything non-positive."""
+    """Read one integer override, ignoring invalid non-positive values."""
     if not values:
         return default
     try:
@@ -272,19 +234,34 @@ def _resolved(values: Mapping[str, int] | None, key: str, default: int) -> int:
 
 
 def plan_catalog(values: Mapping[str, int] | None = None) -> tuple[Plan, ...]:
-    """Return the one canonical catalogue used by DB seeding and the UI.
+    """Return the authoritative catalog used by startup sync and the wallet.
 
     ``values`` accepts the resolved settings mapping (see
-    :meth:`gamas_bot.config.Settings.plan_values`). Without it the canonical
-    business defaults are returned.
+    :meth:`gamas_bot.config.Settings.plan_values`). The free grant is present
+    for display and account logic but is never synchronized as a purchase plan.
     """
     free_seconds = _resolved(values, "free_plan_hours", FREE_PLAN_HOURS) * SECONDS_PER_HOUR
     plans: list[Plan] = [
-        Plan(FREE_PLAN_CODE, FREE_PLAN_NAME, free_seconds, 0, None, 0, True),
+        Plan(
+            FREE_PLAN_CODE,
+            FREE_PLAN_NAME,
+            free_seconds,
+            0,
+            None,
+            0,
+            is_free=True,
+            original_price_toman=None,
+            purchase_available=False,
+        ),
     ]
     for spec in PAID_PLAN_SPECS:
         hours = _resolved(values, f"{spec.key}_hours", spec.hours)
         days = _resolved(values, f"{spec.key}_validity_days", spec.validity_days)
+        original_price = _resolved(
+            values, f"{spec.key}_original_price_toman", spec.original_price_toman
+        )
+        price = _resolved(values, f"{spec.key}_price_toman", spec.price_toman)
+        available = original_price > 0 and price > 0
         plans.append(
             Plan(
                 spec.code,
@@ -292,9 +269,11 @@ def plan_catalog(values: Mapping[str, int] | None = None) -> tuple[Plan, ...]:
                     hours=to_persian_digits(hours), days=to_persian_digits(days)
                 ),
                 plan_seconds(hours),
-                _resolved(values, f"{spec.key}_price_toman", spec.price_toman),
+                price,
                 days,
                 spec.sort_order,
+                original_price_toman=original_price or None,
+                purchase_available=available,
             )
         )
     return tuple(plans)
@@ -323,6 +302,17 @@ def format_duration(seconds: int | float | None) -> str:
 def format_toman(amount: int) -> str:
     grouped = f"{int(amount):,}".replace(",", "٬")
     return f"{to_persian_digits(grouped)} تومان"
+
+
+def format_plan_price(sale_price: int, original_price: int | None = None) -> str:
+    """Render the list price and final sale price without implying a tariff rule."""
+    sale = format_toman(sale_price)
+    if original_price is not None and original_price > sale_price > 0:
+        return (
+            f"قیمت اصلی: {format_toman(original_price)} | "
+            f"قیمت نهایی: {sale}"
+        )
+    return f"مبلغ: {sale}"
 
 
 def format_validity(days: int | None) -> str:

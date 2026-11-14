@@ -4,6 +4,21 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Billing catalog and Gemini 3.5 request contract.** The current commercial
+catalog is six explicit 30-day plans (3, 6, 10, 20, 26 and 30 hours), each with
+separate list and sale prices; the unconfirmed 50-hour tier is not offered.
+Wallets distinguish the two amounts, while purchase snapshots and revenue use
+the final sale price. Full startup catalog sync deactivates omitted built-in
+plans only; custom plans, payment records and frozen snapshots remain intact.
+The old global credit-package price is retired: `100,000 credits = 3 hours =
+10,800 seconds` is only a usage-unit conversion.
+
+Gemini 3.x requests now use `responseFormat.text` and `thinkingConfig.thinkingLevel`
+without sampling parameters; Gemini 2.x keeps its legacy request dialect. Quiz
+task policy follows the original requested count, and each learning job resolves
+source sensitivity once and carries it through all chunk requests. Quiz
+validation and duplicate rejection emit count-only diagnostics.
+
 **Follow-up: compile policy, prose claims, incompleteness.** The editorial pass
 received the booklet's label but did not forward it to `_compile_once`, so
 `NOTE_COMPILE=true` silently dropped OpenRouter from the compile only; the
@@ -114,7 +129,7 @@ fragments.
 
 **Large uploads.** Default video/audio and PowerPoint/document upload ceilings are now 1 GiB; presentation extraction permits up to 1 GiB unpacked with a 2 GiB workspace budget. Operators must provision adequate temporary disk and verify Telegram/host transfer limits.
 
-## 3.0 — Gamas Studio, reference-grade booklets, confirmed tariff
+## 3.0 — Gamas Studio, reference-grade booklets, tariff at release
 
 **Mini App (Gamas Studio).** Persian-first RTL single page with Home,
 Leaderboard (all-time / weekly / monthly), Submissions, structured Booklet
@@ -139,9 +154,11 @@ furniture and an explicit auto-generation disclaimer. Additive migration 027
 persists owner-scoped PDF/DOCX bytes; the completion screen sends nothing
 automatically and each output button returns the exact stored file.
 
-**Tariff.** Confirmed: 100 000 credits = 3 hours = 10 800 seconds = 65 000 Toman.
-All six built-in plans use proportional 30-day prices; historical snapshots and
-custom plans are untouched.
+**Historical tariff (superseded by Unreleased above).** At the 3.0 release,
+the then-current tariff treated 100 000 credits = 3 hours = 10 800 seconds as
+65 000 Toman, with proportional 30-day built-in plan prices. This records the
+catalog at that release only; it is not a current price rule. Historical
+payment snapshots and custom plans were untouched at the time.
 
 **Quality.** PDF visual QA (`tests/test_pdf_visual_qa.py`) checks geometry,
 fonts, ink coverage and text collisions, and found three real glyph/layout
