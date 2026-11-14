@@ -77,7 +77,6 @@ or deployment compatibility is implied by offline tests. See
 | Audio, video, voice note | Transcript first, then an RTL Word/PDF booklet when a note provider is configured |
 | PDF, DOCX, PowerPoint | Extracted text, source-based notes, exports and per-slide mapping |
 | Free Office / آفیس رایگان | Text, TXT, Markdown, CSV or TSV to Word, Excel, PowerPoint or PDF |
-| Gamas Studio (Mini App) | Leaderboard, per-submission speakers, structured booklet editor, PDF/DOCX exports, revision history |
 | Library | Saved Telegram file references |
 | Wallet | Credit, plans and manually reviewed receipts |
 | Support | Persistent support tickets |
@@ -86,25 +85,6 @@ PowerPoint narration starts only from its audio button. Scans and photos need
 [opt-in third-party OCR](docs/FEATURES.md#ocr-opt-in-third-party). Details:
 [features](docs/FEATURES.md) · [note providers](docs/PROVIDERS.md) ·
 [billing](docs/BILLING.md).
-
-## Gamas Studio Mini App
-
-Gamas Studio is a Persian RTL Telegram Mini App served by the lightweight WSGI
-application in `scripts/mini_app_wsgi.py`. It shares the bot's SQLite file but
-runs as a separate Passenger web worker; it does not start the bot or apply
-migrations. The reported production URL is the **root domain**
-[`https://gamasrobot.ir`](https://gamasrobot.ir); do not create a Studio
-subdomain as part of a routine deployment. Verify the live cPanel settings and
-BotFather Menu Button before changing production.
-
-- [cPanel / Passenger deployment, diagnostics, release and rollback](docs/MINIAPP_CPANEL.md)
-- [Repository audit and known limitations](docs/MINIAPP_AUDIT.md)
-- [Optional Cloudflare Tunnel alternative](docs/MINIAPP_CLOUDFLARE.md) (not the reported production deployment)
-
-The bot's `MINI_APP_URL` is optional; empty means no bot-generated Mini App
-button. The BotFather Menu Button is configured separately. The Mini App uses
-the raw signed Telegram `initData` on each API request; it does not accept an
-ordinary browser session as authentication.
 
 ## Before production
 

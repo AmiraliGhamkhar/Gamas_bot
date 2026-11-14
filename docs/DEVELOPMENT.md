@@ -11,7 +11,6 @@ audio/video → admission + hold → queue → media → STT → transcript deli
 PDF/DOCX/PPTX → owner-scoped extraction → SQLite text cache → notes/exports
 text/CSV/MD → private Office draft → bounded build → Word/Excel/PPT/PDF
 wallet → order + receipt → admin review → transactional credit
-Studio edit → validated StructuredNotes → revision → PDF + DOCX bytes
 ```
 
 ## Code map (`gamas_bot/`)
@@ -24,42 +23,7 @@ Studio edit → validated StructuredNotes → revision → PDF + DOCX bytes
 | Queue/transfers | `jobs`, `capacity`, `progress`, `telegram_transfer`, `telegram_text` |
 | Media/providers | `media`, `media_worker`, `presentations`, `stt`, `llm`, `llm_profiles`, `http_util` |
 | Notes/documents | `transcript`, `notes`, `notes_evidence`, `doc_extract`, `ocr`, `office*`, `docx_export`, `notes_pdf`, `pdf_export`, `pdf_common` |
-| Mini App | `mini_app` (WSGI + `initData` auth), `mini_app_store` (read-only-per-call SQLite reads / short writes), `mini_app/` bundle |
 | Storage/billing | `db` facade, `db_*` facets, `billing`, `subscription`, `learning`, `referrals` |
-
-## Mini App boundary and performance conventions
-
-- `scripts/mini_app_wsgi.py` creates `application`; Passenger serves the app
-  only. `passenger_wsgi.py` is a distinct bot-health/launcher integration and
-  must not be overwritten. The Mini App never starts the bot or applies schema
-  migrations.
-- On boot, `mini_app/app.js` makes one authenticated Home request. Leaderboard
-  windows and the submissions overview are fetched on first view entry; their
-  response objects live in memory only. Booklet, revision and speaker content is
-  fetched only after a user opens that feature. Store results are owner-scoped.
-- Every API request carries raw signed `Telegram.WebApp.initData`; the server
-  validates HMAC and freshness. Never accept `initDataUnsafe` or persist
-  credentials in browser storage. Writes are not automatically retried.
-- Read-only calls can coalesce while in flight and have a bounded timeout.
-  Client diagnostics are opt-in (`?diagnostics=1`) and contain request timing,
-  response status, correlation id and platform capabilities only, never the
-  signed payload or user content.
-- The `MiniAppStore.profile()` Home summary uses one read-only connection and a
-  single query with optional migration-aware summary columns. Other heavy editor
-  reads remain on demand. Avoid adding indexes/migrations without query-plan and
-  workload evidence.
-- Static assets remain WSGI-served for cPanel compatibility. HTML revalidates;
-  small non-versioned CSS/JS use validators plus a short cache lifetime. Do not
-  assert Apache compression, HTTP/2, direct static routing or long-lived cache
-  behavior without checking the live host.
-- The front end is framework-free vanilla JS and CSS. Keep HTML semantically
-  accessible, RTL and touch-friendly; use Telegram colors/viewport only when
-  feature-detected, respect CSS safe-area insets and keep all useful editor,
-  speaker, revision and export actions available on narrow screens.
-
-See [Gamas Studio operations](MINIAPP_CPANEL.md) and the
-[baseline audit](MINIAPP_AUDIT.md) for request paths, measured evidence and
-unverified host/device requirements.
 
 ## Invariants to preserve
 

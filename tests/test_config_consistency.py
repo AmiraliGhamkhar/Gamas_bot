@@ -29,13 +29,10 @@ CONFIG_SOURCE = Path(config.__file__)
 #: ``NAME=value`` and ``#NAME=value`` lines of the example file.
 ENV_LINE = re.compile(r"^#?\s*([A-Z0-9_]+)=(.*)$", re.M)
 
-#: Variables that only exist to document an optional integration and are read
-#: conditionally rather than through ``_env`` in the code path scanned below.
 #: Variables documented in ``.env.example`` that are read outside ``config.py``.
-#: ``MINI_APP_STATIC_DIR`` belongs to the Mini App's own WSGI entry point
-#: (``scripts/mini_app_wsgi.py``), which resolves the bundle location lazily so a
-#: Passenger worker can be imported before ``.env`` is loaded.
-EXTRA_DOCUMENTED = frozenset({"MINI_APP_STATIC_DIR"})
+#: The removed Mini App was the only such integration; keep this empty unless a
+#: new out-of-process helper needs a documented setting.
+EXTRA_DOCUMENTED: frozenset[str] = frozenset()
 
 #: ``(variable, Settings attribute, kind)`` for the values an operator reads as
 #: "defaults" in the example file. ``kind`` drives the comparison.
@@ -424,11 +421,47 @@ class DocumentationNavigationTests(unittest.TestCase):
             for guide in (
                 "WINDOWS.md",
                 "CPANEL.md",
-                "MINIAPP_CPANEL.md",
-                "MINIAPP_CLOUDFLARE.md",
             ):
                 with self.subTest(index=index.name, guide=guide):
                     self.assertIn(guide, text)
+
+
+class RemovedMiniAppTests(unittest.TestCase):
+    """The Mini App is gone: no settings, no importable modules, no doc pages."""
+
+    def test_settings_no_longer_expose_mini_app_configuration(self):
+        settings = default_settings()
+        for attribute in ("mini_app_url", "mini_app_auth_max_age"):
+            with self.subTest(attribute=attribute):
+                self.assertFalse(hasattr(settings, attribute))
+        documented = example_values()
+        for name in (
+            "MINI_APP_URL",
+            "MINI_APP_AUTH_MAX_AGE_SECONDS",
+            "MINI_APP_STATIC_DIR",
+        ):
+            with self.subTest(variable=name):
+                self.assertNotIn(name, documented)
+
+    def test_removed_modules_are_not_importable(self):
+        import importlib.util
+
+        for module in (
+            "gamas_bot.mini_app",
+            "gamas_bot.mini_app_store",
+            "scripts.mini_app_wsgi",
+            "scripts.mini_app_bench",
+        ):
+            with self.subTest(module=module):
+                self.assertIsNone(importlib.util.find_spec(module))
+
+    def test_removed_guides_are_not_linked(self):
+        for page in (REPO_ROOT / "README.md", REPO_ROOT / "docs" / "README.md"):
+            text = page.read_text(encoding="utf-8")
+            for guide in ("MINIAPP_CPANEL.md", "MINIAPP_CLOUDFLARE.md", "MINIAPP_AUDIT.md"):
+                with self.subTest(page=page.name, guide=guide):
+                    self.assertNotIn(guide, text)
+                    self.assertFalse((REPO_ROOT / "docs" / guide).exists())
 
 
 class VersionConsistencyTests(unittest.TestCase):

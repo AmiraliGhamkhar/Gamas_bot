@@ -1499,25 +1499,11 @@ class LearningWorkflowMixin:
             f"رتبهٔ شما: {to_persian_digits(rank['rank'])} با "
             f"{to_persian_digits(rank['points'])} امتیاز"
         )
-        buttons = self._mini_app_buttons()
-        buttons.append([Button.inline("↩️ منوی اصلی", b"menu:main")])
         await self._edit_or_reply(  # type: ignore[attr-defined]
             event,
             "\n".join(lines),
-            buttons,
+            [[Button.inline("↩️ منوی اصلی", b"menu:main")]],
         )
-
-    def _mini_app_buttons(self) -> list[list]:  # noqa: D401 - documented below
-        """The Mini App entry, when the deployment configured a URL for it.
-
-        A Mini App is opened by a *URL* button inside Telegram's own WebView, not
-        by an HTTP call from this process — so the only thing the bot needs is
-        the public HTTPS URL, and no button is drawn at all when it is absent.
-        """
-        url = str(getattr(self.settings, "mini_app_url", "") or "").strip()
-        if not url.startswith("https://"):
-            return []
-        return [[texts.mini_app_button(texts.BTN_EDIT_IN_APP, url)]]
 
     async def _admin_board(self, event: Any, *, notice: str = "") -> None:
         rows = await self.db.leaderboard_admin_top(5)

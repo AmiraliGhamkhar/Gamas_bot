@@ -64,10 +64,6 @@ merge, split/repair and grounding gates remain enabled as configured. See
 - `NOTE_MODE` is a legacy no-op: audio booklets are always full booklets; compact
   revision notes are a separate document action.
 
-Editing happens in the [Mini App](MINIAPP_CPANEL.md): every structured save
-appends a revision and re-renders both PDF and DOCX, so an export always matches
-a saved revision.
-
 ## Study documents
 
 Send a text PDF, DOCX or PowerPoint (`.pptx`). Legacy `.ppt`/`.pps`/`.pot` is
@@ -138,16 +134,15 @@ non-sensitive file:
 python -m scripts.ocr_smoke scan.jpg --language persian
 ```
 
-## Library, learning and Studio
+## Library and learning
 
 - **Library** keeps the newest `LIBRARY_MAX_ITEMS` (50) Telegram file references
   per user; files themselves stay in Telegram. Pruning a reference does not
   delete cached extracted text.
 - **Learning**: quizzes and flashcards generated from a saved booklet or
   document, previewed before saving. Costs are in [Billing](BILLING.md).
-- **Gamas Studio** (Mini App): home summary, all-time/weekly/monthly
-  leaderboard, per-submission speakers with owner-chosen names, structured
-  booklet editor, exports and revision history.
+- **Leaderboard**: native Telegram ranking from quiz answers, including the
+  caller's own rank. Every study workflow stays inside the chat.
 
 ## Privacy summary
 

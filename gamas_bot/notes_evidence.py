@@ -1233,8 +1233,8 @@ class ClaimEvidence:
 
     Only offsets and a ratio are kept: the report is logged, and a log line must
     never quote the lecture or the booklet. ``span`` points at the sentence in
-    the source that came closest, so an operator can inspect it in Gamas Studio
-    or the stored transcript.
+    the source that came closest, so an operator can inspect it against the
+    stored transcript.
     """
 
     span: tuple[int, int]

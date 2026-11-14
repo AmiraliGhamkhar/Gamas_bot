@@ -5,8 +5,6 @@ The bot is a long-running Telegram client, not a website. The host must allow
 TCP 443 to Telegram and the AI providers. Confirm that with your host before
 buying a plan; a "Python support" badge alone is not enough.
 
-The Mini App is a **separate** deployment: [cPanel Passenger guide](MINIAPP_CPANEL.md).
-
 ## 1. Install outside every web root
 
 ```bash
@@ -86,11 +84,10 @@ otherwise it restarts the bot within a minute. After fixing a startup error use
 `--force` to bypass the spawn throttle. Never delete `data/gamas.lock` while a
 process is alive and never use `pkill python` on shared hosting.
 
-## 5. Optional: bot-launcher health endpoint (not Gamas Studio)
+## 5. Optional: bot-launcher health endpoint
 
-This optional root-level `passenger_wsgi.py` exposes the bot watchdog status; it
-is not the Studio's `scripts/mini_app_wsgi.py` app. Do not point the root-domain
-Gamas Studio application at this file. You do not need Passenger to run the bot.
+This optional root-level `passenger_wsgi.py` exposes the bot watchdog status.
+You do not need Passenger to run the bot.
 If you want an uptime monitor for the bot-launcher endpoint, create a separate
 Python app whose startup file is `passenger_wsgi.py` and entry point
 `application`. `GET /` and `GET /health` answer

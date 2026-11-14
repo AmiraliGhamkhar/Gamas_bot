@@ -596,7 +596,6 @@ class GamasBot(
         """
         from telethon.tl.types import (
             ButtonTypeDefault,
-            ButtonTypeSimpleWebView,
             KeyboardButton,
             KeyboardButtonRow,
             ReplyKeyboardMarkup,
@@ -613,20 +612,6 @@ class GamasBot(
                 is_admin=is_admin, office_enabled=self.settings.office_enabled
             )
         ]
-        # A reply-keyboard WebView button opens Gamas Studio inside Telegram.
-        # It is added only when the app is configured, so a deployment without
-        # a Mini App never shows a button that cannot open (no dead buttons).
-        if self.settings.mini_app_url:
-            rows.append(
-                KeyboardButtonRow(
-                    buttons=[
-                        KeyboardButton(
-                            text=texts.BTN_STUDIO,
-                            type=ButtonTypeSimpleWebView(self.settings.mini_app_url),
-                        )
-                    ]
-                )
-            )
         return ReplyKeyboardMarkup(
             rows=rows,
             resize=True,
@@ -1323,7 +1308,6 @@ class GamasBot(
             has_booklet=has_booklet,
             kinds=kinds,
             item_id=item_id,
-            mini_app_url=self.settings.mini_app_url,
             learning_available=self.settings.note_configured,
         )
         await self._edit(
@@ -1337,7 +1321,6 @@ class GamasBot(
                 has_transcript=KIND_TRANSCRIPT in kinds,
                 has_txt=KIND_TXT in kinds,
                 has_docx=KIND_DOCX in kinds,
-                has_studio=bool(self.settings.mini_app_url and has_booklet),
                 has_learning_item=item_id is not None,
             ),
             buttons,

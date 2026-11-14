@@ -10,9 +10,6 @@ examples assume you activated the virtualenv (`source .venv/bin/activate`).
 | --- | --- |
 | [Windows PowerShell](WINDOWS.md) | Install, run, autostart and update on a Windows PC |
 | [cPanel](CPANEL.md) | Install, cron watchdog, logs and updates on shared Linux hosting |
-| [Gamas Studio on cPanel](MINIAPP_CPANEL.md) | Reported production root-domain deployment, safe release, diagnostics and rollback |
-| [Mini App on Cloudflare](MINIAPP_CLOUDFLARE.md) | Optional separate-host Tunnel alternative; not the reported production setup |
-| [Mini App audit](MINIAPP_AUDIT.md) | Repository facts, verified code issues and live-host/device unknowns |
 
 ## Configure and operate
 

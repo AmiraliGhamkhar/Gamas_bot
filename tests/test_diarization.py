@@ -299,6 +299,33 @@ class ReplyKeyboardTests(unittest.TestCase):
             # Secondary actions do not crowd the always-visible keyboard.
             self.assertNotIn(texts.BTN_OFFICE, labels)
 
+    def test_the_telegram_reply_keyboard_has_no_webview_buttons(self):
+        from types import SimpleNamespace
+
+        from gamas_bot.bot import GamasBot
+        from tests.support import make_settings
+
+        settings = make_settings()
+        for is_admin in (False, True):
+            markup = GamasBot._reply_keyboard(
+                SimpleNamespace(settings=settings), is_admin=is_admin
+            )
+            labels = [button.text for row in markup.rows for button in row.buttons]
+            expected = [
+                label
+                for row in texts.reply_menu_rows(
+                    is_admin=is_admin, office_enabled=settings.office_enabled
+                )
+                for label in row
+            ]
+            with self.subTest(is_admin=is_admin):
+                self.assertEqual(labels, expected)
+                for row in markup.rows:
+                    for button in row.buttons:
+                        self.assertEqual(
+                            type(button.type).__name__, "ButtonTypeDefault"
+                        )
+
     def test_every_label_fits_a_telegram_button(self):
         """Telegram rejects a keyboard button longer than a short label."""
         for row in texts.reply_menu_rows(is_admin=True):

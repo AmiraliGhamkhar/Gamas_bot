@@ -22,7 +22,7 @@ Rules followed here:
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, Final
+from typing import Final
 
 # --------------------------------------------------------------------- buttons
 BTN_LIBRARY: Final = "کتابخانه"
@@ -60,8 +60,6 @@ BTN_GET_KEYPOINTS: Final = "دریافت نکات کلیدی"
 BTN_MY_RESULTS: Final = "📦 خروجی‌های من"
 BTN_START_HERE: Final = "🎓 شروع"
 BTN_UPGRADE: Final = "🛒 افزایش اعتبار"
-BTN_STUDIO: Final = "گاماس استودیو"
-BTN_EDIT_IN_APP: Final = "ویرایش جزوه در گاماس استودیو"
 BTN_QUIZ_FROM_BOOKLET: Final = "آزمون از این جزوه"
 BTN_CARDS_FROM_BOOKLET: Final = "فلش‌کارت از این جزوه"
 OFFICE_CREDIT_NOTICE: Final = (
@@ -166,22 +164,6 @@ def main_screen(
     return "\n".join(lines)
 
 
-def mini_app_button(label: str, url: str) -> Any:
-    """A Telegram button that opens a Mini App (WebView) instead of a URL.
-
-    ``InlineButtonTypeWebView`` is what makes Telegram treat the target as a Mini
-    App: it opens inside the client, exposes ``Telegram.WebApp.initData`` to the
-    page and lets the page close itself. A plain URL button would open a browser
-    tab with no signed session, which the app correctly refuses.
-    """
-    from telethon.tl.types import (
-        InlineButtonTypeWebView,
-        KeyboardInlineButton,
-    )
-
-    return KeyboardInlineButton(text=label, type=InlineButtonTypeWebView(url))
-
-
 # ---------------------------------------------------------------------------
 # The always-visible menu keyboard (Telegram reply keyboard, not inline glass)
 # ---------------------------------------------------------------------------
@@ -215,7 +197,6 @@ DELIVERY_ROW_TRANSCRIPT: Final = "متن خام گفتار را می‌توان�
 DELIVERY_ROW_TXT: Final = "متن خام گفتار به‌صورت فایل TXT آماده است."
 DELIVERY_ROW_KEYPOINTS: Final = "نکات کلیدی آماده است."
 DELIVERY_ROW_DOCX: Final = "نسخهٔ Word آماده است."
-DELIVERY_ROW_STUDIO: Final = "جزوه را می‌توانید در گاماس استودیو ویرایش کنید."
 DELIVERY_ROW_LEARNING: Final = "از جزوه می‌توانید آزمون یا فلش‌کارت بسازید."
 DELIVERY_ROW_NOTES_PENDING: Final = "نکات کلیدی در حال آماده‌شدن است."
 DELIVERY_SPEAKERS_TEMPLATE: Final = "گویندگان شناسایی‌شده: {count} نفر"
@@ -271,7 +252,6 @@ def delivery_screen(
     has_transcript: bool = True,
     has_txt: bool = False,
     has_docx: bool = False,
-    has_studio: bool = False,
     has_learning_item: bool = True,
 ) -> str:
     """Describe only the artifacts and actions exposed by this message."""
@@ -300,8 +280,6 @@ def delivery_screen(
         lines.append(DELIVERY_ROW_KEYPOINTS)
     if has_docx:
         lines.append(DELIVERY_ROW_DOCX)
-    if has_studio:
-        lines.append(DELIVERY_ROW_STUDIO)
     if has_booklet and has_learning_item and learning_available:
         lines.append(DELIVERY_ROW_LEARNING)
     elif has_booklet and not learning_available:
@@ -314,7 +292,6 @@ def delivery_screen(
             has_keypoints,
             notes_pending,
             has_docx,
-            has_studio,
         )
     )
     if not has_any_output:

@@ -194,8 +194,6 @@ CPU.
 - `python -m gamas_bot --check` — offline, safe to run while the bot serves.
 - `python scripts/ensure_running.py status` — process state and PID.
 - `GET /health` on the optional Passenger app — `running`/`starting`/`error`.
-- `GET /health` on the Mini App — liveness plus `database: true/false` from a file-exists check only.
-- `GET /ready` on the Mini App — read-only SQLite/schema probe; it does not authenticate requests or run migrations. See [cPanel Mini App operations](MINIAPP_CPANEL.md).
 
 An uptime monitor should poll at 5-minute intervals and only pages you, not
 restart the bot.

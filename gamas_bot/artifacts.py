@@ -18,11 +18,10 @@ because the costs differ:
   later, when a temporary work directory is long gone.
 * **Key points** — read from the stored ``notes_json``. Same argument: the notes
   are already persisted, so the list is free and stable.
-* **Booklet PDF / DOCX** — rendered once from the validated stored-note model
+ * **Booklet PDF / DOCX** — rendered once from the validated stored-note model
   at completion and persisted as owner-scoped binary artifacts. Fetch callbacks
   only send those exact bytes: they never invoke a renderer or a model.
-* **Mini App editor** — links to Gamas Studio; the editor exports the latest
-  saved version.
+
 
 Everything here is deterministic and side-effect free, which is why it is a
 module instead of another method on the pipeline.
@@ -170,7 +169,6 @@ def delivery_markup(
     has_booklet: bool,
     kinds: set[str],
     item_id: int | None = None,
-    mini_app_url: str = "",
     learning_available: bool = True,
 ):
     """One completion screen, one button per independently available artifact.
@@ -180,7 +178,6 @@ def delivery_markup(
     * 📘 دریافت جزوه PDF  — primary booklet (PDF)
     * 📝 دریافت متن خام
     * ⭐ دریافت نکات کلیدی
-    * ✏️ ویرایش جزوه در Gamas Studio  (when a Mini App URL is configured)
     * 📄 دریافت نسخه Word  (when the DOCX artifact is available)
 
     Nothing appears here unless it really exists: ``kinds`` comes from the
@@ -221,9 +218,6 @@ def delivery_markup(
         rows.append(
             [Button.inline(texts.BTN_GET_DOCX, callback_for(reference, KIND_DOCX))]
         )
-    # Studio button (Web App)
-    if mini_app_url and has_booklet:
-        rows.append([texts.mini_app_button(texts.BTN_EDIT_IN_APP, mini_app_url)])
     # Learning buttons (quiz / flashcards)
     learning: list[Any] = []
     if learning_available and item_id and KIND_QUIZ in kinds:

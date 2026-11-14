@@ -3,14 +3,12 @@
 These cover the new invariants rather than re-testing the existing pipeline:
 exact integer credit arithmetic, honest speaker turns, capability-aware STT
 routing, mandatory adaptive preprocessing with stereo preservation, the
-central submission artifact registry, the Mini App's new screens, and the
-offline DER/JER/WER/CER evaluator.
+central submission artifact registry, and the offline DER/JER/WER/CER evaluator.
 """
 
 from __future__ import annotations
 
 import array
-import io
 import json
 import math
 import tempfile
@@ -53,13 +51,6 @@ from gamas_bot.media_worker import (
     _transcode,
     adaptive_filters,
 )
-from gamas_bot.mini_app import (
-    MiniAppData,
-    create_app,
-    booklet_docx_bytes,
-    leaderboard_payload,
-    resolve_leaderboard_window,
-)
 from gamas_bot.notes import StructuredNotes
 from gamas_bot.stt import PROVIDERS, order_specs_for_diarization
 from gamas_bot.transcript import (
@@ -76,7 +67,6 @@ from gamas_bot.transcript import (
     speaker_name_from_label,
 )
 from tests.support import make_settings
-from tests.test_mini_app import BOT_TOKEN, NOW, credentials
 
 RATE = 16_000
 
@@ -383,14 +373,14 @@ class DeliveryMarkupTests(unittest.TestCase):
             reference="GMS-7", speakers=2, has_booklet=True,
             kinds={KIND_BOOKLET, KIND_DOCX, KIND_TRANSCRIPT, KIND_TXT,
                    KIND_KEYPOINTS, KIND_QUIZ, KIND_FLASHCARDS},
-            item_id=11, mini_app_url="https://example.com/app",
+            item_id=11,
         )
         payloads = self._payloads(buttons)
         for kind in ("booklet", "docx", "transcript", "txt", "keypoints"):
             self.assertIn(f"art:GMS-7:{kind}", payloads)
         self.assertIn("quiz:new:11", payloads)
         self.assertIn("fc:ai:11", payloads)
-        self.assertTrue(any("ویرایش" in str(p) for p in payloads))
+        self.assertFalse(any("استودیو" in str(p) for p in payloads))
 
     def test_learning_buttons_are_hidden_when_generation_is_not_configured(self):
         buttons = delivery_markup(
@@ -416,15 +406,14 @@ class DeliveryMarkupTests(unittest.TestCase):
         self.assertEqual(parse_callback("art:GMS-7:txt"), ("GMS-7", "txt"))
         self.assertEqual(callback_for("GMS-7", "txt"), b"art:GMS-7:txt")
 
-    def test_delivery_screen_mentions_edit_and_learning(self):
+    def test_delivery_screen_mentions_learning_without_the_removed_studio(self):
         from gamas_bot import texts
 
         body = texts.delivery_screen(
             reference="GMS-7", speakers=2, has_booklet=True, has_keypoints=True,
-            has_studio=True,
         )
-        self.assertIn("ویرایش", body)
         self.assertIn("آزمون", body)
+        self.assertNotIn("استودیو", body)
 
     def test_delivery_copy_only_names_artifacts_that_have_buttons(self):
         from gamas_bot import texts
@@ -437,14 +426,13 @@ class DeliveryMarkupTests(unittest.TestCase):
             has_transcript=False,
             has_txt=True,
             has_docx=False,
-            has_studio=False,
             has_learning_item=False,
         )
         self.assertIn(texts.DELIVERY_ROW_TXT, body)
         self.assertNotIn(texts.DELIVERY_ROW_TRANSCRIPT, body)
         self.assertNotIn(texts.DELIVERY_ROW_BOOKLET, body)
         self.assertNotIn(texts.DELIVERY_ROW_DOCX, body)
-        self.assertNotIn(texts.DELIVERY_ROW_STUDIO, body)
+        self.assertNotIn("استودیو", body)
         self.assertNotIn(texts.DELIVERY_ROW_LEARNING, body)
         self.assertNotIn(texts.DELIVERY_SPEAKERS_NONE, body)
 
@@ -474,133 +462,6 @@ class DeliveryMarkupTests(unittest.TestCase):
         self.assertIn("گویندگان", notes.to_markdown())
 
 
-# ------------------------------------------------------------- Mini App 2.0 --
-
-class MiniAppV2Tests(unittest.TestCase):
-    def setUp(self):
-        self.calls: list[tuple] = []
-        self.data = MiniAppData(
-            leaderboard=lambda limit: [{"first_name": "الف", "quiz_points": 90}][:limit],
-            rank=lambda _u: {"rank": 1, "points": 90},
-            booklets=lambda _u, limit: [{"id": 1, "title": "جزوه", "editable": True}],
-            booklet=lambda _u, item_id: (
-                {"id": item_id, "title": "جزوهٔ من", "content_text": "# سرفصل\n\nمتن جزوه", "editable": True}
-                if item_id == 1 else None
-            ),
-            save_booklet=lambda *_a: True,
-            profile=lambda _u: {
-                "first_name": "نگار", "credits": 100_000, "unlimited": False,
-                "quiz_points": 40, "library_count": 1, "submission_count": 2,
-                "artifact_count": 5,
-            },
-            leaderboard_window=lambda limit, window: (
-                [{"first_name": "هفتگی", "quiz_points": 20}][:limit] if window == "weekly" else []
-            ),
-            rank_window=lambda _u, window: {"rank": 2, "points": 20},
-            revisions=lambda _u, _i, limit: [
-                {"id": 3, "created_at": "2026-11-10T10:00:00", "chars": 12, "source": "mini_app"}
-            ][:limit],
-            restore_revision=lambda _u, _i, revision_id: revision_id == 3,
-            speaker_turns=lambda _u, _s: [
-                {"speaker_id": "speaker_0", "speaker_label": "0",
-                 "display_name": "گویندهٔ ۱", "start": 0.0, "end": 2.0,
-                 "text": "سلام", "overlaps": False}
-            ],
-            rename_speaker=lambda _u, _s, label, name: bool(label and name),
-        )
-        self.app = create_app(data=self.data, bot_token=BOT_TOKEN, now=lambda: NOW)
-
-    def _request(self, path, body, method="POST"):
-        raw = json.dumps(body).encode()
-        captured: dict = {}
-
-        def start_response(status, headers):
-            captured["status"] = status
-            captured["headers"] = dict(headers)
-
-        chunks = self.app(
-            {
-                "PATH_INFO": path, "REQUEST_METHOD": method,
-                "CONTENT_LENGTH": str(len(raw)), "wsgi.input": io.BytesIO(raw),
-            },
-            start_response,
-        )
-        return captured, b"".join(chunks)
-
-    def test_home_shows_only_the_callers_own_summary(self):
-        captured, body = self._request("/api/home", {"initData": credentials()})
-        payload = json.loads(body)
-        self.assertIn("200", captured["status"])
-        self.assertEqual(payload["credits"], 100_000)
-        self.assertEqual(payload["tabs"], ["home", "leaderboard", "studio"])
-        self.assertNotIn("password", payload)
-        cancelled, _ = self._request("/api/home", {"initData": ""})
-        self.assertIn("401", cancelled["status"])
-
-    def test_weekly_leaderboard_uses_the_window(self):
-        captured, body = self._request(
-            "/api/leaderboard", {"initData": credentials(), "window": "weekly"}
-        )
-        payload = json.loads(body)
-        self.assertEqual(payload["window"], "weekly")
-        self.assertEqual(payload["rows"][0]["name"], "هفتگی")
-        self.assertEqual(resolve_leaderboard_window("nonsense"), "all")
-        self.assertEqual(leaderboard_payload(self.data, 42, window="all")["rows"][0]["name"], "الف")
-
-    def test_revision_history_and_restore_are_authenticated(self):
-        captured, body = self._request(
-            "/api/revisions", {"initData": credentials(), "id": 1}
-        )
-        self.assertEqual(json.loads(body)["items"][0]["id"], 3)
-        captured, _ = self._request(
-            "/api/revision", {"initData": "", "id": 1, "revision_id": 3}, "PUT"
-        )
-        self.assertIn("401", captured["status"])
-        captured, body = self._request(
-            "/api/revision", {"initData": credentials(), "id": 1, "revision_id": 3}, "PUT"
-        )
-        self.assertTrue(json.loads(body)["ok"])
-
-    def test_docx_export_is_a_real_word_file_for_the_owner_only(self):
-        captured, body = self._request(
-            "/api/booklet/export", {"initData": credentials(), "id": 1}
-        )
-        self.assertIn("200", captured["status"])
-        self.assertTrue(body.startswith(b"PK"))
-        self.assertIn("wordprocessingml.document", captured["headers"]["Content-Type"])
-        self.assertIn("attachment", captured["headers"]["Content-Disposition"])
-        denied, _ = self._request(
-            "/api/booklet/export", {"initData": "", "id": 1}
-        )
-        self.assertIn("401", denied["status"])
-        missing, _ = self._request(
-            "/api/booklet/export", {"initData": credentials(), "id": 999}
-        )
-        self.assertIn("404", missing["status"])
-
-    def test_docx_bytes_helper_is_pure(self):
-        payload = booklet_docx_bytes(self.data, 42, 1)
-        self.assertTrue(payload.startswith(b"PK"))
-
-    def test_speaker_names_are_explicit_and_owner_scoped(self):
-        captured, body = self._request(
-            "/api/speakers", {"initData": credentials(), "submission_id": 12}
-        )
-        payload = json.loads(body)
-        self.assertIn("200", captured["status"])
-        self.assertEqual(payload["labels"], ["0"])
-        self.assertEqual(payload["turns"][0]["display_name"], "گویندهٔ ۱")
-        self.assertFalse(payload["unknown_attribution"])
-        captured, body = self._request(
-            "/api/speakers",
-            {"initData": credentials(), "submission_id": 12, "label": "0", "name": "استاد"},
-            "PUT",
-        )
-        self.assertEqual(json.loads(body)["name"], "استاد")
-        denied, _ = self._request("/api/speakers", {"initData": "", "submission_id": 12})
-        self.assertIn("401", denied["status"])
-
-
 # --------------------------------------------------------- DB / migration ---
 
 class CentralSubmissionTests(unittest.IsolatedAsyncioTestCase):
@@ -623,6 +484,32 @@ class CentralSubmissionTests(unittest.IsolatedAsyncioTestCase):
             {"submission_artifacts", "submission_binary_artifacts",
              "booklet_revisions", "quiz_point_events", "speaker_names",
              "diarization_reference_turns"} <= names
+        )
+
+    async def test_migration_028_and_030_columns_exist(self):
+        """The shared artifact/revision schema survives the Mini App removal."""
+        expected = {
+            "speaker_names": "role",
+            "library_items": "structured_json",
+            "booklet_revisions": "structured_json",
+            "submission_binary_artifacts": "revision_id",
+        }
+        for table, column in expected.items():
+            rows = await self.db.db.execute_fetchall(f"PRAGMA table_info({table})")
+            self.assertIn(column, [str(row[1]) for row in rows], f"{table}.{column}")
+        rows = await self.db.db.execute_fetchall(
+            "PRAGMA table_info(submission_binary_artifacts)"
+        )
+        names = {str(row[1]) for row in rows}
+        self.assertTrue(
+            {
+                "delivery_attempts",
+                "delivery_successes",
+                "delivery_failures",
+                "last_delivery_attempt_at",
+                "last_delivery_error",
+            }
+            <= names
         )
 
     async def test_independent_artifacts_and_speaker_names(self):

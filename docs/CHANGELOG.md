@@ -4,6 +4,17 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Telegram-only release: Gamas Studio removed.** The Telegram Mini App is
+permanently decommissioned: its frontend bundle, WSGI backend and SQLite store,
+the `initData` authentication layer, the WSGI/benchmark scripts, its
+configuration variables, tests and deployment guides are gone. The bot exposes
+no WebView button in the reply keyboard, leaderboard or delivery messages;
+PDF/DOCX booklets, transcripts, key points, quizzes, flashcards, the library,
+wallet, admin panel and the native leaderboard are unchanged. No database,
+migration, table or stored record was modified — the historical
+`migrations/v3/026`–`030` objects remain in place so existing databases stay
+usable.
+
 **Safe booklet recovery and delivery status.** Numeric/term evidence retains
 original text spans so the final scrub removes only disproved occurrences and
 unsupported clauses; high-risk medical claims are prioritized and removed as a
@@ -146,7 +157,8 @@ fragments.
 **Mini App (Gamas Studio).** Persian-first RTL single page with Home,
 Leaderboard (all-time / weekly / monthly), Submissions, structured Booklet
 Editor, Preview, Exports and Revision History — no build step. Deploy:
-[cPanel](MINIAPP_CPANEL.md) or [Cloudflare](MINIAPP_CLOUDFLARE.md).
+cPanel Passenger or Cloudflare Tunnel (this Mini App was removed later; see
+Unreleased).
 
 **Structured editing.** The editor works on the canonical `StructuredNotes`
 model: sections, subsections and blocks (paragraphs, lists, definitions,

@@ -464,6 +464,8 @@ class LeaderboardAndGiftTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("رتبهٔ شما: ۲ با ۳۰ امتیاز", text)
         # No telegram id ever reaches the public board.
         self.assertNotIn(str(OWNER), text)
+        # The board is fully native: only the way back, no WebView entry.
+        self.assertEqual(menu_payloads(event.edits[-1]["buttons"]), {b"menu:main"})
 
     async def test_missing_name_renders_fallback_only(self):
         await self.db.db.execute("UPDATE users SET quiz_points=10 WHERE telegram_id=?", (OWNER,))

@@ -1422,7 +1422,7 @@ class JobPipelineMixin:
                     else:
                         item_id = int(match["item_id"])
                     # The structured model the renderers used, stored next to
-                    # the text cache so Gamas Studio can edit the real
+                    # the text cache so it matches the persisted booklet
                     # structure (the submission's notes_json stays the
                     # immutable original). Refreshed on every delivery so a
                     # re-processed submission never serves a stale structure.
@@ -1652,7 +1652,6 @@ class JobPipelineMixin:
             has_booklet=has_booklet,
             kinds=kinds,
             item_id=item_id,
-            mini_app_url=self.settings.mini_app_url,
             learning_available=self.settings.note_configured,
         )
         body = texts.delivery_screen(
@@ -1664,7 +1663,6 @@ class JobPipelineMixin:
             has_transcript=KIND_TRANSCRIPT in kinds,
             has_txt=KIND_TXT in kinds,
             has_docx=KIND_DOCX in kinds,
-            has_studio=bool(self.settings.mini_app_url and has_booklet),
             has_learning_item=item_id is not None,
         )
         # Quality notices are a suffix to the single results message: do not

@@ -296,8 +296,8 @@ class LibraryRepositoryMixin(DatabaseCore):
     async def library_set_structured(self, item_id: int, structured_json: str) -> None:
         """Store the canonical structured payload of one booklet item.
 
-        Written once by the pipeline next to the text cache, so Gamas Studio
-        can edit the real structure. The submission's ``transcriptions.notes_json``
+        Written once by the pipeline next to the text cache so the stored
+        structure matches the delivered booklet. The submission's ``transcriptions.notes_json``
         stays the immutable original; this column is the editable copy. The
         028 column is optional at runtime: a bot binary may run against a
         database whose migration has not been applied yet.
@@ -435,7 +435,7 @@ class LibraryRepositoryMixin(DatabaseCore):
         SQLite BLOBs keep the deliverable private, durable across workdir cleanup,
         and atomically tied to the submission.  The digest gives operators a
         direct integrity check without retaining a second file copy.
-        ``revision_id`` (migration 028, optional) records which Studio revision
+        ``revision_id`` (migration 028, optional) records which booklet revision
         the bytes were rendered from; the pipeline leaves it ``NULL``.
         """
         if kind not in {"booklet", "docx"}:

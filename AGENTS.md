@@ -11,8 +11,6 @@ Keep changes small and practical.
   bot token.
 - Telethon, bounded asyncio work, SQLite WAL, PyAV. No system binaries, brokers,
   external databases, web frameworks or payment gateways.
-- Telegram and the Mini App are separate processes sharing the SQLite file; the
-  Mini App never migrates.
 - Do not modify production `.env`, `data/`, sessions, receipts or backups.
   `migrations/v2/` is read-only legacy material.
 - Code, comments, logs and docs in English; user messages and LLM prompts in
@@ -46,8 +44,6 @@ Keep changes small and practical.
   cooldown-limited changes never target self or peer admins.
 - Only channel-membership **infrastructure** errors fail open. Confirmed
   non-membership blocks.
-- Mini App: verify `initData` HMAC (constant-time) with `auth_date` freshness on
-  every request, scope every query to the signed user id.
 
 ## Billing (append-only)
 
