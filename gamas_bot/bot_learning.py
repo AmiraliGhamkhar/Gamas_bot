@@ -1,8 +1,13 @@
-"""Quizzes, flashcards, curation previews, leaderboards, and admin rewards (SRP / DIP).
+"""Flashcards, curation previews, and admin rewards (SRP / DIP).
 
 Encapsulates parallel chunk generation, source-grounded item anchoring,
-interactive curation previews, quiz sessions, flashcard study & DOCX export,
-and leaderboard gift flows.
+interactive curation previews, flashcard study & DOCX export, and the
+administrator's top-users reward flow.
+
+The quiz sessions and leaderboard screens of earlier versions were removed from
+the product. Their persistence layer (``db_learning``) and its tables are kept
+read-only for migration compatibility, and nothing here creates a quiz session
+or awards leaderboard points from a user flow anymore.
 """
 
 from __future__ import annotations
@@ -31,7 +36,6 @@ from .bot_ui import (
     FLASHCARD_ASK_FRONT,
     FREE_TRY_BADGE,
     FREE_TRY_RESTORED,
-    LEADERBOARD_FALLBACK_NAME,
     LEARNING_BUSY_ALERT,
     LEARNING_CREDIT_RESTORED,
     LEARNING_GENERATION_FAILED,
@@ -39,10 +43,6 @@ from .bot_ui import (
     LEARNING_LEGACY_NOTICE,
     LEARNING_NO_CREDIT,
     LEARNING_REFUND_PENDING_NOTICE,
-    LEARNING_STALE_ALERT,
-    QUIZ_COUNTS,
-    QUIZ_POINTS_PER_ANSWER,
-    QUIZ_START_GUIDANCE,
     TELEGRAM_CAPTION_LIMIT,
 )
 from .db import InsufficientBalanceError
@@ -133,7 +133,7 @@ def _log_quiz_dedupe_diagnostics(input_count: int, accepted_count: int, stage: s
 
 
 class LearningWorkflowMixin:
-    """Learning generation, curation, quiz sessions, flashcards, and leaderboards."""
+    """Learning generation, curation, flashcards, and admin rewards."""
 
     db: Any
     settings: Any
@@ -605,6 +605,9 @@ class LearningWorkflowMixin:
                     ],
                 )
                 return
+        # Only ``kind="deck"`` is reachable since the quiz flow was removed from
+        # the product; the generic branches below keep the shared generation
+        # helper intact without a second call path.
         chunks = [chunk for chunk in source["chunks"] if chunk.text.strip()]
         if not chunks:
             await event.respond("متنی برای ساخت محتوا پیدا نشد. فایل دیگری بفرستید.")
@@ -1057,19 +1060,8 @@ class LearningWorkflowMixin:
                     ),
                     refund_seconds_value=refund,
                 )
-            else:
-                artifact_id = await self.db.quiz_create_session(
-                    user_id,
-                    int(state["item_id"]),
-                    items,
-                    free_claim_id=(
-                        state.get("claim_id") if state.get("free") else None
-                    ),
-                    paid_charge_id=(
-                        state.get("claim_id") if state.get("charged") else None
-                    ),
-                    refund_seconds_value=refund,
-                )
+            else:  # pragma: no cover - the quiz flow was removed; only decks exist
+                raise ValueError("unsupported learning kind")
         except BaseException as exc:
             if (isinstance(exc, sqlite3.IntegrityError)
                     and await self.db.library_item(user_id, int(state["item_id"])) is None):
@@ -1103,24 +1095,20 @@ class LearningWorkflowMixin:
         refund_notice = ("\n" + texts.LEARNING_PRORATA_REFUND.format(
             duration=format_seconds_as_credits(refund)
         )) if refund else ""
-        if state["kind"] == "deck":
-            deck = await self.db.deck_get(artifact_id, user_id)
-            await self._ack(event, texts.LEARNING_DECK_SAVED + refund_notice)
-            if deck is None:
-                await self._edit(
-                    event,
-                    "✅ مجموعه ذخیره شد؛ از «کتابخانه من» بازش کنید.",
-                    [[Button.inline("↩️ فلش‌کارت‌ها", b"fc:hub")]],
-                )
-            else:
-                await self._edit(
-                    event,
-                    self._deck_screen_text(deck, len(items)),
-                    self._deck_keyboard(artifact_id, bool(items)),
-                )
+        deck = await self.db.deck_get(artifact_id, user_id)
+        await self._ack(event, texts.LEARNING_DECK_SAVED + refund_notice)
+        if deck is None:
+            await self._edit(
+                event,
+                "✅ مجموعه ذخیره شد؛ از «کتابخانه من» بازش کنید.",
+                [[Button.inline("↩️ فلش‌کارت‌ها", b"fc:hub")]],
+            )
         else:
-            await self._ack(event, texts.LEARNING_QUIZ_READY + refund_notice)
-            await self._render_question_message(event, user_id, artifact_id)
+            await self._edit(
+                event,
+                self._deck_screen_text(deck, len(items)),
+                self._deck_keyboard(artifact_id, bool(items)),
+            )
 
     async def _handle_curation_callback(
         self, event: Any, user_id: int, data: str
@@ -1171,339 +1159,6 @@ class LearningWorkflowMixin:
                 await self._render_curation(event, user_id)
                 return
             await self._ack(event, CURATION_STALE_ALERT, alert=True)
-
-    async def _quiz_start_screen(
-        self, event: Any, user_id: int, item_id: int
-    ) -> None:
-        item = await self.db.library_item_detail(user_id, item_id)
-        if item is None or item.get("kind") != "booklet":
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
-            return
-        document = await self.db.document_by_library_item(user_id, item_id)
-        if document:
-            await self._show_document_generate_screen(  # type: ignore[attr-defined]
-                event, user_id, int(document["id"]), "quiz"
-            )
-            return
-        if not item.get("content_text"):
-            await self._edit(
-                event,
-                "🧪 آزمون از جزوه\n\n" + LEARNING_LEGACY_NOTICE,
-                [[Button.inline("↩️ بازگشت", b"library")]],
-            )
-            return
-        if not self.settings.note_configured:
-            await self._edit(
-                event,
-                texts.LEARNING_GENERATION_UNAVAILABLE,
-                [[self._learning_back_button(item_id)]],
-            )
-            return
-        per_question = self.settings.quiz_cost_seconds_per_question
-        free = await self._free_try_available(user_id, "quiz")
-        buttons: list[list] = []
-        for _code, label, _cards, questions in SIZE_PRESETS:
-            cost_label = (
-                texts.LEARNING_FREE_CHOICE_LABEL
-                if free
-                else format_seconds_as_credits(questions * per_question)
-            )
-            buttons.append(
-                [
-                    Button.inline(
-                        button_label(
-                            f"{label} — {to_persian_digits(questions)} سؤال — {cost_label}"
-                        ),
-                        f"quiz:go:{item_id}:{questions}".encode("ascii"),
-                    )
-                ]
-            )
-        buttons.append([self._learning_back_button(item_id)])
-        badge = ""
-        if free:
-            badge = f"\n\n{FREE_TRY_BADGE} — نخستین آزمون رایگان است؛ اندازه را انتخاب کنید."
-        await self._edit(
-            event,
-            "🧪 آزمون از جزوه\n\n" + QUIZ_START_GUIDANCE + badge,
-            buttons,
-        )
-
-    async def _quiz_generate(
-        self, event: Any, user_id: int, item_id: int, count: int
-    ) -> None:
-        if count not in QUIZ_COUNTS:
-            await self._ack(event, "تعداد سؤال نامعتبر است.", alert=True)
-            return
-        document = await self.db.document_by_library_item(user_id, item_id)
-        if document:
-            await self._generate_from_document(  # type: ignore[attr-defined]
-                event, user_id, int(document["id"]), "quiz", str(count)
-            )
-            return
-        item = await self.db.library_item_detail(user_id, item_id)
-        if item is None or item.get("kind") != "booklet":
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
-            return
-        content = item.get("content_text")
-        if not content:
-            await self._ack(event, LEARNING_LEGACY_NOTICE, alert=True)
-            return
-        if not self.settings.note_configured:
-            await event.respond(texts.LEARNING_GENERATION_UNAVAILABLE)
-            return
-        if user_id in self._learning_in_flight:
-            await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
-            return
-        if self._shutting_down:
-            await self._ack(
-                event,
-                "ربات در حال راه‌اندازی مجدد است؛ دوباره تلاش کنید.",
-                alert=True,
-            )
-            return
-        self._learning_in_flight.add(user_id)
-        task = asyncio.current_task()
-        if task is not None:
-            self._learning_tasks[user_id] = task
-        try:
-            async with self._learning_lock(user_id):
-                await self._quiz_generate_locked(
-                    event, user_id, item_id, count, content
-                )
-        finally:
-            self._learning_in_flight.discard(user_id)
-            if self._learning_tasks.get(user_id) is task:
-                self._learning_tasks.pop(user_id, None)
-
-    async def _quiz_generate_locked(
-        self,
-        event: Any,
-        user_id: int,
-        item_id: int,
-        count: int,
-        content: str,
-    ) -> None:
-        reason = await self.db.quiz_admission(
-            user_id,
-            max_active_hours=self.settings.quiz_max_active_hours,
-            max_sessions_per_hour=self.settings.quiz_max_sessions_per_hour,
-        )
-        if reason == "active":
-            await event.respond(
-                "یک آزمون فعال دیگر دارید؛ ابتدا آن را تمام کنید یا "
-                "دکمهٔ «پایان آزمون» را بزنید."
-            )
-            return
-        if reason == "rate":
-            await event.respond(
-                "تعداد آزمون‌های شما در یک ساعت اخیر به حداکثر مجاز "
-                "رسیده است؛ کمی بعد دوباره تلاش کنید."
-            )
-            return
-        item = await self.db.library_item_detail(user_id, item_id)
-        if item is None:
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
-            return
-        await self._generate_learning(
-            event,
-            user_id=user_id,
-            kind="quiz",
-            source={
-                "item_id": int(item_id),
-                "doc_id": None,
-                "title": self._item_display_title(item),
-                "chunks": await run_file_io(self._learning_chunks, content),
-                "sensitivity_text": content,
-            },
-            wanted=int(count),
-            cost=int(count) * self.settings.quiz_cost_seconds_per_question,
-            note=f"quiz-pending:{item_id}",
-            title=short_title(
-                self._item_display_title(item), fallback=FALLBACK_BOOKLET
-            )
-            + " — آزمون",
-        )
-
-    def _question_keyboard(self, session_id: int, question_id: int) -> list[list]:
-        option_row = [
-            Button.inline(
-                OPTION_LABELS[index],
-                f"quiz:ans:{session_id}:{question_id}:{index}".encode("ascii"),
-            )
-            for index in range(4)
-        ]
-        return [
-            option_row,
-            [
-                Button.inline(
-                    "⏹ پایان آزمون", f"quiz:quit:{session_id}".encode("ascii")
-                )
-            ],
-        ]
-
-    async def _render_question_message(
-        self, message: Any, user_id: int, session_id: int
-    ) -> None:
-        question = await self.db.quiz_current_question(session_id)
-        if question is None:
-            await self._finish_after_question(message, user_id, session_id)
-            return
-        number = int(question["idx"]) + 1
-        lines = [
-            f"سؤال {to_persian_digits(number)} از "
-            f"{to_persian_digits(question['question_count'])}",
-            "",
-            str(question["question"]),
-            "",
-        ]
-        for index, option in enumerate(question["options"]):
-            lines.append(f"{OPTION_LABELS[index]}) {option}")
-        if question.get("source"):
-            lines.append(f"\n📍 منبع: {question['source']}")
-        await message.edit(
-            "\n".join(lines),
-            buttons=self._question_keyboard(session_id, int(question["question_id"])),
-        )
-
-    async def _finish_after_question(
-        self, message: Any, user_id: int, session_id: int
-    ) -> None:
-        session = await self.db.quiz_get_session(session_id, user_id)
-        if session is None:
-            await message.edit(LEARNING_STALE_ALERT)
-            return
-        await self._show_finish_screen(message, user_id, session)
-
-    async def _show_finish_screen(
-        self, message: Any, user_id: int, session: Any
-    ) -> None:
-        rank = await self.db.leaderboard_rank(user_id)
-        correct = int(session["score"]) // QUIZ_POINTS_PER_ANSWER
-        text = (
-            "🎉 آزمون تمام شد!\n\n"
-            f"پاسخ‌های درست: {to_persian_digits(correct)} از "
-            f"{to_persian_digits(session['question_count'])}\n"
-            f"امتیاز کسب‌شده: {to_persian_digits(session['score'])}\n"
-            "رتبهٔ شما در لیدربورد: "
-            f"{to_persian_digits(rank['rank'])}"
-        )
-        await message.edit(text, buttons=self._learning_done_buttons())
-
-    def _learning_done_buttons(self) -> list[list]:
-        return [
-            [Button.inline("🏆 لیدربورد", b"board")],
-            [Button.inline("📚 کتابخانه من", b"library")],
-            [Button.inline("↩️ منوی اصلی", b"menu:main")],
-        ]
-
-    async def _quiz_answer(
-        self,
-        event: Any,
-        user_id: int,
-        session_id: int,
-        question_id: int,
-        option: int,
-    ) -> None:
-        session = await self.db.quiz_get_session(session_id, user_id)
-        if session is None:
-            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
-            return
-        result = await self.db.quiz_record_answer(session_id, question_id, option)
-        if result["status"] == "stale":
-            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
-            return
-        if result["status"] == "already":
-            await self._ack(event, "پاسخ شما ثبت شده بود.")
-            return
-        correct_text = result["options"][result["correct_index"]]
-        if result["correct"]:
-            lines = [f"✅ پاسخ درست: {correct_text}"]
-        else:
-            lines = [
-                "❌ پاسخ شما درست نبود.",
-                f"✅ پاسخ درست: {correct_text}",
-            ]
-        if result["explanation"]:
-            lines.append(f"💡 {result['explanation']}")
-        next_label = "مشاهدهٔ نتیجه ➡️" if result["finished"] else "سؤال بعدی ➡️"
-        await self._edit(
-            event,
-            "\n".join(lines),
-            [[Button.inline(next_label, f"quiz:next:{session_id}".encode("ascii"))]],
-        )
-
-    async def _quiz_next(self, event: Any, user_id: int, session_id: int) -> None:
-        session = await self.db.quiz_get_session(session_id, user_id)
-        if session is None:
-            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
-            return
-        if session["status"] == "done":
-            await self._show_finish_screen(event, user_id, session)
-            return
-        if session["status"] != "active":
-            await self._show_quiz_summary(event, user_id, session)
-            return
-        await self._render_question_message(event, user_id, session_id)
-
-    async def _quiz_quit(self, event: Any, user_id: int, session_id: int) -> None:
-        session = await self.db.quiz_get_session(session_id, user_id)
-        if session is None:
-            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
-            return
-        if session["status"] == "active":
-            await self.db.quiz_finish(session_id, "quit")
-            session = await self.db.quiz_get_session(session_id, user_id)
-        await self._show_quiz_summary(event, user_id, session)
-
-    async def _show_quiz_summary(
-        self, event: Any, user_id: int, session: Any
-    ) -> None:
-        answered = min(int(session["current_index"]), int(session["question_count"]))
-        correct = int(session["score"]) // QUIZ_POINTS_PER_ANSWER
-        rank = await self.db.leaderboard_rank(user_id)
-        text = (
-            "⏹ آزمون پایان یافت.\n\n"
-            f"پاسخ‌های درست: {to_persian_digits(correct)} از "
-            f"{to_persian_digits(answered)}\n"
-            f"امتیاز کسب‌شده: {to_persian_digits(session['score'])}\n"
-            f"رتبهٔ شما در لیدربورد: {to_persian_digits(rank['rank'])}"
-        )
-        await self._edit(event, text, self._learning_done_buttons())
-
-    async def _show_leaderboard(self, event: Any) -> None:
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        rows = await self.db.leaderboard_top(20)
-        if not rows:
-            await self._edit_or_reply(  # type: ignore[attr-defined]
-                event,
-                texts.leaderboard_empty(
-                    notes_configured=self.settings.note_configured
-                ),
-                [[Button.inline("↩️ منوی اصلی", b"menu:main")]],
-            )
-            return
-        medals = ("🥇", "🥈", "🥉")
-        lines = ["🏆 لیدربورد", ""]
-        for index, row in enumerate(rows):
-            rank_label = medals[index] if index < 3 else to_persian_digits(index + 1)
-            name = row["first_name"] or LEADERBOARD_FALLBACK_NAME
-            lines.append(
-                f"{rank_label} {name} — "
-                f"{to_persian_digits(row['quiz_points'])} امتیاز"
-            )
-        rank = await self.db.leaderboard_rank(user_id)
-        lines.append("")
-        lines.append(
-            f"رتبهٔ شما: {to_persian_digits(rank['rank'])} با "
-            f"{to_persian_digits(rank['points'])} امتیاز"
-        )
-        await self._edit_or_reply(  # type: ignore[attr-defined]
-            event,
-            "\n".join(lines),
-            [[Button.inline("↩️ منوی اصلی", b"menu:main")]],
-        )
 
     async def _admin_board(self, event: Any, *, notice: str = "") -> None:
         rows = await self.db.leaderboard_admin_top(5)
@@ -2332,53 +1987,3 @@ class LearningWorkflowMixin:
             await self._flip_card(event, user_id, deck_id, card_id)
             return
         await self._ack(event, self._deck_stale_alert(), alert=True)
-
-    async def _route_quiz_callback(
-        self, event: Any, user_id: int, data: str
-    ) -> None:
-        parts = data.split(":")
-        action = parts[1] if len(parts) > 1 else ""
-        if action == "cur":
-            await self._handle_curation_callback(event, user_id, data)
-            return
-        if action == "new" and len(parts) == 3:
-            item_id = _to_int(parts[2])
-            if item_id is None:
-                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
-                return
-            await self._quiz_start_screen(event, user_id, item_id)
-            return
-        if action == "go" and len(parts) == 4:
-            item_id = _to_int(parts[2])
-            count = _to_int(parts[3])
-            if item_id is None or count is None:
-                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
-                return
-            if not await self._require_membership(
-                event, user_id, kind="callback", callback_data=data
-            ):
-                return
-            await self._quiz_generate(event, user_id, item_id, count)
-            return
-        if action == "ans" and len(parts) == 5:
-            session_id = _to_int(parts[2])
-            question_id = _to_int(parts[3])
-            option = _to_int(parts[4])
-            if session_id is None or question_id is None or option is None:
-                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
-                return
-            await self._quiz_answer(
-                event, user_id, session_id, question_id, option
-            )
-            return
-        if action in ("next", "quit") and len(parts) == 3:
-            session_id = _to_int(parts[2])
-            if session_id is None:
-                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
-                return
-            if action == "next":
-                await self._quiz_next(event, user_id, session_id)
-            else:
-                await self._quiz_quit(event, user_id, session_id)
-            return
-        await self._ack(event, LEARNING_STALE_ALERT, alert=True)

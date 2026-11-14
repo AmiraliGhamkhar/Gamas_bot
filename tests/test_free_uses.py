@@ -1,4 +1,4 @@
-"""Free first try (R3): one free deck and one free quiz per user.
+"""Free first try (R3): one free deck (and the legacy quiz gift) per user.
 
 Two layers are covered:
 
@@ -227,16 +227,6 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertTrue(any("رایگان در اولین استفاده" in label for label in flash_labels))
 
-        quiz = self.press(f"quiz:new:{self.item_id}".encode())
-        await self.bot._handle_callback(quiz)
-        self.assertIn(FREE_TRY_BADGE, self.last_text(quiz))
-        quiz_labels = [
-            button.text
-            for row in quiz.edits[-1]["buttons"]
-            for button in row
-            if getattr(button, "text", None)
-        ]
-        self.assertTrue(any("رایگان در اولین استفاده" in label for label in quiz_labels))
 
     async def test_badge_disappears_once_the_gift_is_used(self):
         await self.db.consume_free_use(OWNER, "deck")
@@ -307,36 +297,6 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
         self.assertEqual(await self.db.deck_count(OWNER), 0)
 
-    async def test_first_quiz_is_free_and_second_is_paid(self):
-        await self.db.add_credit(OWNER, 600, note="paid", validity_days=30)
-        first = self.press(f"quiz:go:{self.item_id}:5".encode())
-        with mock.patch(
-            "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=quiz_payload(5)),
-        ):
-            await self.bot._handle_callback(first)
-        await self.bot._handle_callback(self.press(b"quiz:cur:save"))
-        debits = await self.db.db.execute_fetchall(
-            "SELECT COUNT(*) FROM ledger WHERE kind='debit'"
-        )
-        self.assertEqual(debits[0][0], 0)  # the gift paid for this quiz
-        self.assertFalse((await self.db.free_use_state(OWNER))["quiz"])
-        # Finish the session so the admission gate allows a second one.
-        rows = await self.db.db.execute_fetchall("SELECT session_id FROM quiz_sessions")
-        await self.db.quiz_finish(int(rows[0][0]), "quit")
-        second = self.press(f"quiz:go:{self.item_id}:5".encode())
-        with mock.patch(
-            "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=quiz_payload(5)),
-        ) as generator:
-            await self.bot._handle_callback(second)
-            generator.assert_awaited_once()
-        debits = await self.db.db.execute_fetchall(
-            "SELECT seconds FROM ledger WHERE kind='debit'"
-        )
-        self.assertEqual(len(debits), 1)
-        self.assertEqual(int(debits[0][0]), 300)  # 5 questions x 60s
-
     async def test_concurrent_double_tap_claims_one_gift(self):
         async def slow(*_args, **_kwargs):
             await asyncio.sleep(0.05)
@@ -398,25 +358,6 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(int(debit[0][0]), 500)
         self.assertEqual((await self.db.decks_list(OWNER))[0]["card_count"], 10)
-
-    async def test_quiz_size_preset_bills_per_question(self):
-        await self.db.add_credit(OWNER, 5000, note="paid", validity_days=30)
-        await self.db.consume_free_use(OWNER, "quiz")
-        event = self.press(f"quiz:go:{self.item_id}:20".encode())
-        with mock.patch(
-            "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=quiz_payload(20)),
-        ):
-            await self.bot._handle_callback(event)
-        await self.bot._handle_callback(self.press(b"quiz:cur:save"))
-        debit = await self.db.db.execute_fetchall(
-            "SELECT seconds FROM ledger WHERE kind='debit'"
-        )
-        self.assertEqual(int(debit[0][0]), 20 * 60)
-        rows = await self.db.db.execute_fetchall(
-            "SELECT COUNT(*) FROM quiz_questions"
-        )
-        self.assertEqual(int(rows[0][0]), 20)
 
     async def test_admin_reset_gives_the_gift_back(self):
         admin_id = next(iter(self.settings.admin_ids))
@@ -490,18 +431,6 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(decks, (0, 1))
         self.assertEqual((await self.db.free_use_state(OWNER))["deck"], decks == 0)
         self.assertNotIn(OWNER, self.bot._curation)
-
-    async def test_quiz_second_attempt_without_credit_reaches_paywall(self):
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(5))):
-            await self.bot._handle_callback(self.press(f"quiz:go:{self.item_id}:5".encode()))
-        await self.bot._handle_callback(self.press(b"quiz:cur:save"))
-        row = (await self.db.db.execute_fetchall("SELECT session_id FROM quiz_sessions"))[0]
-        await self.db.quiz_finish(int(row[0]), "quit")
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock()) as generator:
-            await self.bot._handle_callback(self.press(f"quiz:go:{self.item_id}:5".encode()))
-        generator.assert_not_awaited()
-        self.assertTrue(any(LEARNING_NO_CREDIT in record["text"] for record in self.client.texts))
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
 
     async def test_reset_execute_requires_a_fresh_confirmation(self):
         admin = next(iter(self.settings.admin_ids))

@@ -30,16 +30,7 @@ SUPPORT_CATEGORY_BUTTONS: dict[str, str] = {
 
 LEARNING_LEGACY_NOTICE = (
     "متن این جزوهٔ قدیمی ذخیره نشده است.\n"
-    "🧪 آزمون و 🃏 فلش‌کارت فقط برای جزوه‌های تازه کار می‌کند."
-)
-QUIZ_START_GUIDANCE = (
-    "سؤال‌های متوسط تا سخت؛ تعداد را انتخاب کنید.\n"
-    "هر پاسخ درست ۱۰ امتیاز دارد."
-)
-LEADERBOARD_EMPTY = (
-    "🏆 لیدربورد\n\n"
-    "هنوز امتیازی ثبت نشده است.\n"
-    "اولین آزمون خود را از «📚 کتابخانه من» شروع کنید."
+    "🃏 فلش‌کارت فقط برای جزوه‌های تازه کار می‌کند."
 )
 FLASHCARD_EMPTY = (
     "🃏 فلش‌کارت‌ها\n\n"
@@ -56,15 +47,14 @@ LEARNING_CREDIT_RESTORED = "💳 اعتبار شما کامل برگشت داد�
 DOC_EXTRACTION_STOPPED = "📄 استخراج متن سند متوقف شد."
 OFFICE_UPLOAD_STOPPED = "🗂 آفیس رایگان متوقف شد."
 LEARNING_DELIVERY_CTA = (
-    "\n🧪 از همین جزوه آزمون بده یا 🃏 فلش‌کارت بساز: «📚 کتابخانه من»"
+    "\n🃏 از همین جزوه فلش‌کارت مرور بساز: «📚 کتابخانه من»"
 )
 FLASHCARD_ASK_FRONT = "پرسش کارت را بفرستید:"
 FLASHCARD_ASK_BACK = "پاسخ کارت را بفرستید:"
 LEARNING_STALE_ALERT = "این آزمون دیگر معتبر نیست."
 LEARNING_BUSY_ALERT = "درخواست قبلی شما در حال پردازش است؛ کمی صبر کنید."
+#: Display-name fallback used by the administrator's top-users screen.
 LEADERBOARD_FALLBACK_NAME = "کاربر گاماس"
-QUIZ_COUNTS = (5, 10, 15, 20)
-QUIZ_POINTS_PER_ANSWER = 10
 FREE_TRY_BADGE = "🎁 اولین بار رایگان"
 FREE_TRY_USED_NOTICE = (
     "🎁 هدیهٔ اولین بار شما برای این بخش استفاده شده است؛ "
@@ -87,7 +77,6 @@ DOC_PHOTO_HINT = texts.DOCUMENT_PHOTO_OCR_OFF
 DOC_OCR_FAILED = texts.DOCUMENT_OCR_FAILED
 DEFAULT_INTAKE_SUFFIX: dict[str, str] = {"image": ".jpg"}
 DOC_GENERATE_CARDS = "🃏 ساخت فلش‌کارت"
-DOC_GENERATE_QUESTIONS = "❓ ساخت سؤالات"
 
 SUPPORT_STATUS_LABELS: dict[str, str] = {
     "open": "🆕 باز",

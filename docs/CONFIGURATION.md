@@ -82,13 +82,14 @@ chain yields a local source-preserving booklet rather than discarding successful
 chunks. `NOTE_COMPLETENESS_FILL` remains strictly source-grounded and may run
 while `NOTE_STRICT_GROUNDING=true`.
 
-## Interactive HTML review sheet
+## Offline HTML study booklet
 
-The review sheet adds **no environment variables**. It reuses the note-provider
-settings (`NOTE_*`, the provider chain and the allowlists) and the same
-`NOTE_DATA_SENSITIVITY` decision as the booklet, and its one planning call
-follows the same timeouts and failover. Its 30-minute duration is a default of
-the renderer and planner API, not a deployment setting.
+The HTML booklet adds **no environment variables** and makes **no model call**:
+it is rendered from the same validated notes as the PDF and DOCX, reusing the
+note-provider settings (`NOTE_*`, the provider chain and the allowlists) and the
+same `NOTE_DATA_SENSITIVITY` decision. `QUIZ_COST_SECONDS_PER_QUESTION` and the
+other quiz settings are still read by the legacy quiz storage but no longer
+reach a user-facing flow.
 
 ## Sensitivity and validation
 

@@ -24,7 +24,7 @@ from gamas_bot.artifacts import (
     KIND_DOCX,
     KIND_FLASHCARDS,
     KIND_KEYPOINTS,
-    KIND_QUIZ,
+    KIND_STUDY_HTML,
     KIND_TRANSCRIPT,
     KIND_TXT,
     callback_for,
@@ -372,13 +372,12 @@ class DeliveryMarkupTests(unittest.TestCase):
         buttons = delivery_markup(
             reference="GMS-7", speakers=2, has_booklet=True,
             kinds={KIND_BOOKLET, KIND_DOCX, KIND_TRANSCRIPT, KIND_TXT,
-                   KIND_KEYPOINTS, KIND_QUIZ, KIND_FLASHCARDS},
+                   KIND_KEYPOINTS, KIND_STUDY_HTML, KIND_FLASHCARDS},
             item_id=11,
         )
         payloads = self._payloads(buttons)
-        for kind in ("booklet", "docx", "transcript", "txt", "keypoints"):
+        for kind in ("booklet", "docx", "transcript", "txt", "keypoints", KIND_STUDY_HTML):
             self.assertIn(f"art:GMS-7:{kind}", payloads)
-        self.assertIn("quiz:new:11", payloads)
         self.assertIn("fc:ai:11", payloads)
         self.assertFalse(any("استودیو" in str(p) for p in payloads))
 
@@ -387,12 +386,11 @@ class DeliveryMarkupTests(unittest.TestCase):
             reference="GMS-7",
             speakers=0,
             has_booklet=True,
-            kinds={KIND_BOOKLET, KIND_QUIZ, KIND_FLASHCARDS},
+            kinds={KIND_BOOKLET, KIND_FLASHCARDS},
             item_id=11,
             learning_available=False,
         )
         payloads = self._payloads(buttons)
-        self.assertNotIn("quiz:new:11", payloads)
         self.assertNotIn("fc:ai:11", payloads)
 
     def test_no_dead_buttons_when_an_artifact_is_missing(self):
@@ -402,7 +400,8 @@ class DeliveryMarkupTests(unittest.TestCase):
         )
         payloads = self._payloads(buttons)
         self.assertNotIn("art:GMS-7:booklet", payloads)
-        self.assertFalse(any("quiz" in p for p in payloads))
+        self.assertNotIn("art:GMS-7:study_html", payloads)
+        self.assertFalse(any(p.startswith("fc:") for p in payloads))
         self.assertEqual(parse_callback("art:GMS-7:txt"), ("GMS-7", "txt"))
         self.assertEqual(callback_for("GMS-7", "txt"), b"art:GMS-7:txt")
 
@@ -412,7 +411,8 @@ class DeliveryMarkupTests(unittest.TestCase):
         body = texts.delivery_screen(
             reference="GMS-7", speakers=2, has_booklet=True, has_keypoints=True,
         )
-        self.assertIn("آزمون", body)
+        self.assertIn("فلش‌کارت", body)
+        self.assertNotIn("آزمون", body)
         self.assertNotIn("استودیو", body)
 
     def test_delivery_copy_only_names_artifacts_that_have_buttons(self):

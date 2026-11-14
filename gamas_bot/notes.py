@@ -1178,7 +1178,6 @@ def notes_response_schema() -> dict:
                 },
             },
             "key_points": text_array,
-            "review_questions": text_array,
             "glossary": {
                 "type": "array",
                 "items": {

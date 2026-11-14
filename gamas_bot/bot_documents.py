@@ -28,14 +28,12 @@ from .bot_ui import (
     DEFAULT_INTAKE_SUFFIX,
     DOC_EXTRACTION_STOPPED,
     DOC_GENERATE_CARDS,
-    DOC_GENERATE_QUESTIONS,
     DOC_OCR_FAILED,
     FREE_TRY_BADGE,
     LEARNING_BUSY_ALERT,
     MAX_OFFICE_OUTPUT_BYTES,
     MAX_OFFICE_SESSIONS,
     OFFICE_UPLOAD_STOPPED,
-    QUIZ_COUNTS,
     TELEGRAM_CAPTION_LIMIT,
 )
 from .doc_extract import (
@@ -66,7 +64,8 @@ from .jobs import Job
 from .learning import MAX_MODEL_INPUT_CHARS, SIZE_PRESETS, bound_content_text, preset_cards
 from .media import MediaToolError, convert_to_pptx
 from .notes import StructuringError
-from .review_sheet import generate_review_sheet
+from .artifact_validation import validate_study_html_artifact
+from .study_notes_html import render_study_notes_html, study_notes_filename
 from .ocr import I2OCRClient, OcrError, extract_text_problem
 from .office import (
     FORMAT_LABELS,
@@ -345,11 +344,7 @@ class DocumentOfficeWorkflowMixin:
                 [
                     Button.inline(
                         DOC_GENERATE_CARDS, f"doc:fc:{document_id}".encode("ascii")
-                    ),
-                    Button.inline(
-                        DOC_GENERATE_QUESTIONS,
-                        f"doc:quiz:{document_id}".encode("ascii"),
-                    ),
+                    )
                 ]
             )
         buttons.append(
@@ -1226,30 +1221,29 @@ class DocumentOfficeWorkflowMixin:
                 meta=meta,
                 mode_label=mode_label,
             )
-            # The interactive review sheet is only derived from a completed AI
-            # booklet. The deterministic source fallback is never planned again,
-            # and a failure here must not cost the Word and PDF files above.
-            review_output: tuple[str, bytes, str, str] | None = None
+            # The offline HTML study booklet is rendered deterministically from
+            # the completed AI booklet. The deterministic source fallback is
+            # never rendered again, and a failure here must not cost the Word and
+            # PDF files above.
+            study_output: tuple[str, bytes, str, str] | None = None
             if mode == "full" and not fallback_used and full_notes is not None:
                 try:
-                    review_file = await generate_review_sheet(
-                        full_notes,
-                        self.settings,
-                        self._http_session() if self.settings.note_configured else None,  # type: ignore[attr-defined]
-                        reference=reference,
-                        announce=lambda label: progress.update(
-                            self.OFFICE_BUILD_PERCENT - 6, label
-                        ),
+                    await progress.update(
+                        self.OFFICE_BUILD_PERCENT - 6, texts.STUDY_STAGE_RENDERING
                     )
+                    study_bytes = await run_file_io(
+                        lambda: render_study_notes_html(full_notes).encode("utf-8")
+                    )
+                    await run_file_io(validate_study_html_artifact, study_bytes)
                 except Exception:
-                    review_file = None
-                    logger.exception("document review HTML generation failed mode=%s", mode)
-                if review_file is not None:
-                    review_output = (
-                        review_file.filename,
-                        review_file.content,
-                        f"🌐 مرور تعاملی — HTML | {title}",
-                        f"{short_title(title, fallback=FALLBACK_OFFICE, max_words=2)} — مرور تعاملی HTML",
+                    study_bytes = None
+                    logger.exception("document study HTML generation failed mode=%s", mode)
+                if study_bytes is not None:
+                    study_output = (
+                        study_notes_filename(str(full_notes.display_title)),
+                        study_bytes,
+                        f"📖 جزوه HTML — آفلاین | {title}",
+                        f"{short_title(title, fallback=FALLBACK_OFFICE, max_words=2)} — جزوه HTML",
                     )
             variant = "کامل" if mode == "full" else "مرور"
             if fallback_used:
@@ -1272,8 +1266,8 @@ class DocumentOfficeWorkflowMixin:
                     f"{base_title} — {variant} PDF",
                 ),
             ]
-            if review_output is not None:
-                outputs.append(review_output)
+            if study_output is not None:
+                outputs.append(study_output)
             return outputs
 
         await self._office_run_operation(
@@ -1602,8 +1596,10 @@ class DocumentOfficeWorkflowMixin:
         )
 
     async def _show_document_generate_screen(
-        self, event: Any, user_id: int, document_id: int, kind: str
+        self, event: Any, user_id: int, document_id: int, kind: str = "deck"
     ) -> None:
+        """The flashcard-size screen for a source document (quiz was removed)."""
+        del kind  # only the flashcard set is generated now
         document = await self.db.document_meta(user_id, document_id)
         if document is None:
             await self._ack(event, "این سند پیدا نشد.", alert=True)  # type: ignore[attr-defined]
@@ -1615,54 +1611,30 @@ class DocumentOfficeWorkflowMixin:
                 [[Button.inline("↩️ سند", f"doc:show:{document_id}".encode("ascii"))]],
             )
             return
-        deck_label = "مجموعهٔ فلش‌کارت" if kind == "deck" else "آزمون"
+        deck_label = "مجموعهٔ فلش‌کارت"
         buttons: list[list] = []
-        free_kind = "deck" if kind == "deck" else "quiz"
-        free = await self._free_try_available(user_id, free_kind)  # type: ignore[attr-defined]
-        if kind == "deck":
-            base_size = int(self.settings.flashcard_ai_deck_size)
-            base_cost = int(self.settings.flashcard_ai_cost_seconds)
-            for code, label, cards, _questions in SIZE_PRESETS:
-                buttons.append(
-                    [
-                        Button.inline(
-                            button_label(
-                                f"{label} — {to_persian_digits(cards)} کارت — "
-                                + (
-                                    texts.LEARNING_FREE_CHOICE_LABEL
-                                    if free
-                                    else format_seconds_as_credits(
-                                        self._preset_cost(base_cost, cards, base_size)  # type: ignore[attr-defined]
-                                    )
+        free = await self._free_try_available(user_id, "deck")  # type: ignore[attr-defined]
+        base_size = int(self.settings.flashcard_ai_deck_size)
+        base_cost = int(self.settings.flashcard_ai_cost_seconds)
+        for code, label, cards, _questions in SIZE_PRESETS:
+            buttons.append(
+                [
+                    Button.inline(
+                        button_label(
+                            f"{label} — {to_persian_digits(cards)} کارت — "
+                            + (
+                                texts.LEARNING_FREE_CHOICE_LABEL
+                                if free
+                                else format_seconds_as_credits(
+                                    self._preset_cost(base_cost, cards, base_size)  # type: ignore[attr-defined]
                                 )
-                            ),
-                            f"doc:gen:fc:{document_id}:{code}".encode("ascii"),
-                        )
-                    ]
-                )
-        else:
-            per_question = int(self.settings.quiz_cost_seconds_per_question)
-            for _code, label, _cards, questions in SIZE_PRESETS:
-                buttons.append(
-                    [
-                        Button.inline(
-                            button_label(
-                                f"{label} — {to_persian_digits(questions)} سؤال — "
-                                + (
-                                    texts.LEARNING_FREE_CHOICE_LABEL
-                                    if free
-                                    else format_seconds_as_credits(questions * per_question)
-                                )
-                            ),
-                            f"doc:gen:quiz:{document_id}:{questions}".encode("ascii"),
-                        )
-                    ]
-                )
-        header = (
-            f"🃏 ساخت فلش‌کارت از «{document.get('title') or 'سند'}»"
-            if kind == "deck"
-            else f"❓ ساخت سؤال از «{document.get('title') or 'سند'}»"
-        )
+                            )
+                        ),
+                        f"doc:gen:fc:{document_id}:{code}".encode("ascii"),
+                    )
+                ]
+            )
+        header = f"🃏 ساخت فلش‌کارت از «{document.get('title') or 'سند'}»"
         lines = [header, "", "اندازهٔ مجموعه را انتخاب کنید."]
         if free:
             lines.append(f"\n{FREE_TRY_BADGE} — اولین {deck_label} شما رایگان است.")
@@ -1679,6 +1651,7 @@ class DocumentOfficeWorkflowMixin:
         kind: str,
         choice: str,
     ) -> None:
+        del kind  # only the flashcard set is generated now
         if not self.settings.note_configured:
             await event.respond(texts.LEARNING_GENERATION_UNAVAILABLE)
             return
@@ -1686,30 +1659,22 @@ class DocumentOfficeWorkflowMixin:
         if source is None:
             await self._ack(event, "این سند پیدا نشد.", alert=True)  # type: ignore[attr-defined]
             return
-        if kind == "deck":
-            if choice and preset_cards(choice) is None:
-                await self._ack(  # type: ignore[attr-defined]
-                    event, texts.INVALID_LEARNING_SIZE, alert=True
-                )
-                return
-            if (
-                await self.db.deck_count(user_id)
-                >= self.settings.flashcard_max_decks_per_user
-            ):
-                await event.respond(
-                    "به حداکثر تعداد مجموعه‌های فلش‌کارت رسیده‌اید؛ یک مجموعهٔ قدیمی را "
-                    "حذف کنید."
-                )
-                return
-            wanted, cost = self._deck_size_and_cost(choice or None)  # type: ignore[attr-defined]
-            note = f"fc-pending:doc:{document_id}"
-        else:
-            wanted = _to_int(choice) or 5
-            if wanted not in QUIZ_COUNTS:
-                await self._ack(event, "تعداد سؤال نامعتبر است.", alert=True)  # type: ignore[attr-defined]
-                return
-            cost = wanted * int(self.settings.quiz_cost_seconds_per_question)
-            note = f"quiz-pending:doc:{document_id}"
+        if choice and preset_cards(choice) is None:
+            await self._ack(  # type: ignore[attr-defined]
+                event, texts.INVALID_LEARNING_SIZE, alert=True
+            )
+            return
+        if (
+            await self.db.deck_count(user_id)
+            >= self.settings.flashcard_max_decks_per_user
+        ):
+            await event.respond(
+                "به حداکثر تعداد مجموعه‌های فلش‌کارت رسیده‌اید؛ یک مجموعهٔ قدیمی را "
+                "حذف کنید."
+            )
+            return
+        wanted, cost = self._deck_size_and_cost(choice or None)  # type: ignore[attr-defined]
+        note = f"fc-pending:doc:{document_id}"
         if user_id in self._learning_in_flight:
             await self._ack(event, LEARNING_BUSY_ALERT, alert=True)  # type: ignore[attr-defined]
             return
@@ -1726,34 +1691,16 @@ class DocumentOfficeWorkflowMixin:
             self._learning_tasks[user_id] = task
         try:
             async with self._learning_lock(user_id):  # type: ignore[attr-defined]
-                if kind != "deck":
-                    reason = await self.db.quiz_admission(
-                        user_id,
-                        max_active_hours=self.settings.quiz_max_active_hours,
-                        max_sessions_per_hour=self.settings.quiz_max_sessions_per_hour,
-                    )
-                    if reason == "active":
-                        await event.respond(
-                            "یک آزمون فعال دیگر دارید؛ ابتدا آن را تمام کنید."
-                        )
-                        return
-                    if reason == "rate":
-                        await event.respond(
-                            "تعداد آزمون‌های شما در یک ساعت اخیر به حداکثر مجاز رسیده است."
-                        )
-                        return
                 await self._generate_learning(  # type: ignore[attr-defined]
                     event,
                     user_id=user_id,
-                    kind="deck" if kind == "deck" else "quiz",
+                    kind="deck",
                     source=source,
                     wanted=wanted,
                     cost=cost,
                     note=note,
                     title=(
                         f"{short_title(source['title'], fallback=FALLBACK_BOOKLET)} — فلش‌کارت"
-                        if kind == "deck"
-                        else f"{short_title(source['title'], fallback=FALLBACK_BOOKLET)} — آزمون"
                     ),
                 )
         finally:
@@ -1911,20 +1858,19 @@ class DocumentOfficeWorkflowMixin:
                 event, user_id, user_id, message_id
             )
             return
-        if action in ("fc", "quiz") and len(parts) == 3:
+        if action == "fc" and len(parts) == 3:
             document_id = _to_int(parts[2])
             if document_id is None:
                 await self._ack(event, "این سند پیدا نشد.", alert=True)  # type: ignore[attr-defined]
                 return
             await self._show_document_generate_screen(
-                event, user_id, document_id, "deck" if action == "fc" else "quiz"
+                event, user_id, document_id, "deck"
             )
             return
         if action == "gen" and len(parts) == 5:
-            if parts[2] not in {"fc", "quiz"}:
+            if parts[2] != "fc":
                 await self._ack(event, "درخواست نامعتبر است.", alert=True)  # type: ignore[attr-defined]
                 return
-            kind = "deck" if parts[2] == "fc" else "quiz"
             document_id = _to_int(parts[3])
             if document_id is None:
                 await self._ack(event, "این سند پیدا نشد.", alert=True)  # type: ignore[attr-defined]
@@ -1934,7 +1880,7 @@ class DocumentOfficeWorkflowMixin:
             ):
                 return
             await self._generate_from_document(
-                event, user_id, document_id, kind, parts[4]
+                event, user_id, document_id, "deck", parts[4]
             )
             return
         await self._ack(event, "درخواست نامعتبر است.", alert=True)  # type: ignore[attr-defined]

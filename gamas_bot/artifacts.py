@@ -18,9 +18,11 @@ because the costs differ:
   later, when a temporary work directory is long gone.
 * **Key points** — read from the stored ``notes_json``. Same argument: the notes
   are already persisted, so the list is free and stable.
- * **Booklet PDF / DOCX** — rendered once from the validated stored-note model
-  at completion and persisted as owner-scoped binary artifacts. Fetch callbacks
-  only send those exact bytes: they never invoke a renderer or a model.
+ * **Booklet PDF / DOCX / HTML** — rendered once from the validated stored-note
+  model at completion and persisted as owner-scoped binary artifacts. Fetch
+  callbacks only send those exact bytes: they never invoke a renderer or a model.
+  The HTML booklet is the offline study copy and is rendered by
+  :mod:`gamas_bot.study_notes_html`.
 
 
 Everything here is deterministic and side-effect free, which is why it is a
@@ -43,20 +45,28 @@ logger = logging.getLogger(__name__)
 #: independent buttons because a student may want to read it now or save it.
 KIND_BOOKLET = "booklet"   # PDF (primary student deliverable)
 KIND_DOCX = "docx"         # editable Word version
-KIND_REVIEW_HTML = "review_html"  # offline interactive review sheet (self-contained HTML)
+#: The offline HTML study booklet. The persisted kind string stays
+#: ``review_html`` because it is a ``CHECK`` constraint value in
+#: ``submission_binary_artifacts`` (migration 033): reusing it stores the new
+#: booklet without a destructive table rebuild, and the buttons in older chat
+#: messages keep resolving to the file they were created for.
+KIND_STUDY_HTML = "review_html"
 KIND_TRANSCRIPT = "transcript"
 KIND_TXT = "txt"
 KIND_KEYPOINTS = "keypoints"
-KIND_QUIZ = "quiz"
 KIND_FLASHCARDS = "flashcards"
+#: Kinds accepted for reading only. ``review_html`` is the previous name of the
+#: HTML artifact and equals :data:`KIND_STUDY_HTML`; kept as a named alias so
+#: call sites read as intent, not as a storage detail.
+LEGACY_HTML_KIND = "review_html"
+LEGACY_KINDS = frozenset({LEGACY_HTML_KIND})
 KINDS = (
     KIND_BOOKLET,
     KIND_DOCX,
-    KIND_REVIEW_HTML,
+    KIND_STUDY_HTML,
     KIND_TRANSCRIPT,
     KIND_TXT,
     KIND_KEYPOINTS,
-    KIND_QUIZ,
     KIND_FLASHCARDS,
 )
 
@@ -76,6 +86,11 @@ def callback_for(reference: str, kind: str) -> bytes:
     return f"{CALLBACK_PREFIX}{reference}:{kind}".encode("ascii")
 
 
+def is_html_kind(kind: str) -> bool:
+    """True for the offline HTML booklet (stored under its legacy kind name)."""
+    return kind in {KIND_STUDY_HTML, LEGACY_HTML_KIND}
+
+
 def parse_callback(data: str) -> tuple[str, str] | None:
     """``art:GMS-12:transcript`` → ``("GMS-12", "transcript")``; else ``None``."""
     if not data.startswith(CALLBACK_PREFIX):
@@ -85,7 +100,7 @@ def parse_callback(data: str) -> tuple[str, str] | None:
         return None
     reference, kind = parts[0].strip(), parts[1].strip()
     digits = reference[4:] if reference.startswith("GMS-") else reference
-    if not digits.isdigit() or kind not in KINDS:
+    if not digits.isdigit() or (kind not in KINDS and kind not in LEGACY_KINDS):
         return None
     return reference, kind
 
@@ -181,7 +196,8 @@ def delivery_markup(
     * 📝 دریافت متن خام
     * ⭐ دریافت نکات کلیدی
     * 📄 دریافت نسخه Word  (when the DOCX artifact is available)
-    * 🌐 دریافت جزوه مرور تعاملی HTML  (when the review sheet is available)
+    * 📖 دریافت جزوه HTML  (offline study booklet, when it is available)
+    * 🃏 کارت‌های مرور      (flashcards from this booklet, when available)
 
     Nothing appears here unless it really exists: ``kinds`` comes from the
     central submission artifact registry. Every button retrieves a persisted
@@ -221,25 +237,18 @@ def delivery_markup(
         rows.append(
             [Button.inline(texts.BTN_GET_DOCX, callback_for(reference, KIND_DOCX))]
         )
-    # The interactive HTML review sheet is also an independent persisted file.
-    if KIND_REVIEW_HTML in kinds:
+    # The offline HTML study booklet is also an independent persisted file.
+    if KIND_STUDY_HTML in kinds:
         rows.append(
             [
                 Button.inline(
-                    texts.BTN_GET_REVIEW_HTML,
-                    callback_for(reference, KIND_REVIEW_HTML),
+                    texts.BTN_GET_STUDY_HTML,
+                    callback_for(reference, KIND_STUDY_HTML),
                 )
             ]
         )
-    # Learning buttons (quiz / flashcards)
+    # Flashcards remain an independent study action from this booklet.
     learning: list[Any] = []
-    if learning_available and item_id and KIND_QUIZ in kinds:
-        learning.append(
-            Button.inline(
-                texts.BTN_QUIZ_FROM_BOOKLET,
-                f"quiz:new:{int(item_id)}".encode("ascii"),
-            )
-        )
     if learning_available and item_id and KIND_FLASHCARDS in kinds:
         learning.append(
             Button.inline(

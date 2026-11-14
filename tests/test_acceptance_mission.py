@@ -434,7 +434,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         )
         more_payloads = menu_payloads(self.bot._more_menu())
         self.assertIn(b"office:start", more_payloads)
-        self.assertIn(b"board", more_payloads)
+        self.assertNotIn(b"board", more_payloads)
         self.assertIn(b"results", more_payloads)
         self.assertIn(b"ref:home", more_payloads)
 

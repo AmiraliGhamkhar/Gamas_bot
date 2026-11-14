@@ -4,7 +4,28 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
-**Interactive HTML review sheet (third booklet output).** A completed AI booklet
+**Offline HTML study booklet replaces the interactive review sheet; quiz and
+leaderboard leave the product.** The third booklet output is now a
+deterministic, self-contained `Gamas_<topic>_notes.html` rendered from the same
+validated `StructuredNotes` model as the PDF and DOCX: Persian RTL, embedded
+Vazirmatn fonts, embedded CSS, no script, no network reference, mobile-first,
+with cover, table of contents, learning objectives, sections (definitions,
+steps, tables, callouts, per-section key points), key points, summary, quick
+review, glossary and final review. The review-sheet planner, its skeleton
+asset, its strict validator, `scripts/lint_review_sheet.py` and their tests are
+deleted; only the smallest delivery check remains (doctype, `lang="fa"`
+`dir="rtl"`, non-trivial body, no external reference) and it cannot reject
+otherwise usable educational HTML. Quiz and leaderboard are no longer part of
+the user-facing flow: menu entries, `quiz:` and `board` routes, answer
+callbacks, document-quiz generation and the library quiz button are gone, so no
+new quiz session or leaderboard point is created. Persisted quiz/deck tables
+and the historical `review_html` artifact kind stay for compatibility (old rows
+and downloads keep working) and are treated as legacy. The note prompt now asks
+for a structured academic booklet, preserves source terminology, marks source
+gaps with «نیازمند بررسی» and forbids speaker labels, timestamps,
+transcript-style narration and any quiz, score or ranking component.
+
+**Interactive HTML review sheet (third booklet output) — superseded.** A completed AI booklet
 (verified or repaired; never the deterministic source fallback or a degraded
 booklet) can now also produce a self-contained, offline, Persian RTL HTML
 review sheet with a 30-minute study plan, collapsible questions, exam traps,
@@ -16,7 +37,9 @@ it is stored or advertised. It is stored as the `review_html` binary artifact
 preserving every row, id and delivery counter), served from the results screen
 and Results Hub as a `.html` document, and never regenerated on download. PDF
 and DOCX delivery is unaffected when the sheet fails. Full-document Office
-workflows send the sheet with their Word/PDF outputs.
+workflows send the sheet with their Word/PDF outputs. *(Superseded by the
+offline study booklet entry above: the sheet, its planner, skeleton and
+validator no longer exist.)*
 
 **Telegram-only release: Gamas Studio removed.** The Telegram Mini App is
 permanently decommissioned: its frontend bundle, WSGI backend and SQLite store,

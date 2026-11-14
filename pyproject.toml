@@ -82,9 +82,7 @@ target-version = "py311"
 # inline documentation occasionally run past it, so the limit is a guide for
 # new code rather than a hard gate (E501 is not in the selected rule set).
 line-length = 120
-# scripts/lint_review_sheet.py is the user-supplied review-sheet checker (spec section 11),
-# kept byte-identical to the uploaded copy, so it is excluded from lint rather than reformatted.
-extend-exclude = [".venv", ".render", "scripts/lint_review_sheet.py"]
+extend-exclude = [".venv", ".render"]
 
 [tool.ruff.lint]
 # Real errors and probable bugs only. Formatting is deliberately not
@@ -151,8 +149,7 @@ files = [
     "gamas_bot/progress.py",
     "gamas_bot/protocols.py",
     "gamas_bot/routing.py",
-    "gamas_bot/review_sheet.py",
-    "gamas_bot/review_sheet_html.py",
+    "gamas_bot/study_notes_html.py",
     "gamas_bot/texts.py",
     "gamas_bot/telegram_text.py",
     "gamas_bot/telegram_transfer.py",

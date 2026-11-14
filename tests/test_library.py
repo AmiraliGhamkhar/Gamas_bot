@@ -329,7 +329,6 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("GMS-77", text)
         payloads = menu_payloads(buttons)
         self.assertIn(f"lib:f:{item_id}".encode(), payloads)
-        self.assertIn(f"quiz:new:{item_id}".encode(), payloads)
         self.assertIn(f"fc:ai:{item_id}".encode(), payloads)
         self.assertIn(b"lib:0", payloads)
 

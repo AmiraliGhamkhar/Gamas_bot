@@ -1,4 +1,4 @@
-"""The progress bar shown for short actions: quiz, flashcards, documents, Office.
+"""The progress bar shown for short actions: flashcards, documents, Office.
 
 Every one of these screens used to jump straight to a plain sentence («در حال
 ساخت…») and then sit still for minutes. The bar exists *before* the first model
@@ -29,7 +29,6 @@ from gamas_bot.progress import (
     progress_text,
 )
 from tests.support import FakeCallbackEvent, FakeTelegramClient, make_settings
-from tests.test_learning import quiz_payload
 
 OWNER = 555
 
@@ -136,7 +135,6 @@ class _LearningFixture(unittest.IsolatedAsyncioTestCase):
             temp_dir=root / "tmp",
             flashcard_ai_cost_seconds=300,
             flashcard_ai_deck_size=6,
-            quiz_cost_seconds_per_question=60,
         )
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.settings.db_path)
@@ -170,10 +168,17 @@ class LearningBarTests(_LearningFixture):
         async def provider(*args, **kwargs):
             # Everything Telegram showed *before* the model was asked.
             observed.extend(text["text"] for text in self.client.texts)
-            return quiz_payload(5, source="بخش ۱")
+            return {"cards": [
+                {"front": "پرسش ۱", "back": "پاسخ ۱", "source": "بخش ۱"},
+                {"front": "پرسش ۲", "back": "پاسخ ۲", "source": "بخش ۲"},
+                {"front": "پرسش ۳", "back": "پاسخ ۳", "source": "بخش ۱"},
+                {"front": "پرسش ۴", "back": "پاسخ ۴", "source": "بخش ۲"},
+                {"front": "پرسش ۵", "back": "پاسخ ۵", "source": "بخش ۱"},
+                {"front": "پرسش ۶", "back": "پاسخ ۶", "source": "بخش ۲"},
+            ]}
 
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
-            await self.bot._handle_callback(self.press(f"quiz:go:{self.item_id}:5".encode()))
+            await self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
 
         self.assertTrue(observed, "no message was sent before the model call")
         first = observed[0]
@@ -183,9 +188,9 @@ class LearningBarTests(_LearningFixture):
         self.assertIn(OWNER, self.bot._curation)
 
     async def test_failed_generation_leaves_a_failure_bar_and_refunds(self):
-        event = self.press(f"quiz:go:{self.item_id}:5".encode())
+        event = self.press(f"fc:go:{self.item_id}".encode())
         with mock.patch(
-            "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value={"questions": []})
+            "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value={"cards": []})
         ):
             await self.bot._handle_callback(event)
         self.assertNotIn(OWNER, self.bot._curation)

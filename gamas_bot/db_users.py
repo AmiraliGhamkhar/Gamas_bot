@@ -100,7 +100,7 @@ class UsersRepositoryMixin(DatabaseCore):
         )
 
     async def set_first_name(self, user_id: int, first_name: str) -> None:
-        """Store the bounded display name used by the public leaderboard."""
+        """Store the bounded display name used by the admin top-users report."""
         bounded = " ".join(str(first_name).split())[:64]
         if not bounded:
             return

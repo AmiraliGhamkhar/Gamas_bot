@@ -13,7 +13,7 @@ from unittest import mock
 from gamas_bot.bot import GamasBot
 from gamas_bot.db import Database
 from tests.support import FakeCallbackEvent, FakeTelegramClient, make_settings
-from tests.test_free_uses import cards_payload, quiz_payload
+from tests.test_free_uses import cards_payload
 
 OWNER = 9101
 OTHER = 9102
@@ -216,17 +216,13 @@ class PaidCurationTests(CurationFixture):
         await self.bot._handle_callback(event)
         self.assertIn("هزینه‌ای کسر نشده", event.edits[-1]["text"])
 
-    async def test_saved_paid_deck_and_quiz_are_not_refunded_on_restart(self):
+    async def test_saved_paid_deck_is_not_refunded_on_restart(self):
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
             await self.bot._handle_callback(self.press(f"fc:go:{self.item}".encode()))
         await self.bot._handle_callback(self.press(b"fc:cur:save"))
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(5))):
-            await self.bot._handle_callback(self.press(f"quiz:go:{self.item}:5".encode()))
-        await self.bot._handle_callback(self.press(b"quiz:cur:save"))
-        self.assertEqual(await self.db.available_seconds(OWNER), 400)
+        self.assertEqual(await self.db.available_seconds(OWNER), 700)
         self.assertEqual(await self.db.recover_pending_learning_charges(), 0)
         self.assertEqual(await self.db.deck_count(OWNER), 1)
-        self.assertEqual(len(await self.db.db.execute_fetchall("SELECT * FROM quiz_sessions")), 1)
 
     async def test_cancel_during_committed_save_never_refunds_paid_artifact(self):
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
@@ -267,7 +263,7 @@ class OneShotCallback(FakeCallbackEvent):
 
 class CallbackAnswerTests(CurationFixture):
     async def test_specific_stale_and_invalid_alerts_are_not_eaten_by_early_ack(self):
-        for payload in (b"doc:show:999999", b"lib:it:999999", b"quiz:bad", b"fc:cur:save", b"sup:bad"):
+        for payload in (b"doc:show:999999", b"lib:it:999999", b"fc:bad", b"fc:cur:save", b"sup:bad"):
             with self.subTest(payload=payload):
                 event = OneShotCallback(self.client, data=payload, chat_id=OWNER)
                 await self.bot._handle_callback(event)

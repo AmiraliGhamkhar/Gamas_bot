@@ -590,7 +590,7 @@ class CallbackGateIntegrationTests(SubscriptionTestCase):
 
     async def test_generation_callback_is_gated(self):
         await self.use_resolver("left")
-        event = CallbackEvent(USER_ID, b"quiz:go:1:5")
+        event = CallbackEvent(USER_ID, b"fc:go:1")
         await self.bot._dispatch_callback(event)
         self.assertTrue(any(JOIN_PROMPT_MARKER in text for text, _ in event.edits))
 

@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from gamas_bot.artifacts import KIND_STUDY_HTML
 from gamas_bot.bot import (
     TELEGRAM_DOWNLOAD_CHUNK_BYTES,
     GamasBot,
@@ -1482,7 +1483,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(admin_menu, user_menu | {b"adm:home"})
         more_menu = menu_payloads(self.bot._more_menu())
         self.assertIn(b"results", more_menu)
-        self.assertIn(b"board", more_menu)
+        self.assertNotIn(b"board", more_menu)
         self.assertIn(b"office:start", more_menu)
         self.assertIn(b"ref:home", more_menu)
         self.bot.settings = replace(self.settings, office_enabled=False)
@@ -1542,10 +1543,6 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"fc:pick:0", menu_payloads(cards_buttons))
         self.assertIn(b"fc:man", menu_payloads(cards_buttons))
 
-        board = FakeCallbackEvent(self.user_id, b"board")
-        await self.bot._handle_callback(board)
-        self.assertIn("فعلاً فعال نیست", board.edits[-1][0])
-        self.assertNotIn("اولین آزمون", board.edits[-1][0])
 
     async def test_main_panel_asks_for_the_next_file_and_shows_the_balance(self):
         """One action, one number: the returning screen is not a brochure."""
@@ -2580,7 +2577,7 @@ class ResultsHubTests(BotPipelineTestCase):
         _text, buttons = callback.edits[-1]
         payloads = menu_payloads(buttons)
         self.assertIn(f"art:GMS-{submission}:booklet".encode("ascii"), payloads)
-        self.assertIn(b"quiz:new:77", payloads)
+        self.assertIn(b"fc:ai:77", payloads)
 
 
 class ReplyKeyboardRoutingTests(BotPipelineTestCase):
@@ -2591,7 +2588,6 @@ class ReplyKeyboardRoutingTests(BotPipelineTestCase):
             texts.BTN_START_HERE: "فایل درس بعدی",
             texts.BTN_HELP: "راهنمای گاماس",
             texts.BTN_UPGRADE: "بسته را انتخاب کنید",
-            texts.BTN_LEADERBOARD: "لیدربورد",
             texts.BTN_LIBRARY: "کتابخانه",
             texts.BTN_WALLET: "اعتبار",
             texts.BTN_MORE: "بخش‌های دیگر",
@@ -2613,7 +2609,6 @@ class ReplyKeyboardRoutingTests(BotPipelineTestCase):
             (texts.BTN_WALLET_LEGACY, "_show_wallet"),
             (texts.BTN_WALLET_UPGRADE_LEGACY, "_show_wallet"),
             (texts.BTN_OFFICE_LEGACY, "_route_office_callback"),
-            (texts.BTN_LEADERBOARD_LEGACY, "_show_leaderboard"),
             (texts.BTN_SUPPORT_LEGACY, "_show_support_home"),
         ):
             event = FakeMessageEvent(USER_ID, old_label)
@@ -2716,81 +2711,92 @@ class ReplyKeyboardRoutingTests(BotPipelineTestCase):
         self.assertFalse(any("پنل مدیریت" in reply for reply in event.replies))
 
 
-class ReviewSheetDeliveryTests(BotPipelineTestCase):
-    """The interactive HTML sheet: persisted at completion, fetched without regeneration."""
+class StudyHtmlDeliveryTests(BotPipelineTestCase):
+    """The offline HTML booklet: persisted at completion, fetched as stored bytes."""
 
-    async def _completed_job_with_planner(self, *, planner_error: BaseException | None = None):
-        from tests.test_review_sheet import sample_notes, sample_payload
+    async def _completed_job(self):
+        from gamas_bot.notes import StructuredNotes
 
         self.bot.settings = replace(self.settings, avalai_api_key="note-key")
-        # The planner is patched, so a sentinel session stands in for aiohttp.
-        self.bot._http_session = lambda: mock.sentinel.http_session  # type: ignore[method-assign]
-        planner = (
-            mock.AsyncMock(side_effect=planner_error)
-            if planner_error is not None
-            else mock.AsyncMock(return_value=sample_payload())
-        )
         event = self.media_event()
+        notes = StructuredNotes.from_payload(json.loads(sample_notes_json()))
         with mock.patch(
             "gamas_bot.bot.structure_transcript",
-            new=mock.AsyncMock(return_value=sample_notes()),
-        ), mock.patch("gamas_bot.review_sheet.complete_json", new=planner):
+            new=mock.AsyncMock(return_value=notes),
+        ):
             submission = await self.run_media_job(event, transcribe=self._raw())
-        return event, submission, planner
+        return event, submission
 
-    async def test_a_completed_job_persists_pdf_docx_and_the_review_sheet(self):
-        from gamas_bot.artifact_validation import inspect_review_html
+    async def test_a_completed_job_persists_pdf_docx_and_the_booklet(self):
+        from gamas_bot.artifact_validation import validate_study_html_artifact
 
-        event, submission, planner = await self._completed_job_with_planner()
-        planner.assert_awaited_once()
+        event, submission = await self._completed_job()
         pdf = await self.db.binary_artifact(submission, USER_ID, "booklet")
         docx = await self.db.binary_artifact(submission, USER_ID, "docx")
-        review = await self.db.binary_artifact(submission, USER_ID, "review_html")
-        assert pdf is not None and docx is not None and review is not None
+        booklet = await self.db.binary_artifact(submission, USER_ID, KIND_STUDY_HTML)
+        assert pdf is not None and docx is not None and booklet is not None
         self.assertTrue(bytes(pdf["content"]).startswith(b"%PDF-"))
-        html_text = bytes(review["content"]).decode("utf-8")
-        self.assertEqual(inspect_review_html(html_text.encode("utf-8")).errors, ())
-        self.assertTrue(str(review["filename"]).endswith(".html"))
-        self.assertEqual(review["content_type"], "text/html")
+        html_bytes = bytes(booklet["content"])
+        validate_study_html_artifact(html_bytes)  # raises on any structural failure
+        html_text = html_bytes.decode("utf-8")
+        self.assertIn('lang="fa"', html_text)
+        self.assertIn('dir="rtl"', html_text)
+        filename = str(booklet["filename"])
+        self.assertTrue(filename.startswith("Gamas_"), filename)
+        self.assertTrue(filename.endswith("_notes.html"), filename)
+        self.assertIn("charset=utf-8", str(booklet["content_type"]))
         results = [text for text in event.replies if "پردازش تمام شد" in text]
         self.assertTrue(results)
-        self.assertIn(texts.DELIVERY_ROW_REVIEW_HTML, results[-1])
+        self.assertIn(texts.DELIVERY_ROW_STUDY_HTML, results[-1])
 
-    async def test_a_failing_planner_keeps_pdf_and_docx_and_says_so(self):
-        event, submission, _planner = await self._completed_job_with_planner(
-            planner_error=RuntimeError("provider unavailable")
-        )
+    async def test_a_failing_renderer_keeps_pdf_and_docx_and_says_so(self):
+        with mock.patch(
+            "gamas_bot.bot_jobs.render_study_notes_html",
+            side_effect=RuntimeError("renderer unavailable"),
+        ):
+            event, submission = await self._completed_job()
         self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
         self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "docx"))
-        self.assertIsNone(await self.db.binary_artifact(submission, USER_ID, "review_html"))
+        self.assertIsNone(await self.db.binary_artifact(submission, USER_ID, KIND_STUDY_HTML))
         results = [text for text in event.replies if "پردازش تمام شد" in text]
-        self.assertIn(texts.NOTICE_REVIEW_HTML.strip(), results[-1])
+        self.assertIn(texts.NOTICE_STUDY_HTML.strip(), results[-1])
 
-    async def test_the_stored_sheet_is_sent_as_a_text_html_document_without_regeneration(self):
-        _event, submission, planner = await self._completed_job_with_planner()
-        planner_calls = planner.await_count
+    async def test_the_stored_booklet_is_sent_as_a_text_html_document(self):
+        _event, submission = await self._completed_job()
         client = self.bot.client
         before = len(client.deliveries)
-        data = f"art:GMS-{submission}:review_html"
+        data = f"art:GMS-{submission}:{KIND_STUDY_HTML}"
         callback = FakeCallbackEvent(client, data=data.encode("ascii"))
-        await self.bot._fetch_artifact(callback, USER_ID, data)
+        with mock.patch("gamas_bot.bot_jobs.render_study_notes_html") as render:
+            await self.bot._fetch_artifact(callback, USER_ID, data)
+        render.assert_not_called()
         self.assertFalse(callback.answers[-1][1])
         sent = client.deliveries[before:]
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["mime_type"], "text/html")
         self.assertTrue(sent[0]["force_document"])
-        # Downloading never plans or renders again: the stored bytes are sent as-is.
-        self.assertEqual(planner.await_count, planner_calls)
-        stored = await self.db.binary_artifact(submission, USER_ID, "review_html")
+        stored = await self.db.binary_artifact(submission, USER_ID, KIND_STUDY_HTML)
         assert stored is not None
-        self.assertEqual(bytes(stored["content"]).count(b"<script>"), 1)
+        self.assertEqual(bytes(stored["content"]).count(b"<script"), 0)
 
-    async def test_another_user_cannot_fetch_the_sheet(self):
-        _event, submission, _planner = await self._completed_job_with_planner()
+    async def test_an_old_review_html_callback_still_opens_the_booklet(self):
+        """Buttons in chat history use the legacy kind name; they keep working."""
+        _event, submission = await self._completed_job()
+        client = self.bot.client
+        before = len(client.deliveries)
+        data = f"art:GMS-{submission}:review_html"
+        callback = FakeCallbackEvent(client, data=data.encode("ascii"))
+        await self.bot._fetch_artifact(callback, USER_ID, data)
+        sent = client.deliveries[before:]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["mime_type"], "text/html")
+
+    async def test_another_user_cannot_fetch_the_booklet(self):
+        _event, submission = await self._completed_job()
         other = 999
         await self.db.ensure_user(other)
         client = self.bot.client
-        data = f"art:GMS-{submission}:review_html"
+        data = f"art:GMS-{submission}:{KIND_STUDY_HTML}"
         callback = FakeCallbackEvent(client, data=data.encode("ascii"))
         before = len(client.deliveries)
         await self.bot._fetch_artifact(callback, other, data)

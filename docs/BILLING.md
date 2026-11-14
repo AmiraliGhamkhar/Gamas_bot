@@ -58,7 +58,7 @@ syncs do not deactivate unrelated plans.
 
 | Action | Default cost |
 | --- | --- |
-| Quiz, 5 / 10 / 20 questions | 5 / 10 / 20 minutes (`QUIZ_COST_SECONDS_PER_QUESTION=60`) |
+| Quiz, 5 / 10 / 20 questions — *legacy, no longer offered* | 5 / 10 / 20 minutes (`QUIZ_COST_SECONDS_PER_QUESTION=60`) |
 | AI deck, 10 / 20 / 40 cards | 5 / 10 / 20 minutes (`FLASHCARD_AI_COST_SECONDS=300`, base size 10) |
 | Manual decks, Word/PDF export, re-download | free |
 | Office and document notes/exports | free to users; provider calls cost the operator |
@@ -69,10 +69,12 @@ refunds once. If fewer items are produced than requested, the shortfall is
 refunded pro rata in the same transaction that stores the artifact. At least 3
 questions or 5 cards are required for a valid result.
 
-Admission is checked before the debit: one generation per user at a time, one
-active quiz, 3 new sessions per rolling hour, 30 stored decks. Each user keeps
-one free quiz and one free AI deck; unlimited users spend neither gifts nor
-credit.
+Admission is checked before the debit: one generation per user at a time, 3 new
+sessions per rolling hour, 30 stored decks. Each user keeps one free AI deck
+(and, for existing records, one legacy free quiz); unlimited users spend neither
+gifts nor credit. The quiz price and its admission counters remain in the code
+only so stored quiz rows and old refunds stay consistent — no user-facing flow
+reaches them.
 
 ## Purchases (card to card, manual review)
 

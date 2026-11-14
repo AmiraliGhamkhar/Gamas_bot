@@ -1,7 +1,7 @@
 # Gamas Bot
 
 Persian Telegram study assistant: turn lecture audio, video, PowerPoint or
-documents into a transcript, a right-to-left Word/PDF booklet, quizzes,
+documents into a transcript, a right-to-left Word/PDF/HTML study booklet,
 flashcards and Office exports.
 
 Runs on **Windows with PowerShell** or on **shared Linux hosting with cPanel**.
@@ -53,7 +53,7 @@ Audio transcription defaults to Speechmatics (`enhanced`), then Deepgram
 generation is restricted to **AvalAI** (`deepseek-v4.1-flash`), **Gemini**
 (`gemini-3.5-flash-lite`) and **OpenRouter**
 (`nvidia/nemotron-3.5-super-vl:free`). The default available chain is
-`avalai,gemini,openrouter`; booklet work and large/difficult quizzes prefer
+`avalai,gemini,openrouter`; booklet work and large/difficult flashcard decks prefer
 AvalAI, while smaller learning and Office tasks prefer Gemini. OpenRouter is
 always the last fallback, never promoted by preferences, and is excluded for
 unclassified (`UNKNOWN`) content. Missing credentials skip a route; stale
@@ -74,7 +74,7 @@ or deployment compatibility is implied by offline tests. See
 
 | Input or menu | Result |
 | --- | --- |
-| Audio, video, voice note | Transcript first, then an RTL Word/PDF booklet and an offline interactive HTML review sheet when a note provider is configured |
+| Audio, video, voice note | Transcript first, then an RTL Word/PDF booklet plus an offline HTML study booklet when a note provider is configured |
 | PDF, DOCX, PowerPoint | Extracted text, source-based notes, exports and per-slide mapping |
 | Free Office / آفیس رایگان | Text, TXT, Markdown, CSV or TSV to Word, Excel, PowerPoint or PDF |
 | Library | Saved Telegram file references |

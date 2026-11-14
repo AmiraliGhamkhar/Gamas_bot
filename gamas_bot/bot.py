@@ -45,8 +45,7 @@ from .artifacts import (
     KIND_DOCX,
     KIND_FLASHCARDS,
     KIND_KEYPOINTS,
-    KIND_QUIZ,
-    KIND_REVIEW_HTML,
+    KIND_STUDY_HTML,
     KIND_TRANSCRIPT,
     KIND_TXT,
     delivery_markup,
@@ -68,7 +67,6 @@ from .bot_ui import (
     DEFAULT_INTAKE_SUFFIX,
     DOC_EXTRACTION_STOPPED,
     DOC_GENERATE_CARDS,
-    DOC_GENERATE_QUESTIONS,
     DOC_OCR_FAILED,
     DOC_PHOTO_HINT,
     DOC_UNSUPPORTED_HINT,
@@ -78,7 +76,6 @@ from .bot_ui import (
     FREE_TRY_BADGE,
     FREE_TRY_RESTORED,
     FREE_TRY_USED_NOTICE,
-    LEADERBOARD_EMPTY,
     LEADERBOARD_FALLBACK_NAME,
     LEARNING_BUSY_ALERT,
     LEARNING_CREDIT_RESTORED,
@@ -94,9 +91,6 @@ from .bot_ui import (
     MAX_OFFICE_SESSIONS,
     MAX_RAW_PREVIEW_LINES,
     OFFICE_UPLOAD_STOPPED,
-    QUIZ_COUNTS,
-    QUIZ_POINTS_PER_ANSWER,
-    QUIZ_START_GUIDANCE,
     RAW_FALLBACK_MAX_PAGES,
     RAW_PREVIEW_CHARS,
     SUPPORT_CATEGORY_BUTTONS,
@@ -648,7 +642,6 @@ class GamasBot(
             rows.append([Button.inline(texts.BTN_OFFICE, b"office:start")])
         rows.extend(
             [
-                [Button.inline(texts.BTN_LEADERBOARD, b"board")],
                 [Button.inline(texts.BTN_HELP, b"help"),
                  Button.inline(texts.BTN_REFERRALS, b"ref:home")],
                 [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
@@ -861,7 +854,7 @@ class GamasBot(
         return user_id is not None and user_id in self.settings.admin_ids
 
     async def _capture_sender_name(self, event) -> None:
-        """Best-effort leaderboard name capture; a lookup failure is invisible."""
+        """Best-effort display-name capture; a lookup failure is invisible."""
         user_id = event.sender_id
         if user_id is None:
             return
@@ -989,14 +982,6 @@ class GamasBot(
                 buttons.append(
                     [
                         Button.inline(
-                            texts.BTN_QUIZ_FROM_BOOKLET,
-                            f"quiz:new:{item_id}".encode("ascii"),
-                        )
-                    ]
-                )
-                buttons.append(
-                    [
-                        Button.inline(
                             texts.BTN_CARDS_FROM_BOOKLET,
                             f"fc:ai:{item_id}".encode("ascii"),
                         )
@@ -1086,7 +1071,6 @@ class GamasBot(
         r.register_exact("library", lambda e, _u, _d: self._show_library(e))
         r.register_prefix("res:", self._cb_result_set)
         r.register_exact("library:fc", lambda e, _u, _d: self._show_flashcard_hub(e))
-        r.register_exact("board", lambda e, _u, _d: self._show_leaderboard(e))
         r.register_exact("wallet", lambda e, _u, _d: self._show_wallet(e))
         r.register_exact("support", self._handle_support_callback)
         r.register_exact("adm:home", lambda e, _u, _d: self._show_admin_overview(e))
@@ -1129,7 +1113,6 @@ class GamasBot(
             r.register_prefix(adm_sup_prefix, self._handle_admin_support_callback)
         r.register_prefix("sup:", self._handle_support_callback)
         r.register_prefix("art:", self._route_artifact_callback)
-        r.register_prefix("quiz:", self._route_quiz_callback)
         r.register_prefix("fc:", self._route_flashcard_callback)
 
     async def _route_reply_menu(self, event, user_id: int, text: str) -> bool:
@@ -1144,8 +1127,6 @@ class GamasBot(
             texts.BTN_WALLET: lambda e: self._show_wallet(e),
             texts.BTN_WALLET_LEGACY: lambda e: self._show_wallet(e),
             texts.BTN_WALLET_UPGRADE_LEGACY: lambda e: self._show_wallet(e),
-            texts.BTN_LEADERBOARD: lambda e: self._show_leaderboard(e),
-            texts.BTN_LEADERBOARD_LEGACY: lambda e: self._show_leaderboard(e),
             texts.BTN_OFFICE: lambda e: self._route_office_callback(e, user_id, "office:start"),
             texts.BTN_OFFICE_LEGACY: lambda e: self._route_office_callback(e, user_id, "office:start"),
             texts.BTN_SUPPORT: lambda e: self._show_support_home(e),
@@ -1295,14 +1276,14 @@ class GamasBot(
             if match is not None:
                 item_id = int(match["item_id"])
             # The booklet is forwardable even if the optional library lookup
-            # for learning buttons failed; only quiz/flashcards need item_id.
+            # for the flashcard button failed; only flashcards need item_id.
             kinds.add(KIND_BOOKLET)
             if item_id is not None:
-                kinds.update({KIND_QUIZ, KIND_FLASHCARDS})
+                kinds.add(KIND_FLASHCARDS)
             else:
-                kinds.difference_update({KIND_QUIZ, KIND_FLASHCARDS})
+                kinds.discard(KIND_FLASHCARDS)
         else:
-            kinds.difference_update({KIND_BOOKLET, KIND_QUIZ, KIND_FLASHCARDS})
+            kinds.difference_update({KIND_BOOKLET, KIND_FLASHCARDS})
         buttons = delivery_markup(
             reference=reference,
             speakers=0,
@@ -1322,7 +1303,7 @@ class GamasBot(
                 has_transcript=KIND_TRANSCRIPT in kinds,
                 has_txt=KIND_TXT in kinds,
                 has_docx=KIND_DOCX in kinds,
-                has_review_html=KIND_REVIEW_HTML in kinds,
+                has_study_html=KIND_STUDY_HTML in kinds,
                 has_learning_item=item_id is not None,
             ),
             buttons,
@@ -1797,7 +1778,6 @@ __all__ = [
     "DEFAULT_INTAKE_SUFFIX",
     "DOC_EXTRACTION_STOPPED",
     "DOC_GENERATE_CARDS",
-    "DOC_GENERATE_QUESTIONS",
     "DOC_OCR_FAILED",
     "DOC_PHOTO_HINT",
     "DOC_UNSUPPORTED_HINT",
@@ -1814,7 +1794,6 @@ __all__ = [
     "FloodWaitError",
     "GamasBot",
     "JobProgress",
-    "LEADERBOARD_EMPTY",
     "LEADERBOARD_FALLBACK_NAME",
     "LEARNING_BUSY_ALERT",
     "LEARNING_CREDIT_RESTORED",
@@ -1831,9 +1810,6 @@ __all__ = [
     "MAX_RAW_PREVIEW_LINES",
     "MAX_RECEIPT_IMAGE_PIXELS",
     "OFFICE_UPLOAD_STOPPED",
-    "QUIZ_COUNTS",
-    "QUIZ_POINTS_PER_ANSWER",
-    "QUIZ_START_GUIDANCE",
     "RAW_FALLBACK_MAX_PAGES",
     "RAW_PREVIEW_CHARS",
     "RECEIPT_IMAGE_EXTENSIONS",

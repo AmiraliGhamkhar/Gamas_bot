@@ -748,9 +748,12 @@ class ResponseSchemaTests(unittest.TestCase):
         top = schema["properties"]
         for key in (
             "title", "summary", "learning_objectives", "sections",
-            "practical_tips", "key_points", "review_questions", "glossary",
+            "practical_tips", "key_points", "glossary",
         ):
             self.assertIn(key, top)
+        # The booklet contract has no quiz: archived notes may still carry the
+        # field, but the model is never asked to produce it.
+        self.assertNotIn("review_questions", top)
 
 
 class ProgressiveBookletTests(unittest.IsolatedAsyncioTestCase):
@@ -1213,8 +1216,11 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(compile_accepts(gutted_prose, merged))
 
     async def test_narrow_window_drops_optional_digest_instead_of_overflowing(self):
+        # The study-booklet prompt is larger, so a 10K window is now the
+        # smallest one that still leaves more than one chunk here (see
+        # ContextBudgetTests for the invariant).
         settings = make_settings(
-            note_context_tokens=8192,
+            note_context_tokens=10240,
             note_max_output_tokens=2048,
             note_chunk_chars=100_000,
             note_compile=False,

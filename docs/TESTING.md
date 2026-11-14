@@ -50,16 +50,16 @@ and failure logging, provider-text redaction, the bounded repair loop, the final
 acceptance gate (fact, prose claim and `warn` mode), local salvage, incomplete
 delivery and the new job stages; `tests/test_note_evidence.py` pins original
 number/term spans and evidence windows; `tests/test_booklet_recovery.py` covers
-source-only fallback and high-risk clause cleanup. `tests/test_review_sheet.py` covers the review-sheet planner (strict plan
-parsing, grounding, minute allocation, quality states), the deterministic
-renderer, the HTML validator (hard errors and warnings), the `review_html`
-artifact contract and the migration 033 fresh, populated and replay paths.
-The suite also runs the user-supplied checker `scripts/lint_review_sheet.py` (spec section 11) on a
-rendered sheet and requires `RESULT: PASS`. That file is excluded from Ruff so it stays byte-identical
-to the spec.
+source-only fallback and high-risk clause cleanup. `tests/test_study_notes_html.py` covers the
+offline booklet renderer (doctype, `lang="fa"`, `dir="rtl"`, table of contents,
+every content block, embedded fonts, UTF-8 bytes, filename), asserts that
+speaker labels, timestamps, quiz/leaderboard UI and external references never
+appear, and checks the delivery markup and the minimal HTML delivery gate.
+`tests/test_artifact_validation.py` pins the PDF/DOCX checks and the HTML
+gate's one rejection path.
 `tests/test_bot.py` exercises
 render-boundary structure checks, result-notification failure and the HTML
-sheet's delivery, failure isolation and owner scope (`ReviewSheetDeliveryTests`), while
+booklet's delivery, failure isolation and owner scope (`StudyHtmlDeliveryTests`), while
 `tests/test_workflow_regressions.py` covers failed/restarted jobs with and
 without a persisted transcript.
 

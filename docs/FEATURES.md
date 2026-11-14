@@ -38,7 +38,7 @@ python -m gamas_bot.media_worker check
 ## Booklets (Word and PDF)
 
 With a note provider configured, a finished transcript also produces a Persian
-RTL booklet. Booklets, AI quizzes and AI flashcards use the same note-provider
+RTL booklet. Booklets and AI flashcards use the same note-provider
 allowlist: AvalAI, Gemini and OpenRouter. The default chain is
 `avalai,gemini,openrouter`; task-specific priorities and sensitivity policy
 apply before dispatch, and OpenRouter is always a fallback. The optional
@@ -51,15 +51,15 @@ merge, split/repair and grounding gates remain enabled as configured. See
   install `Vazirmatn` from `assets/fonts/` on the PC that opens the file.
 - PDF built from the same validated `StructuredNotes` model, with an embedded
   Vazirmatn subset, a topic map and selectable text.
-- Interactive HTML review sheet (`🌐 دریافت جزوه مرور تعاملی HTML`): a single
-  self-contained `.html` file with the Vazirmatn fonts embedded, so it works
-  offline. It has a 30-minute study plan split into 5–12 sections (the last one
-  a one-minute self-test), collapsible questions, exam traps and comparison
-  pairs. Every question, answer and trap cites source units from the validated
-  booklet; unsupported items are omitted. No scripts or styles come from the
-  model, and the page runs only the fixed script pinned by its
-  Content-Security-Policy. It is generated only from a completed AI booklet, so
-  deterministic fallback and degraded booklets never get one. Downloading it is
+- Offline HTML study booklet (`📖 جزوه HTML (آفلاین)`): a single self-contained
+  `.html` file named after the topic, with the Vazirmatn fonts and all CSS
+  embedded, so it opens from a local file with no internet, no CDN and no
+  script. It is rendered deterministically from the same validated
+  `StructuredNotes` model as the PDF and DOCX — no second model call — and
+  contains a cover, a table of contents, learning objectives, ordered sections
+  with definitions, numbered steps, tables and callouts, high-yield key points,
+  a summary, a quick review, a glossary and a final review. Speaker labels,
+  timestamps and transcript narration never reach the page. Downloading it is
   free and never re-renders the file; billing rules are unchanged.
 - Nothing is pushed automatically: the final message lists what was produced and
   offers one button per artifact. Re-downloading is free and never re-renders.
@@ -149,10 +149,12 @@ python -m scripts.ocr_smoke scan.jpg --language persian
 - **Library** keeps the newest `LIBRARY_MAX_ITEMS` (50) Telegram file references
   per user; files themselves stay in Telegram. Pruning a reference does not
   delete cached extracted text.
-- **Learning**: quizzes and flashcards generated from a saved booklet or
-  document, previewed before saving. Costs are in [Billing](BILLING.md).
-- **Leaderboard**: native Telegram ranking from quiz answers, including the
-  caller's own rank. Every study workflow stays inside the chat.
+- **Learning**: AI flashcard decks generated from a saved booklet or document,
+  previewed before saving. Costs are in [Billing](BILLING.md).
+- **Quiz and leaderboard are retired**: their buttons, callbacks and menus are
+  gone, no new session or point is written, and the stored tables remain only
+  for compatibility with existing databases. Every study workflow stays inside
+  the chat.
 
 ## Privacy summary
 

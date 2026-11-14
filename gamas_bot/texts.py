@@ -33,8 +33,6 @@ BTN_WALLET_LEGACY: Final = "🛒 خرید اشتراک"
 BTN_WALLET_UPGRADE_LEGACY: Final = "🛒 افزایش اعتبار"
 BTN_OFFICE: Final = "آفیس رایگان"
 BTN_OFFICE_LEGACY: Final = "🗂 آفیس رایگان"
-BTN_LEADERBOARD: Final = "لیدربورد"
-BTN_LEADERBOARD_LEGACY: Final = "🏆 لیدربورد"
 BTN_SUPPORT: Final = "پشتیبانی"
 BTN_SUPPORT_LEGACY: Final = "🎧 پشتیبانی"
 BTN_HELP: Final = "راهنما"
@@ -54,20 +52,17 @@ BTN_NEXT: Final = "بعدی ▶️"
 BTN_REDOWNLOAD: Final = "دریافت مجدد"
 BTN_GET_BOOKLET: Final = "دریافت جزوه PDF"
 BTN_GET_DOCX: Final = "دریافت نسخه Word"
-BTN_GET_REVIEW_HTML: Final = "🌐 دریافت جزوه مرور تعاملی HTML"
-DELIVERY_ROW_REVIEW_HTML: Final = "جزوهٔ مرور تعاملی HTML (آفلاین) آماده است."
-REVIEW_STAGE_PLANNING: Final = "طراحی جزوهٔ مرور تعاملی"
-REVIEW_STAGE_RENDERING: Final = "ساخت فایل HTML"
-REVIEW_STAGE_VALIDATING: Final = "بررسی ساختار و امنیت HTML"
-NOTICE_REVIEW_HTML: Final = "\n\nنکته: جزوهٔ مرور تعاملی HTML آماده نشد؛ فایل‌های دیگر جزوه سالم هستند."
-NOTICE_REVIEW_HTML_STORAGE: Final = "\n\nنکته: ذخیرهٔ جزوهٔ مرور تعاملی HTML انجام نشد."
+BTN_GET_STUDY_HTML: Final = "دریافت جزوه HTML"
+DELIVERY_ROW_STUDY_HTML: Final = "جزوهٔ مطالعهٔ HTML (آفلاین) آماده است."
+STUDY_STAGE_RENDERING: Final = "ساخت فایل HTML جزوه"
+NOTICE_STUDY_HTML: Final = "\n\nنکته: جزوهٔ HTML آماده نشد؛ فایل‌های دیگر جزوه سالم هستند."
+NOTICE_STUDY_HTML_STORAGE: Final = "\n\nنکته: ذخیرهٔ جزوهٔ HTML انجام نشد."
 BTN_GET_TRANSCRIPT: Final = "خواندن متن خام در گفتگو"
 BTN_DOWNLOAD_TXT: Final = "دانلود متن خام (TXT)"
 BTN_GET_KEYPOINTS: Final = "دریافت نکات کلیدی"
 BTN_MY_RESULTS: Final = "📦 خروجی‌های من"
 BTN_START_HERE: Final = "🎓 شروع"
 BTN_UPGRADE: Final = "🛒 افزایش اعتبار"
-BTN_QUIZ_FROM_BOOKLET: Final = "آزمون از این جزوه"
 BTN_CARDS_FROM_BOOKLET: Final = "فلش‌کارت از این جزوه"
 OFFICE_CREDIT_NOTICE: Final = (
     "🗂 آفیس رایگان: تبدیل متن به Word، Excel، PowerPoint یا PDF؛ "
@@ -204,7 +199,7 @@ DELIVERY_ROW_TRANSCRIPT: Final = "متن خام گفتار را می‌توان�
 DELIVERY_ROW_TXT: Final = "متن خام گفتار به‌صورت فایل TXT آماده است."
 DELIVERY_ROW_KEYPOINTS: Final = "نکات کلیدی آماده است."
 DELIVERY_ROW_DOCX: Final = "نسخهٔ Word آماده است."
-DELIVERY_ROW_LEARNING: Final = "از جزوه می‌توانید آزمون یا فلش‌کارت بسازید."
+DELIVERY_ROW_LEARNING: Final = "از همین جزوه می‌توانید فلش‌کارت مرور بسازید."
 DELIVERY_ROW_NOTES_PENDING: Final = "نکات کلیدی در حال آماده‌شدن است."
 DELIVERY_SPEAKERS_TEMPLATE: Final = "گویندگان شناسایی‌شده: {count} نفر"
 DELIVERY_SPEAKERS_ONE: Final = "یک گوینده شناسایی شد."
@@ -259,7 +254,7 @@ def delivery_screen(
     has_transcript: bool = True,
     has_txt: bool = False,
     has_docx: bool = False,
-    has_review_html: bool = False,
+    has_study_html: bool = False,
     has_learning_item: bool = True,
 ) -> str:
     """Describe only the artifacts and actions exposed by this message."""
@@ -288,8 +283,8 @@ def delivery_screen(
         lines.append(DELIVERY_ROW_KEYPOINTS)
     if has_docx:
         lines.append(DELIVERY_ROW_DOCX)
-    if has_review_html:
-        lines.append(DELIVERY_ROW_REVIEW_HTML)
+    if has_study_html:
+        lines.append(DELIVERY_ROW_STUDY_HTML)
     if has_booklet and has_learning_item and learning_available:
         lines.append(DELIVERY_ROW_LEARNING)
     elif has_booklet and not learning_available:
@@ -302,7 +297,7 @@ def delivery_screen(
             has_keypoints,
             notes_pending,
             has_docx,
-            has_review_html,
+            has_study_html,
         )
     )
     if not has_any_output:
@@ -495,10 +490,6 @@ FLASHCARD_EMPTY_RAW_ONLY: Final = (
     "هنوز مجموعه‌ای نساخته‌اید. می‌توانید کارت‌های دستی خودتان را اضافه کنید؛ "
     "ساخت خودکار از جزوه فعلاً فعال نیست."
 )
-LEADERBOARD_EMPTY_RAW_ONLY: Final = (
-    "🏆 لیدربورد\n\n"
-    "هنوز امتیازی ثبت نشده است. ساخت خودکار آزمون، راه کسب امتیاز، فعلاً فعال نیست."
-)
 
 
 def flashcard_empty(*, notes_configured: bool) -> str:
@@ -509,17 +500,6 @@ def flashcard_empty(*, notes_configured: bool) -> str:
             "هنوز مجموعه‌ای نساخته‌اید. از یک جزوه بسازید یا کارت‌های دستی خودتان را اضافه کنید."
         )
     return FLASHCARD_EMPTY_RAW_ONLY
-
-
-def leaderboard_empty(*, notes_configured: bool) -> str:
-    """Avoid suggesting a quiz when the configured note/learning provider is absent."""
-    if notes_configured:
-        return (
-            "🏆 لیدربورد\n\n"
-            "هنوز امتیازی ثبت نشده است.\n"
-            "اولین آزمون خود را از «📚 کتابخانه من» شروع کنید."
-        )
-    return LEADERBOARD_EMPTY_RAW_ONLY
 
 # ------------------------------------------------------------------ membership
 SUBSCRIPTION_REQUIRED_TEMPLATE: Final = (
