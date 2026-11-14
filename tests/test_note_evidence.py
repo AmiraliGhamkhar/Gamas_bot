@@ -31,7 +31,9 @@ from gamas_bot.notes_evidence import (
     prose_claim_evidence,
     coverage_thresholds,
     evidence_windows,
+    extract_number_occurrences,
     extract_signals,
+    extract_term_occurrences,
     mask_structural,
     sentence_coverage,
     split_sentences,
@@ -73,6 +75,23 @@ class SignalExtractionTests(unittest.TestCase):
     def test_decimal_comma_and_thousand_separator(self):
         self.assert_signal("مقدار ۱۲٫۵", "number", "12.5")
         self.assert_signal("۱٬۰۰۰ نفر", "number", "1000")
+
+    def test_number_and_term_occurrences_preserve_original_spans(self):
+        source = "Metformin با ۵۰۰ میلی‌گرم و ۷۵٪ و تاریخ ۱۴۰۲/۰۵/۱۲ ثبت شد."
+        number_occurrences = extract_number_occurrences(source)
+        self.assertEqual(
+            [source[item.start:item.end] for item in number_occurrences],
+            ["۵۰۰ میلی‌گرم", "۷۵٪", "۱۴۰۲/۰۵/۱۲"],
+        )
+        self.assertEqual(
+            [item.signal.label for item in number_occurrences],
+            ["500 mg", "75 %", "1402-05-12"],
+        )
+        term_occurrence = next(
+            item for item in extract_term_occurrences(source)
+            if item.signal.value == "metformin"
+        )
+        self.assertEqual(source[term_occurrence.start:term_occurrence.end], "Metformin")
 
     def test_ratio_is_one_signal(self):
         self.assert_signal("فشار خون ۱۲۰/۸۰ mmHg", "number", "120/80", "mmhg")
@@ -165,7 +184,7 @@ class AuditTests(unittest.TestCase):
         missing = [s for s in extract_signals(source) if s.value == "1.6"]
         windows = evidence_windows(source, missing)
         self.assertEqual(len(windows), 1)
-        self.assertIn("1.6", windows[0][1])
+        self.assertIn("۱.۶", windows[0][1])
 
     def test_standard_equivalents_table_is_persian_to_latin_only(self):
         for latin, spellings in STANDARD_EQUIVALENTS.items():

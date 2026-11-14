@@ -430,12 +430,12 @@ class PromptTests(unittest.TestCase):
 
 
 class CompileAcceptanceTests(unittest.TestCase):
-    def test_rejects_gutted_result(self):
+    def test_safe_content_loss_is_left_for_post_compile_diagnostics(self):
         merged = StructuredNotes(
             sections=[one_section(f"بخش {i}", paragraphs=[f"متن {i}"]) for i in range(10)]
         )
         gutted = StructuredNotes(sections=[one_section("همه", paragraphs=["یک خط"])])
-        self.assertFalse(compile_accepts(gutted, merged))
+        self.assertTrue(compile_accepts(gutted, merged))
 
     def test_accepts_restructured_result(self):
         merged = StructuredNotes(
@@ -1172,7 +1172,7 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
         merged = merge_structured_notes([first, second])
         self.assertEqual(len(merged.sections), 2)
 
-    def test_compile_accepts_rejects_dropped_definitions_and_gutted_prose(self):
+    def test_compile_accepts_safe_content_loss_for_post_compile_diagnostics(self):
         defs = (
             NoteDefinition("کیفیت", "توضیح اول"),
             NoteDefinition("پایایی", "توضیح دوم"),
@@ -1202,7 +1202,7 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
         )
-        self.assertFalse(compile_accepts(no_defs, merged))
+        self.assertTrue(compile_accepts(no_defs, merged))
 
         gutted_prose = StructuredNotes(
             sections=(
@@ -1210,7 +1210,7 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
                 NoteSection(heading="بخش ۲", paragraphs=("کوتاه دو.",)),
             )
         )
-        self.assertFalse(compile_accepts(gutted_prose, merged))
+        self.assertTrue(compile_accepts(gutted_prose, merged))
 
     async def test_narrow_window_drops_optional_digest_instead_of_overflowing(self):
         settings = make_settings(
@@ -1474,7 +1474,9 @@ class FabricatedNumberScrubTests(unittest.TestCase):
         scrubbed, removed = scrub_fabricated_numbers(notes, report.audit)
         self.assertEqual(removed, 3)
         self.assertEqual(scrubbed.sections[0].callouts, ())
-        self.assertEqual(scrubbed.glossary, ())
+        self.assertEqual(len(scrubbed.glossary), 1)
+        self.assertIn("مقدار دارو", scrubbed.glossary[0].definition)
+        self.assertNotIn("۷۵۰", scrubbed.glossary[0].definition)
         self.assertEqual(scrubbed.practical_tips, ())
 
     def test_clean_notes_are_untouched(self):
@@ -1718,8 +1720,8 @@ class SkeletonPromptTests(unittest.TestCase):
             with self.subTest(edit_phrase=edit_phrase):
                 self.assertIn(edit_phrase, COMPILE_SYSTEM_PROMPT)
 
-    def test_compile_gate_and_body_chars_protect_tables_callouts_and_tips(self):
-        """_notes_body_chars counts tips once and compile_accepts protects callouts/tips."""
+    def test_compile_content_loss_is_measured_without_rejecting_safe_notes(self):
+        """Body/structure counts expose omissions; the evidence gate marks them partial."""
         from gamas_bot.notes import (
             NoteCallout,
             PracticalTip,
@@ -1774,7 +1776,8 @@ class SkeletonPromptTests(unittest.TestCase):
         # 1 table + 3 callouts + 1 practical tip = 5 structured items
         self.assertEqual(_notes_structured_item_count(two_sec_notes), 5)
 
-        # A compile candidate that drops all callouts, tables, and tips is rejected
+        # Safe but incomplete compile output remains deliverable; the later
+        # evidence/completeness audit must describe its omissions as partial.
         gutted = StructuredNotes(
             title="جزوهٔ فارماکولوژی",
             summary="خلاصهٔ درس",
@@ -1789,7 +1792,7 @@ class SkeletonPromptTests(unittest.TestCase):
                 ),
             ),
         )
-        self.assertFalse(compile_accepts(gutted, two_sec_notes))
+        self.assertTrue(compile_accepts(gutted, two_sec_notes))
 
         # Completeness assessment counts table captions and practical tips as drafted text
         source = (
@@ -1798,6 +1801,7 @@ class SkeletonPromptTests(unittest.TestCase):
         )
         completeness = assess_completeness(source, two_sec_notes)
         self.assertEqual(completeness.covered_units, completeness.total_units)
+        self.assertLess(assess_completeness(source, gutted).coverage, completeness.coverage)
 
 
 class CoverageFillTests(unittest.IsolatedAsyncioTestCase):
@@ -1808,12 +1812,12 @@ class CoverageFillTests(unittest.IsolatedAsyncioTestCase):
         for i in range(6)
     )
     DRAFT = json.dumps({
-        "title": "درس", "summary": "خلاصه", "key_points": ["نکته"],
+        "title": "ترمودینامیک", "summary": "خلاصه", "key_points": ["نکته"],
         "glossary": [{"term": "entropy", "definition": "آنتروپی"}],
         "sections": [{"heading": "مقدمه", "paragraphs": ["سلام به کلاس"]}],
     }, ensure_ascii=False)
     FILL = json.dumps({
-        "title": "درس",
+        "title": "ترمودینامیک",
         "sections": [{"heading": "ترمودینامیک", "paragraphs": [
             "جملهٔ مستقل شمارهٔ ۰ دربارهٔ ترمودینامیک و آنتروپی و تعادل گرمایی است."
         ]}],
@@ -1848,4 +1852,4 @@ class CoverageFillTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession([self.DRAFT])
         notes = await structure_transcript(self.SOURCE, settings, session)
         self.assertEqual(len(session.calls), 2)  # map + one failing fill
-        self.assertEqual(notes.title, "درس")
+        self.assertEqual(notes.title, "ترمودینامیک")

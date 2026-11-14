@@ -56,7 +56,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from functools import lru_cache
 from typing import Iterable, Iterator, Sequence
 
-from .textnorm import normalize_digits, normalize_for_compare
+from .textnorm import normalize_digits, normalize_for_compare, normalize_persian
 
 # ===========================================================================
 # Units
@@ -91,6 +91,11 @@ UNIT_ALIASES: dict[str, tuple[str, ...]] = {
     "mb": ("MB", "mb", "مگابایت"),
     "gb": ("GB", "gb", "گیگابایت"),
     "ms": ("ms", "میلی‌ثانیه", "میلی ثانیه"),
+    "day": ("day", "روز", "روزه"),
+    "week": ("week", "هفته", "هفتگی"),
+    "month": ("month", "ماه", "ماهه"),
+    "year": ("year", "yr", "سال", "ساله"),
+    "count": ("count", "نفر", "مورد", "بار"),
 }
 
 #: Every known unit spelling, folded, for the term scanner to skip.
@@ -105,10 +110,10 @@ _UNIT_SPELLINGS: dict[str, str] = {
 }
 
 
-def _unit_pattern() -> str:
-    """One alternation of every alias, longest first, whitespace-tolerant."""
+def _unit_pattern(tokens: Iterable[str] = _UNIT_TOKENS) -> str:
+    """One alternation of unit aliases, longest first, whitespace-tolerant."""
     parts: list[str] = []
-    for alias in sorted(_UNIT_TOKENS, key=len, reverse=True):
+    for alias in sorted(tokens, key=len, reverse=True):
         pieces = [re.escape(piece) for piece in alias.split()]
         parts.append(r"[\s\u200c]*".join(pieces))
     return "|".join(parts)
@@ -164,6 +169,10 @@ _EQUIVALENCE_PAREN = re.compile(r"[\u0600-\u06FF\w][^\n()]{0,40}?\(([^()\n]{1,80
 
 #: Persian/Arabic decimal and thousands separators.
 _NUMBER_FIXUPS = str.maketrans({"٫": ".", "٬": "", "／": "/"})
+# Occurrence spans must continue to index the original text. Preserve the
+# thousands separator as a one-character comma here; `_canonical_value` folds
+# it after matching. The general extraction normalizer above may still drop it.
+_NUMBER_SPAN_FIXUPS = str.maketrans({"٫": ".", "٬": ",", "／": "/"})
 
 #: A parenthetical may not be longer than this many words to count as an
 #: equivalence position; anything longer is prose, not a term.
@@ -184,26 +193,79 @@ STANDARD_EQUIVALENTS: dict[str, tuple[str, ...]] = {
     "sql": ("اس‌کیوال", "اس کیوال", "سی‌کوئل"),
     "algorithm": ("الگوریتم",),
     "database": ("دیتابیس", "پایگاه داده"),
-    "schema": ("اسکیما", "شِما", "شما"),
-    "relation": ("رابطه‌ای", "رابطه"),
+    # Avoid broad Persian words such as «شما» / «اصلی» as aliases: they occur
+    # in ordinary prose and would incorrectly ground an unrelated term.
+    "schema": ("اسکیما",),
+    "relation": ("رابطه‌ای",),
     "tuple": ("چندتایی", "تاپل"),
     "attribute": ("صفت", "ویژگی"),
     "index": ("ایندکس", "نمایه"),
-    "primary": ("کلید اصلی", "اصلی"),
-    "foreign": ("کلید خارجی", "خارجی"),
+    "primary": ("کلید اصلی",),
+    "foreign": ("کلید خارجی",),
     "wimp": ("ویمپ",),
     "fitts": ("فیتس",),
     "nielsen": ("نیلسن",),
     "metformin": ("متفورمین",),
     "dapagliflozin": ("داپاگلیفلوزین",),
     "hba1c": ("اچ‌بی‌ای‌وان‌سی", "هموگلوبین گلیکوزیله"),
-    "egfr": ("ای‌جی‌اف‌آر",),
+    "egfr": ("ای‌جی‌اف‌آر", "نرخ فیلتراسیون گلومرولی"),
+    # Common, unambiguous spoken forms of abbreviations in Persian lectures.
+    "api": ("ای‌پی‌آی", "رابط برنامه‌نویسی کاربردی"),
+    "cpu": ("سی‌پی‌یو", "پردازندهٔ مرکزی"),
+    "gpu": ("جی‌پی‌یو", "پردازندهٔ گرافیکی"),
+    "covid-19": ("کووید-۱۹", "کووید ۱۹"),
 }
 
+
+def _comparison_phrase(text: str) -> str:
+    """Normalize punctuation and spacing for terminology alias comparison."""
+    folded = normalize_for_compare(text or "")
+    folded = re.sub(r"[^\w]+", " ", folded, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", folded).strip()
+
+
 _NORMALIZED_STANDARD_EQUIVALENTS: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
-    (token, tuple(normalize_for_compare(item) for item in spellings))
+    (token, tuple(_comparison_phrase(item) for item in spellings))
     for token, spellings in STANDARD_EQUIVALENTS.items()
 )
+
+# Persian number words are recognized only when they directly qualify an
+# explicit unit/quantity marker. This avoids treating the common article «یک»
+# as a numeric fact in every sentence.
+_NUMBER_WORD_VALUES: dict[str, int] = {
+    "صفر": 0,
+    "یک": 1, "يك": 1, "یه": 1, "یك": 1,
+    "دو": 2, "سه": 3, "چهار": 4, "پنج": 5, "شش": 6, "شیش": 6,
+    "هفت": 7, "هشت": 8, "نه": 9, "ده": 10,
+    "یازده": 11, "دوازده": 12, "سیزده": 13, "چهارده": 14, "پانزده": 15,
+    "شانزده": 16, "هفده": 17, "هجده": 18, "نوزده": 19,
+    "بیست": 20, "سی": 30, "چهل": 40, "پنجاه": 50, "شصت": 60,
+    "هفتاد": 70, "هشتاد": 80, "نود": 90,
+    "صد": 100, "یکصد": 100, "دویست": 200, "سیصد": 300,
+    "چهارصد": 400, "پانصد": 500, "ششصد": 600, "هفتصد": 700,
+    "هشتصد": 800, "نهصد": 900,
+    "هزار": 1_000, "میلیون": 1_000_000, "میلیارد": 1_000_000_000,
+}
+_NUMBER_WORD_ATOM = "|".join(
+    re.escape(word) for word in sorted(_NUMBER_WORD_VALUES, key=len, reverse=True)
+)
+# Large year phrases («هزار سال») are common rhetorical/historical periods in
+# Persian humanities text, not measurements. Keep year aliases for digit values,
+# but do not turn number words followed by «سال» into hard numeric signals.
+_NUMBER_WORD_UNIT_TOKENS = frozenset(
+    alias for alias in _UNIT_TOKENS if _UNIT_SPELLINGS.get(alias) != "year"
+)
+_NUMBER_WORD_UNIT_ALTERNATION = _unit_pattern(_NUMBER_WORD_UNIT_TOKENS)
+_NUMBER_WORD_UNIT = re.compile(
+    rf"(?<![\w])(?P<num>(?:{_NUMBER_WORD_ATOM})"
+    rf"(?:(?:[\s\u200c]*و[\s\u200c]*|[\s\u200c]+)(?:{_NUMBER_WORD_ATOM})){{0,5}})"
+    rf"[\s\u200c]*(?P<unit>{_NUMBER_WORD_UNIT_ALTERNATION})(?![\w])",
+    re.UNICODE | re.IGNORECASE,
+)
+_NUMBER_WORD_TOKEN = re.compile(rf"(?<![\w])(?:{_NUMBER_WORD_ATOM})(?![\w])", re.UNICODE)
+_NORMALIZED_NUMBER_WORD_VALUES = {
+    normalize_for_compare(word): value for word, value in _NUMBER_WORD_VALUES.items()
+}
 
 _HORIZONTAL_SPACES = re.compile(r"[ \t]+")
 _UNIT_SPACE_COLLAPSE = re.compile(r"[\s\u200c]+")
@@ -234,6 +296,15 @@ class Signal:
         if self.kind != "number" or not self.unit:
             return self.value
         return f"{self.value} {self.unit}"
+
+
+@dataclass(frozen=True, slots=True)
+class SignalOccurrence:
+    """A normalized signal and its exact span in the original text."""
+
+    signal: Signal
+    start: int
+    end: int
 
 
 def units_compatible(first: str, second: str) -> bool:
@@ -349,7 +420,7 @@ class CoverageReport:
 
 def _fold(text: str) -> str:
     """Digits, decimal separators and whitespace, without touching letters."""
-    folded = normalize_digits(text or "")
+    folded = normalize_persian(text or "", digits=True)
     folded = folded.translate(_NUMBER_FIXUPS)
     return _HORIZONTAL_SPACES.sub(" ", folded)
 
@@ -377,7 +448,37 @@ def _canonical_unit(raw: str) -> str:
     if not raw:
         return ""
     key = _UNIT_SPACE_COLLAPSE.sub(" ", raw.strip().casefold())
-    return _UNIT_SPELLINGS.get(key, key)
+    canonical = _UNIT_SPELLINGS.get(key, key)
+    # Count words are quantity markers, not measurement units; retain the
+    # longstanding `Signal(number, value)` shape for values such as «۱٬۰۰۰ نفر».
+    return "" if canonical == "count" else canonical
+
+
+def _parse_number_words(raw: str) -> int | None:
+    """Parse a bounded Persian number phrase such as «هفتاد و پنج».
+
+    The caller only invokes this for a phrase immediately followed by an
+    explicit unit, so ordinary «یک» in prose is not elevated into a numeric
+    assertion. Unknown/mixed phrases fail closed instead of guessing.
+    """
+    words = [
+        _NORMALIZED_NUMBER_WORD_VALUES.get(normalize_for_compare(match.group(0)))
+        for match in _NUMBER_WORD_TOKEN.finditer(raw)
+    ]
+    if not words or any(value is None for value in words):
+        return None
+    total = 0
+    current = 0
+    for value in words:
+        assert value is not None
+        if value < 100:
+            current += value
+        elif value < 1_000:
+            current = (current or 1) * value
+        else:
+            total += (current or 1) * value
+            current = 0
+    return total + current
 
 
 def mask_structural(text: str) -> str:
@@ -464,14 +565,126 @@ def extract_signals(text: str, *, mask: bool = True) -> frozenset[Signal]:
         term_spans.append((match.start(), match.start() + len(token)))
     without_terms = _blanked(without_dates, term_spans)
 
-    # 4. Numbers with their optional unit.
+    # 4. Numeric digits with their optional unit.
     for match in _NUMBER_UNIT.finditer(without_terms):
         value = _canonical_value(normalize_digits(match.group("num")))
         if not value:
             continue
         unit = _canonical_unit(match.group("unit") or "")
         signals.add(Signal("number", value, unit))
+
+    # 5. Persian number words only when they immediately qualify a known unit
+    # or quantity marker (e.g. «پنجاه میلی‌گرم», «سه روز»). The exact value is
+    # normalized, so it remains a hard signal and an unsupported value is still
+    # detected even when the two sides use different number representations.
+    for match in _NUMBER_WORD_UNIT.finditer(without_terms):
+        number_value = _parse_number_words(match.group("num"))
+        if number_value is None:
+            continue
+        unit = _canonical_unit(match.group("unit") or "")
+        signals.add(Signal("number", str(number_value), unit))
     return frozenset(signals)
+
+
+def _offset_preserving_structural_mask(text: str) -> str:
+    """Mask layout numbers without changing offsets needed by local scrubbing."""
+    normalized = normalize_digits(normalize_persian(text or "")).translate(_NUMBER_SPAN_FIXUPS)
+    ranges = [
+        match.span()
+        for pattern in (_MARKDOWN_HEADING, _CHUNK_MARKER, _STRUCTURAL_NUMBER, _LIST_ORDINAL)
+        for match in pattern.finditer(normalized)
+    ]
+    return _blanked(normalized, ranges)
+
+
+def extract_number_occurrences(
+    text: str, *, mask: bool = True
+) -> tuple[SignalOccurrence, ...]:
+    """Return exact numeric spans, including date and number-word forms.
+
+    Matching uses the same canonical values and units as :func:`extract_signals`.
+    The normalized text is length-preserving (character folding only), so spans
+    map back to the original string and a scrubber can edit only the unsupported
+    claim rather than deleting its whole sentence.
+    """
+    if not text:
+        return ()
+    working = (
+        _offset_preserving_structural_mask(text)
+        if mask
+        else normalize_digits(normalize_persian(text)).translate(_NUMBER_SPAN_FIXUPS)
+    )
+    ranges: list[tuple[int, int]] = []
+    for match in _URL.finditer(working):
+        ranges.append(match.span())
+    without_urls = _blanked(working, ranges)
+
+    occurrences: list[SignalOccurrence] = []
+    date_ranges: list[tuple[int, int]] = []
+    for match in _DATE.finditer(without_urls):
+        occurrences.append(
+            SignalOccurrence(
+                Signal("number", _canonical_date(match.group("date"))),
+                match.start(), match.end(),
+            )
+        )
+        date_ranges.append(match.span())
+    without_dates = _blanked(without_urls, date_ranges)
+    term_ranges: list[tuple[int, int]] = []
+    for match in _LATIN_TOKEN.finditer(without_dates):
+        token = match.group(0).strip(".-+")
+        folded_token = token.casefold()
+        if folded_token in _UNIT_TOKENS or folded_token in _LATIN_STOPWORDS:
+            continue
+        if len(folded_token) >= 2:
+            term_ranges.append((match.start(), match.start() + len(token)))
+    without_terms = _blanked(without_dates, term_ranges)
+
+    for match in _NUMBER_UNIT.finditer(without_terms):
+        value = _canonical_value(match.group("num"))
+        unit = _canonical_unit(match.group("unit") or "")
+        occurrences.append(
+            SignalOccurrence(Signal("number", value, unit), match.start(), match.end())
+        )
+    for match in _NUMBER_WORD_UNIT.finditer(without_terms):
+        number_value = _parse_number_words(match.group("num"))
+        if number_value is None:
+            continue
+        unit = _canonical_unit(match.group("unit") or "")
+        occurrences.append(
+            SignalOccurrence(
+                Signal("number", str(number_value), unit), match.start(), match.end()
+            )
+        )
+    return tuple(sorted(occurrences, key=lambda item: (item.start, item.end)))
+
+
+def extract_term_occurrences(text: str) -> tuple[SignalOccurrence, ...]:
+    """Return the exact URL/Latin-term spans used by the signal audit.
+
+    Offsets are measured in the original text. Persian letter normalization
+    replaces characters one-for-one, so it does not shift the spans; URLs remain
+    atomic and are not rescanned as terms.
+    """
+    if not text:
+        return ()
+    working = normalize_persian(text)
+    url_occurrences: list[SignalOccurrence] = []
+    url_ranges: list[tuple[int, int]] = []
+    for start, end, raw in _iter_urls(working):
+        url_occurrences.append(SignalOccurrence(Signal("url", raw.casefold()), start, end))
+        url_ranges.append((start, end))
+    without_urls = _blanked(working, url_ranges)
+    occurrences = list(url_occurrences)
+    for match in _LATIN_TOKEN.finditer(without_urls):
+        token = match.group(0).strip(".-+")
+        folded = token.casefold()
+        if len(folded) < 2 or folded in _UNIT_TOKENS or folded in _LATIN_STOPWORDS:
+            continue
+        occurrences.append(
+            SignalOccurrence(Signal("term", folded), match.start(), match.start() + len(token))
+        )
+    return tuple(sorted(occurrences, key=lambda item: (item.start, item.end)))
 
 
 #: CR-3: FULL is the only note mode, so there is a single recall floor. Numbers
@@ -556,13 +769,14 @@ def build_source_index(source: str) -> SourceEvidenceIndex:
         (sentence, content_words(sentence))
         for sentence in split_sentences(masked_raw)
     )
+    normalized_source = _comparison_phrase(source)
     standard_equivalent_tokens = (
         frozenset(
             token
             for token, norm_spellings in _NORMALIZED_STANDARD_EQUIVALENTS
-            if any(item in compare_source for item in norm_spellings)
+            if any(_phrase_contains(normalized_source, item) for item in norm_spellings)
         )
-        if compare_source
+        if normalized_source
         else frozenset()
     )
     return SourceEvidenceIndex(
@@ -663,6 +877,47 @@ def _collect_table(table: object, allowed: set[str]) -> None:
         _collect_tokens(cell, allowed)
 
 
+def _phrase_contains(text: str, phrase: str) -> bool:
+    """Boundary-aware phrase matching after Persian/punctuation normalization."""
+    if not text or not phrase:
+        return False
+    return bool(re.search(rf"(?<![\w]){re.escape(phrase)}(?![\w])", text, re.UNICODE))
+
+
+def _term_aliases(term: str) -> tuple[str, ...]:
+    """Known Persian/English forms for a Latin term; no open-ended inference."""
+    normalized = _comparison_phrase(term)
+    aliases: list[str] = []
+    for token, spellings in _NORMALIZED_STANDARD_EQUIVALENTS:
+        if normalized == _comparison_phrase(token):
+            aliases.extend(spellings)
+    return tuple(dict.fromkeys(alias for alias in aliases if alias))
+
+
+def _term_matches_text(term: str, text: str) -> bool:
+    """Exact or explicitly registered alias match in a normalized corpus."""
+    normalized_term = _comparison_phrase(term)
+    if _phrase_contains(text, normalized_term):
+        return True
+    return any(_phrase_contains(text, alias) for alias in _term_aliases(term))
+
+
+def _term_is_in_source(signal: Signal, source: str, source_index: SourceEvidenceIndex) -> bool:
+    if _covers_lookup(signal, source_index.term_lookup):
+        return True
+    return signal.kind == "term" and _term_matches_text(signal.value, _comparison_phrase(source))
+
+
+def _term_is_in_notes(
+    signal: Signal,
+    notes_lookup: dict[tuple[str, str], tuple[Signal, ...]],
+    notes_text: str,
+) -> bool:
+    if _covers_lookup(signal, notes_lookup):
+        return True
+    return signal.kind == "term" and _term_matches_text(signal.value, notes_text)
+
+
 def _equivalent_additions(
     notes: object,
     source: str = "",
@@ -729,7 +984,10 @@ def audit_notes(
     the second a faithfulness defect, and they need different repairs.
     """
     idx = source_index if source_index is not None else build_source_index(source)
-    note_signals = extract_signals(_notes_text(notes))
+    note_text = _notes_text(notes)
+    normalized_notes = _comparison_phrase(note_text)
+    normalized_source = _comparison_phrase(source)
+    note_signals = extract_signals(note_text)
 
     source_numbers = idx.numbers
     source_terms = idx.terms
@@ -747,7 +1005,7 @@ def audit_notes(
     missing_terms = tuple(
         signal
         for signal in source_terms
-        if not _covers_lookup(signal, note_term_lookup)
+        if not _term_is_in_notes(signal, note_term_lookup, normalized_notes)
     )
     fabricated_numbers = tuple(
         signal
@@ -757,7 +1015,8 @@ def audit_notes(
     fabricated_terms = tuple(
         signal
         for signal in note_terms
-        if signal.value not in allowed and not _covers_lookup(signal, idx.term_lookup)
+        if signal.value not in allowed
+        and not _term_is_in_source(signal, normalized_source, idx)
     )
     return SignalAudit(
         source_numbers=source_numbers,
@@ -786,16 +1045,36 @@ def evidence_windows(
     if not signals or not source:
         return ()
     idx = source_index if source_index is not None else build_source_index(source)
-    masked = idx.masked_folded
-    masked_lower = idx.masked_folded_lower
+    source_numbers = extract_number_occurrences(source)
+    source_lower = source.casefold()
     windows: list[tuple[Signal, str]] = []
     for signal in signals:
-        index = masked_lower.find(signal.value.casefold())
-        if index < 0:
-            continue
+        if signal.kind == "number":
+            occurrence = next(
+                (
+                    item for item in source_numbers
+                    if item.signal.value == signal.value
+                    and units_compatible(item.signal.unit, signal.unit)
+                ),
+                None,
+            )
+            if occurrence is None:
+                continue
+            index, end_index = occurrence.start, occurrence.end
+        else:
+            index = source_lower.find(signal.value.casefold())
+            if index < 0:
+                # Persian aliases are not signal terms themselves, but keep the
+                # cached normalized text as a fallback for legacy callers.
+                index = idx.masked_folded_lower.find(signal.value.casefold())
+                if index < 0:
+                    continue
+                end_index = index + len(signal.value)
+            else:
+                end_index = index + len(signal.value)
         start = max(0, index - radius)
-        end = min(len(masked), index + len(signal.value) + radius)
-        windows.append((signal, " ".join(masked[start:end].split()).strip()))
+        end = min(len(source), end_index + radius)
+        windows.append((signal, " ".join(source[start:end].split()).strip()))
     return tuple(windows)
 
 
@@ -808,19 +1087,50 @@ _PERSIAN_STOPWORDS = frozenset(
     {
         "و", "در", "به", "از", "با", "بر", "برای", "که", "این", "آن", "های",
         "ها", "یک", "یا", "تا", "را", "هم", "می", "شود", "است", "بود", "شد",
-        "شده", "می‌شود", "کرد", "کند", "دارد", "داریم", "بین", "روی", "اگر",
+        "شده", "می‌شود", "میشود", "می‌شوند", "میشوند", "می‌کند", "میکند",
+        "می‌کنند", "میکنند", "کرد", "کند", "دارد", "داریم", "بین", "روی", "اگر",
         "اما", "نیز", "هر", "چه", "چون", "زیرا", "بنابراین", "پس", "ما", "شما",
         "آنها", "وی", "او", "من", "خود", "دیگر", "بسیار", "خیلی", "طور",
     }
 )
+_NORMALIZED_PERSIAN_STOPWORDS = frozenset(
+    normalize_for_compare(word) for word in _PERSIAN_STOPWORDS
+)
+_PERSIAN_PLURAL_SUFFIXES = ("هایشان", "هایمان", "هایتان", "هایی", "های", "ها")
+
+
+def _stem_content_word(word: str) -> str:
+    """Fold common Persian plurals and English plural endings conservatively."""
+    if any(0x0600 <= ord(char) <= 0x06FF for char in word):
+        for suffix in _PERSIAN_PLURAL_SUFFIXES:
+            if word.endswith(suffix) and len(word) > len(suffix) + 2:
+                return word[:-len(suffix)]
+        return word
+    if len(word) > 5:
+        if word.endswith("ies"):
+            return word[:-3] + "y"
+        if word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            return word[:-1]
+    return word
 
 
 def content_words(text: str) -> frozenset[str]:
-    """Meaning-bearing words of a text (lower-case, stopwords removed)."""
-    folded = normalize_for_compare(text)
-    words = _CONTENT_WORD_TOKEN.findall(folded)
+    """Meaning-bearing words after Unicode, spacing and light inflection folding."""
+    folded = normalize_for_compare(text or "")
+    # Use an explicit unit boundary for number words, then compare the same
+    # canonical number as a digit-form note. Other number words remain ordinary
+    # prose so «یک» is not treated as an assertion by itself.
+    for match in tuple(_NUMBER_WORD_UNIT.finditer(folded)):
+        number = _parse_number_words(match.group("num"))
+        if number is not None:
+            folded = folded.replace(match.group(0), f" {number} ", 1)
+    words = (_stem_content_word(word) for word in _CONTENT_WORD_TOKEN.findall(folded))
     return frozenset(
-        word for word in words if word not in _PERSIAN_STOPWORDS and word not in _LATIN_STOPWORDS
+        word
+        for word in words
+        if word
+        and word not in _NORMALIZED_PERSIAN_STOPWORDS
+        and word not in _LATIN_STOPWORDS
     )
 
 
@@ -874,6 +1184,27 @@ MIN_CLAIM_WORDS = 6
 #: independent (`audit_notes`).
 MIN_CLAIM_SUPPORT = 0.2
 
+_HIGH_RISK_MEDICAL_MARKERS = (
+    "دوز", "میلی گرم", "میلیگرم", "میکروگرم", "mg", "mcg", "mg dl", "mmhg",
+    "آستانه", "حد تشخیص", "حد طبیعی", "قند خون", "فشار خون", "مقدار مجاز",
+    "تجویز", "مصرف", "باید مصرف", "نباید مصرف", "درمان", "تشخیص", "تزریق",
+    "قطع دارو", "شروع دارو", "افزایش دوز", "کاهش دوز", "منع مصرف", "عوارض جانبی",
+    "dose", "dosage", "prescribe", "prescription", "diagnos", "treat",
+    "administer", "inject", "take", "should take", "must take", "medication",
+    "drug", "contraindication", "side effect", "normal range", "target range",
+    "threshold", "cutoff", "increase the dose", "decrease the dose",
+    "start the medication", "stop the medication",
+)
+
+
+def classify_claim_risk(text: str) -> str:
+    """Conservative deterministic risk label for an unsupported prose claim."""
+    folded = _comparison_phrase(text)
+    if any(_phrase_contains(folded, _comparison_phrase(marker)) for marker in _HIGH_RISK_MEDICAL_MARKERS):
+        return "high"
+    return "medium"
+
+
 #: Sentences that talk about the document rather than about the subject. They
 #: carry no claim to verify, so they must never be reported as unsupported.
 _META_SENTENCE_MARKERS = (
@@ -913,6 +1244,7 @@ class ClaimEvidence:
     claim: str = ""
     section_index: int = -1
     field: str = ""
+    risk: str = "medium"
 
 
 def _claim_sentences(notes: object) -> Iterator[tuple[str, int, str]]:
@@ -1065,6 +1397,7 @@ def prose_claim_evidence(
                     claim=claim,
                     section_index=section_index,
                     field=field_path,
+                    risk=classify_claim_risk(claim),
                 )
             )
     return tuple(unsupported)

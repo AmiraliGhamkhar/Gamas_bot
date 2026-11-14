@@ -75,8 +75,11 @@ Logs never contain keys, prompts or transcript text. A job's live state moves
 through media, transcription, note generation, `validating_notes`,
 `compiling_notes` and delivery; the compile stage is only reported when the
 editorial pass really runs. A partial result is reported as `partial` with an
-`error_kind` (`notes_quality`, `notes_incomplete`, `notes`, `pdf`, …) on the
-submission.
+`error_kind` (`notes_quality`, `notes_incomplete`, `notes_structure`,
+`booklet_partial`, `notification`, `notes`, `pdf`, …) on the submission. Failed or
+interrupted work with a saved non-empty transcript is recovered as `partial`;
+billing settlement or a delivery timestamp alone does not prove transcript
+persistence.
 Environment changes need a restart.
 
 ## Backup and restore

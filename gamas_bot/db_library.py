@@ -58,8 +58,9 @@ class LibraryRepositoryMixin(DatabaseCore):
         finished = now if status in TERMINAL_SUBMISSION_STATUSES else None
         started = now if status == "processing" else None
         await self._write(
-            "UPDATE submissions SET status = CASE WHEN ? = 'failed' AND delivered_at IS NOT NULL "
-            "THEN 'partial' ELSE ? END, error = ?, "
+            "UPDATE submissions SET status = CASE WHEN ? = 'failed' AND EXISTS ("
+            "SELECT 1 FROM transcriptions t WHERE t.submission_id = submissions.submission_id "
+            "AND length(trim(COALESCE(t.text, ''))) > 0) THEN 'partial' ELSE ? END, error = ?, "
             "error_kind = COALESCE(error_kind, ?), "
             "duration_seconds = COALESCE(?, duration_seconds), "
             "started_at = CASE WHEN ? = 'processing' THEN COALESCE(started_at, ?) ELSE started_at END, "

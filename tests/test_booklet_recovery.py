@@ -26,6 +26,7 @@ from gamas_bot.notes import (
     deterministic_fallback_notes,
     gate_notes,
     repair_improves,
+    scrub_unsupported_content,
     structure_document,
 )
 from tests.support import make_settings
@@ -46,6 +47,38 @@ def notes_with(*paragraphs: str) -> StructuredNotes:
 
 
 class RepairIssueTests(unittest.TestCase):
+    def test_occurrence_scrub_removes_only_an_unsupported_number(self):
+        source = "سگ هنگام باران از پارک دور می‌شود و می‌خوابد."
+        notes = notes_with("سگ هنگام باران ۷۵ بار از پارک دور می‌شود و می‌خوابد.")
+        gated, report = gate_notes(notes, source)
+        self.assertEqual([signal.value for signal in report.audit.fabricated], ["75"])
+
+        scrubbed, removed = scrub_unsupported_content(gated, report, source=source)
+        self.assertEqual(removed, 1)
+        paragraph = scrubbed.sections[0].paragraphs[0]
+        self.assertIn("سگ هنگام باران از پارک دور می‌شود", paragraph)
+        self.assertIn("می‌خوابد", paragraph)
+        self.assertNotIn("۷۵", paragraph)
+        _, final_report = gate_notes(scrubbed, source)
+        self.assertFalse(final_report.audit.fabricated)
+        self.assertFalse(final_report.unsupported_claims)
+
+    def test_unsupported_high_risk_clause_is_removed_as_a_unit(self):
+        source = "کلیه خون را فیلتر می‌کند و کراتینین دفع می‌شود."
+        notes = notes_with(
+            "کلیه خون را فیلتر می‌کند و بیمار باید ۷۵۰ میلی‌گرم مصرف کند."
+        )
+        gated, report = gate_notes(notes, source)
+        scrubbed, removed = scrub_unsupported_content(gated, report, source=source)
+        self.assertGreater(removed, 0)
+        paragraph = scrubbed.sections[0].paragraphs[0]
+        self.assertIn("کلیه خون را فیلتر می‌کند", paragraph)
+        self.assertNotIn("۷۵۰", paragraph)
+        self.assertNotIn("بیمار باید", paragraph)
+        _, final_report = gate_notes(scrubbed, source)
+        self.assertFalse(final_report.audit.fabricated)
+        self.assertFalse(final_report.unsupported_claims)
+
     def test_perfect_booklet_has_no_repair_issue(self):
         _, report = gate_notes(notes_with(SOURCE), SOURCE)
         self.assertEqual(build_repair_issues(notes_with(SOURCE), report, SOURCE), ())
@@ -195,7 +228,7 @@ class FallbackAndCompileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(notes.quality_state, QUALITY_RECOVERED)
         self.assertIn("HbA1c", notes.to_json())
 
-    async def test_compile_loss_of_coverage_is_rejected(self):
+    async def test_compile_loss_of_coverage_is_delivered_degraded(self):
         baseline = notes_with(SOURCE)
         compiled = notes_with("دوز آغازین بررسی شد.")
         _, report = gate_notes(baseline, SOURCE)
@@ -203,7 +236,9 @@ class FallbackAndCompileTests(unittest.IsolatedAsyncioTestCase):
         accepted = notes_mod._gate_compiled(
             compiled, baseline, report, SOURCE, settings, mode="full"
         )
-        self.assertIsNone(accepted)
+        self.assertIsNotNone(accepted)
+        assert accepted is not None
+        self.assertEqual(accepted.quality_state, QUALITY_DEGRADED)
 
     async def test_compile_fabrication_is_rejected(self):
         baseline = notes_with("دوز آغازین 500 mg است.")
@@ -219,7 +254,7 @@ class FallbackAndCompileTests(unittest.IsolatedAsyncioTestCase):
 class StrictFillAndFinalSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_strict_grounding_still_executes_completeness_fill(self):
         draft = {
-            "title": "درس",
+            "title": "مرور درمان و دارو",
             "summary": "خلاصه",
             "key_points": ["نکته"],
             "glossary": [{"term": "HbA1c", "definition": "اصطلاح منبع"}],

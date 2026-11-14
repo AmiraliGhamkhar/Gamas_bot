@@ -49,6 +49,24 @@ class BillingRepositoryMixin(DatabaseCore):
             (user_id, at, at, before_id, before_id),
         )
 
+    async def _backfill_failed_transcript_status_locked(self) -> None:
+        """Upgrade old failed rows when their non-empty transcript was saved."""
+        if await _rows(
+            self.db,
+            "SELECT 1 FROM billing_migrations WHERE name = 'failed_transcript_partial_v1'",
+        ):
+            return
+        await self.db.execute(
+            "UPDATE submissions SET status = 'partial' "
+            "WHERE status = 'failed' AND EXISTS ("
+            "SELECT 1 FROM transcriptions t "
+            "WHERE t.submission_id = submissions.submission_id "
+            "AND length(trim(COALESCE(t.text, ''))) > 0)"
+        )
+        await self.db.execute(
+            "INSERT INTO billing_migrations(name) VALUES ('failed_transcript_partial_v1')"
+        )
+
     async def _backfill_allocations(self) -> None:
         """Replay legacy usage once, without ever charging future purchases."""
         async with self._transaction():
@@ -56,6 +74,7 @@ class BillingRepositoryMixin(DatabaseCore):
                 self.db,
                 "SELECT 1 FROM billing_migrations WHERE name = 'credit_lots_v1'",
             ):
+                await self._backfill_failed_transcript_status_locked()
                 return
             events = await _rows(
                 self.db,
@@ -104,12 +123,9 @@ class BillingRepositoryMixin(DatabaseCore):
                 "(SELECT submission_id FROM holds WHERE settled = 1)"
             )
             await self.db.execute(
-                "UPDATE submissions SET status = 'partial' "
-                "WHERE status = 'failed' AND delivered_at IS NOT NULL"
-            )
-            await self.db.execute(
                 "INSERT INTO billing_migrations(name) VALUES ('credit_lots_v1')"
             )
+            await self._backfill_failed_transcript_status_locked()
 
     async def _refresh_balance_locked(self, user_id: int) -> int:
         """Recompute the cache from authoritative allocations inside the current write."""

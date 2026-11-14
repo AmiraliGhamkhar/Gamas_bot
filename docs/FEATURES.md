@@ -8,9 +8,10 @@ truncated — split the source instead.
 
 Send audio, video or a Telegram voice/video note.
 
-- The **raw transcript is always delivered first** as a `.txt` file (fallback:
-  up to 8 files of 100 000 characters each). Booklet generation happens after it
-  and can fail without losing the transcript.
+- The raw transcript is persisted before booklet generation and offered from the
+  final results screen; it is not pushed as an automatic file. A booklet failure
+  does not erase the transcript. If the results notification itself fails, the
+  stored work remains available and the submission is marked `partial`.
 - Upload cap `MAX_FILE_SIZE=1073741824` (1 GiB), duration
   `MAX_MEDIA_DURATION_SECONDS=7200` (2 hours). Unmeasurable duration is refused
   before any credit is held.
@@ -53,9 +54,13 @@ merge, split/repair and grounding gates remain enabled as configured. See
 - Nothing is pushed automatically: the final message lists what was produced and
   offers one button per artifact. Re-downloading is free and never re-renders.
 - Quality gates (`NOTE_STRICT_GROUNDING`, `NOTE_QUALITY_GATE`,
-  `NOTE_COMPLETENESS_FILL`) remove unsupported numbers and reject truncated or
-  malformed model output. They cannot prove every sentence is correct — review
-  medical, legal or safety material manually.
+  `NOTE_COMPLETENESS_FILL`) repair and re-audit claims, remove unsupported local
+  spans (whole high-risk medical clauses when needed), and use a deterministic
+  source-only outline when the model result cannot be made safe. Structural
+  validation runs before rendering. Safe omissions are delivered as `partial`
+  with a notice; unsafe or unusable structure is never rendered. These checks
+  cannot prove semantic correctness — review medical, legal or safety material
+  manually.
 - `NOTE_MODE` is a legacy no-op: audio booklets are always full booklets; compact
   revision notes are a separate document action.
 

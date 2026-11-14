@@ -521,7 +521,10 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
             )
             for row in recovered:
                 await self.db.execute(
-                    "UPDATE submissions SET status = CASE WHEN delivered_at IS NOT NULL "
+                    "UPDATE submissions SET status = CASE WHEN EXISTS ("
+                    "SELECT 1 FROM transcriptions t "
+                    "WHERE t.submission_id = submissions.submission_id "
+                    "AND length(trim(COALESCE(t.text, ''))) > 0) "
                     "THEN 'partial' ELSE 'failed' END, error = 'interrupted by restart', "
                     "error_kind = COALESCE(error_kind, 'cancelled'), "
                     "finished_at = ? WHERE submission_id = ?",

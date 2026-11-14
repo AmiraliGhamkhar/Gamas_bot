@@ -119,21 +119,26 @@ real patient data in fixtures or smoke tests. See [Security](SECURITY.md).
 
 ### Booklet acceptance
 
-A booklet is delivered only when it is **faithful**; it is announced as
-*complete* only when it is also **complete**:
+A rendered booklet must be **faithful and structurally valid**; only a booklet
+that also meets the completeness checks is announced as complete:
 
 | Outcome | Rule | Result |
 | --- | --- | --- |
-| Rejected — `unsupported_facts` | a number, date, unit or Latin term the source does not contain survives the bounded repair and the numeric scrub | transcript kept, `partial`, `error_kind=notes_quality` |
-| Rejected — `unsupported_claims` | a section sentence shares less than 20 % of its content words with any source sentence (claim-level prose evidence; see below) | transcript kept, `partial`, `error_kind=notes_quality` |
-| Delivered, incomplete | an accepted booklet still omits source numbers or technical terms after two repair attempts | booklet delivered, `partial`, `error_kind=notes_incomplete`, notice names the gap |
-| Delivered, complete | no fabricated signal, no unsupported claim, and no omitted number/term above the mode's floors | `done` |
+| Recovered/scrubbed | Unsupported signals or claims are removed locally; if that cannot leave a safe booklet, the default source-only fallback is audited instead | Safe booklet delivered as `partial`, with a `notes_recovered` or `notes_degraded` notice |
+| Delivered, incomplete | The safe booklet omits source numbers/terms or has low sentence coverage after bounded repair | Booklet delivered as `partial`; the notice names the gap (or says coverage is incomplete) |
+| Structure unavailable | The source is unusable or no renderable structure can be recovered | Raw transcript retained; no booklet is rendered, and the results screen explains the failure |
+| Delivered, complete | Mandatory structure is valid, no fabricated signal or unsupported claim remains, and no diagnostic completeness gap remains | `done` |
 
-The prose check is deliberately lexical: it refuses a sentence with *no*
-vocabulary in common with the lecture, and never claims semantic entailment.
-Paraphrase, reordering and standard equivalents pass; an invented Persian-only
-statement does not. Offsets of the closest source sentence are kept on the
-report (`ClaimEvidence.span`) and only counts are logged — never the text.
+Safe compile output is not discarded merely for lower section/character ratios;
+source omissions are measured by the evidence/completeness audit and reported as
+partial. A malformed or empty structure is still withheld at the render boundary.
+
+The prose check is deliberately lexical: it flags a sentence with *no*
+vocabulary in common with the lecture for repair or removal, and never claims
+semantic entailment. Paraphrase, reordering and standard equivalents pass; an
+invented Persian-only statement does not. Offsets of the closest source sentence
+are kept on the report (`ClaimEvidence.span`) and only counts are logged — never
+the text.
 
 The booklet pipeline classifies its source once (`NOTE_DATA_SENSITIVITY`,
 `auto` by default) and reuses that one label for generation, repair, coverage

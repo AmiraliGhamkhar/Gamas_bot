@@ -78,14 +78,20 @@ from .llm import (
     complete_json,
 )
 from .notes_evidence import (
+    MIN_CLAIM_SUPPORT,
     NoteQualityReport,
+    Signal,
     SignalAudit,
     audit_notes,
+    classify_claim_risk,
     build_source_index,
     content_words,
     coverage_thresholds,
     evidence_windows,
+    extract_number_occurrences,
     extract_signals,
+    extract_term_occurrences,
+    mask_structural,
     prose_claim_evidence,
     sentence_coverage,
     split_sentences,
@@ -117,12 +123,6 @@ EDIT_MESSAGE_RESERVE_CHARS = 4096
 #: :func:`effective_compile_max_chars`); ``NOTE_COMPILE_MAX_CHARS`` can further
 #: lower that budget when an operator sets it explicitly.
 COMPILE_HARD_MAX_CHARS = 160000
-#: The compile result must keep at least this share of the merged sections.
-COMPILE_MIN_SECTION_RATIO = 0.5
-#: Minimum body-character retention when compiling substantive sections.
-COMPILE_MIN_CONTENT_RATIO = 0.35
-#: Average body characters per section above which prose-loss gating applies.
-COMPILE_SUBSTANTIVE_SECTION_CHARS = 400
 #: The deterministic digest/neighbour bounds. They live in the prompt module
 #: because the chunk-context reserve is derived from them; ``notes`` re-exports
 #: them so existing callers keep one import site.
@@ -1501,9 +1501,12 @@ def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
 
 def _load_json_payload(payload: dict, *, mode: str = "full") -> StructuredNotes:
     try:
-        return StructuredNotes.from_payload(payload)
+        notes = StructuredNotes.from_payload(payload)
     except (KeyError, TypeError) as exc:
         raise StructuringError("پاسخ سرویس تولید جزوه ساختار معتبری نداشت.") from exc
+    if not notes.sections:
+        raise StructuringError("ساختار پاسخ جزوه بخش آموزشیِ قابل‌خواندن نداشت.")
+    return notes
 
 
 # ===========================================================================
@@ -2033,42 +2036,20 @@ def _notes_body_chars(notes: StructuredNotes) -> int:
 
 
 def compile_accepts(compiled: StructuredNotes, merged: StructuredNotes) -> bool:
-    """The deterministic acceptance gate for the compile answer.
+    """Check mandatory shape before the source-aware post-compile audit.
 
-    Restructuring may tighten prose and merge sections, but a result that guts
-    the booklet is rejected and the deterministic merge is delivered instead.
+    Safe but incomplete editorial output remains eligible for delivery: the
+    evidence/completeness report marks omissions as partial instead of replacing
+    the entire booklet solely because a lexical or size ratio declined.
+    ``merged`` remains in the signature for compatibility with older callers.
     """
+    _ = merged
     if not compiled.has_content or not compiled.sections:
         return False
-    if not merged.sections:
-        return True
-    ratio = len(compiled.sections) / len(merged.sections)
-    if ratio < COMPILE_MIN_SECTION_RATIO:
-        logger.warning(
-            "compile rejected: section ratio %.2f (%d -> %d)",
-            ratio, len(merged.sections), len(compiled.sections),
-        )
-        return False
-    merged_structured = _notes_structured_item_count(merged)
-    if merged_structured >= 2:
-        compiled_structured = _notes_structured_item_count(compiled)
-        structured_ratio = compiled_structured / merged_structured
-        if structured_ratio < COMPILE_MIN_SECTION_RATIO:
-            logger.warning(
-                "compile rejected: structured item ratio %.2f (%d -> %d)",
-                structured_ratio, merged_structured, compiled_structured,
-            )
-            return False
-    merged_chars = _notes_body_chars(merged)
-    if merged_chars / len(merged.sections) >= COMPILE_SUBSTANTIVE_SECTION_CHARS:
-        compiled_chars = _notes_body_chars(compiled)
-        char_ratio = compiled_chars / merged_chars if merged_chars else 1.0
-        if char_ratio < COMPILE_MIN_CONTENT_RATIO:
-            logger.warning(
-                "compile rejected: body char ratio %.2f (%d -> %d)",
-                char_ratio, merged_chars, compiled_chars,
-            )
-            return False
+    # Completeness is diagnosed by the evidence audit after compile. A terse
+    # editorial answer is preferable to rejecting a safe booklet outright.
+    # Keep only mandatory structure here; unsafe claims still pass through the
+    # bounded audit/repair/salvage path below.
     return True
 
 
@@ -2236,22 +2217,13 @@ def notes_need_repair(report: NoteQualityReport, *, mode: str = "full") -> bool:
 
 
 def acceptance_failure(report: NoteQualityReport) -> str | None:
-    """The hard acceptance rule for a finished booklet, or ``None``.
+    """Whether unsafe assertions remain after repair/salvage.
 
-    Acceptance is about *faithfulness*, not recall: a booklet may be delivered
-    with a diagnosed omission (see :func:`completeness_failure`, which turns it
-    into a partial result) but never with a claim the source does not support.
-
-    Two faithfulness failures reject a booklet:
-
-    * ``unsupported_facts`` — a number, date, unit or term absent from the
-      source (the strict signal audit);
-    * ``unsupported_claims`` — a prose sentence that shares no vocabulary with
-      any source sentence (see :func:`gamas_bot.notes_evidence.prose_claim_evidence`).
-
-    Recall floors and sentence coverage stay repair signals, because a
-    legitimate paraphrase is not disproof and must not reject an otherwise
-    grounded booklet.
+    Missing source information and sentence-coverage proxies are completeness
+    signals, never hard rejection rules. Fabricated numbers/terms/URLs and prose
+    claims with no source vocabulary must first be corrected or removed; the
+    pipeline then falls back to the source-preserving booklet rather than
+    rejecting the whole document.
     """
     if report.audit.fabricated:
         return "unsupported_facts"
@@ -2260,23 +2232,64 @@ def acceptance_failure(report: NoteQualityReport) -> str | None:
     return None
 
 
-def completeness_failure(report: NoteQualityReport, *, mode: str = "full") -> str | None:
-    """Why an accepted booklet is incomplete, or ``None`` when it is not.
+ACCEPTANCE_COMPLETE = "COMPLETE"
+ACCEPTANCE_PARTIAL = "PARTIAL"
+ACCEPTANCE_REJECTED = "REJECTED"
 
-    Faithfulness and completeness are different questions, so they produce
-    different outcomes: an unsupported claim rejects the booklet, while a
-    diagnosed omission that survived the bounded repair cannot be repaired any
-    further. It is delivered — the transcript is the user's source of truth —
-    but never as a *fully verified* booklet: the caller is told, the job ends
-    ``partial`` and the notice names the gap.
+
+def structurally_valid_booklet(notes: StructuredNotes) -> bool:
+    """Mandatory schema/content check shared by renderers and final acceptance."""
+    if not notes.title.strip() or normalize_for_compare(notes.title) in _GENERIC_BOOKLET_TITLES:
+        return False
+    if not notes.sections or not notes.has_content:
+        return False
+    for section in notes.sections:
+        if not section.heading.strip():
+            return False
+        if not section_plain_text(replace(section, heading="")).strip():
+            return False
+    return True
+
+
+def assess_booklet_acceptance(
+    notes: StructuredNotes,
+    report: NoteQualityReport,
+    *,
+    mode: str = "full",
+) -> str:
+    """Return COMPLETE, PARTIAL or REJECTED after local safety salvage.
+
+    REJECTED is reserved for malformed structure or unresolved unsafe claims.
+    Low lexical/sentence coverage and omitted source detail only downgrade the
+    result to PARTIAL, preserving a safe structured deliverable.
     """
-    number_floor, term_floor = coverage_thresholds(resolve_note_mode(mode))
+    if not structurally_valid_booklet(notes) or acceptance_failure(report) is not None:
+        return ACCEPTANCE_REJECTED
+    if (
+        notes.quality_state in {QUALITY_DEGRADED, QUALITY_RECOVERED}
+        or report.audit.missing
+        or report.coverage.ratio < 0.75
+        or completeness_failure(report, mode=mode) is not None
+    ):
+        return ACCEPTANCE_PARTIAL
+    return ACCEPTANCE_COMPLETE
+
+
+def completeness_failure(report: NoteQualityReport, *, mode: str = "full") -> str | None:
+    """A user-facing PARTIAL reason, never a hard acceptance rejection.
+
+    Recall floors and lexical sentence coverage are diagnostic only. They may
+    trigger a bounded repair or a partial-result notice, but do not make a safe
+    structured booklet disappear.
+    """
+    _ = resolve_note_mode(mode)  # retained for API compatibility
     audit = report.audit
-    missing_numbers = [signal for signal in audit.missing if signal.kind == "number"]
-    if missing_numbers:
+    if any(signal.kind == "number" for signal in audit.missing):
         return "missing_numbers"
-    if audit.number_coverage < number_floor or audit.term_coverage < term_floor:
+    if audit.missing:
         return "missing_terms"
+    if report.coverage.ratio < 0.75:
+        return "low_sentence_coverage"
     return None
 
 
@@ -2392,6 +2405,7 @@ def build_repair_issues(
     for signal in audit.fabricated:
         section_index, field, current = _signal_occurrence(notes, signal)
         code = REPAIR_WRONG_NUMBER if signal.kind == "number" else REPAIR_WRONG_TERM
+        risk = classify_claim_risk(current or signal.label)
         issues.append(
             RepairIssue(
                 code=code,
@@ -2403,11 +2417,11 @@ def build_repair_issues(
                 action="REMOVE_OR_REWRITE_FROM_SOURCE",
                 source_signal_metadata=(
                     ("kind", signal.kind), ("label", signal.label),
-                    ("value", signal.value), ("unit", signal.unit),
+                    ("value", signal.value), ("unit", signal.unit), ("risk", risk),
                 ),
             )
         )
-    for claim in report.unsupported_claims:
+    for claim in sorted(report.unsupported_claims, key=lambda item: item.risk != "high"):
         source_evidence = source[claim.span[0]:claim.span[1]].strip() if claim.span[1] else ""
         issues.append(
             RepairIssue(
@@ -2418,7 +2432,9 @@ def build_repair_issues(
                 current_text=claim.claim[:1_000],
                 source_evidence=source_evidence[:1_000],
                 action="REMOVE_OR_REWRITE_FROM_SOURCE",
-                source_signal_metadata=(("shared_ratio", f"{claim.shared_ratio:.3f}"),),
+                source_signal_metadata=(
+                    ("shared_ratio", f"{claim.shared_ratio:.3f}"), ("risk", claim.risk)
+                ),
             )
         )
     for signal in audit.missing:
@@ -2483,9 +2499,12 @@ def build_repair_issues(
         if key not in seen:
             seen.add(key)
             unique.append(issue)
-        if len(unique) >= max(1, limit):
-            break
-    return tuple(unique)
+    # High-risk medical assertions lead the bounded request, irrespective of
+    # how many lower-risk term/coverage findings appeared before them.
+    unique.sort(
+        key=lambda issue: dict(issue.source_signal_metadata).get("risk") != "high"
+    )
+    return tuple(unique[:max(1, limit)])
 
 
 def _repair_issues_for_pass(issues: Sequence[RepairIssue], pass_name: str) -> tuple[RepairIssue, ...]:
@@ -2584,6 +2603,11 @@ def build_repair_document(
         issue_labels.append("### موارد جامانده از جزوه: فقط با شاهد منبعِ همان مسئله برگردانید.")
     if any(issue.code in REPAIR_CRITICAL_CODES for issue in selected_issues):
         issue_labels.append("### مواردی که در متن منبع نیست: حذف کنید یا فقط با شاهد درست بازنویسی کنید.")
+    if any(dict(issue.source_signal_metadata).get("risk") == "high" for issue in selected_issues):
+        issue_labels.append(
+            "### اولویت ایمنی پزشکی: برای دوز، درمان، تشخیص یا آستانهٔ بالینی "
+            "بدون شاهد دقیق فقط حذف کنید؛ مقدار یا توصیهٔ جایگزین نسازید."
+        )
     return "\n\n".join(
         tuple(issue_labels) + (
             "### فرمان تعمیر\n"
@@ -2605,44 +2629,162 @@ def build_repair_document(
 
 
 _SCRUB_SENTENCE = re.compile(r"(?<=[.!?؟…])\s+")
+_SCRUB_LOCAL_CLAUSE = re.compile(
+    r"(?<=[،,؛;:])\s+|\s+(?=(?:و|اما|ولی|بلکه|سپس|همچنین|and|but|then)\s+)",
+    re.IGNORECASE,
+)
+_SCRUB_LEADING_CONNECTOR = re.compile(
+    r"^(?:و|اما|ولی|بلکه|سپس|همچنین|and|but|then)\s+", re.IGNORECASE
+)
+
+
+def _scrub_occurrence_matches(
+    occurrence: Signal,
+    rejected: frozenset[Signal | str],
+) -> bool:
+    for item in rejected:
+        if isinstance(item, Signal):
+            if (
+                item.kind == occurrence.kind
+                and item.value == occurrence.value
+                and (item.kind != "number" or item.unit == occurrence.unit)
+            ):
+                return True
+        elif item == occurrence.value:
+            # Compatibility for older callers that supplied a value-only set.
+            return True
+    return False
+
+
+def _clause_has_source_support(
+    clause: str, source_sentence_words: Sequence[frozenset[str]]
+) -> bool:
+    words = content_words(clause)
+    if not words:
+        return True
+    if not source_sentence_words:
+        return False
+    return max(
+        (len(words & source_words) / len(words) for source_words in source_sentence_words),
+        default=0.0,
+    ) >= MIN_CLAIM_SUPPORT
+
+
+def _remove_local_spans(text: str, spans: Sequence[tuple[int, int]]) -> str:
+    if not spans:
+        return text
+    chars = list(text)
+    for start, end in sorted(set(spans), reverse=True):
+        for index in range(max(0, start), min(len(chars), end)):
+            if chars[index] not in "\r\n":
+                chars[index] = " "
+    cleaned = "".join(chars)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\(\s*\)|\[\s*\]", "", cleaned)
+    cleaned = re.sub(r"\s+([،,؛;:])", r"\1", cleaned)
+    cleaned = re.sub(r"([،,؛;:])\s*([،,؛;:])", r"\1", cleaned)
+    return cleaned.strip()
 
 
 def _scrub_text(
     text: str,
     *,
-    fabricated_numbers: frozenset[str] = frozenset(),
-    fabricated_terms: frozenset[str] = frozenset(),
+    fabricated_numbers: frozenset[Signal | str] = frozenset(),
+    fabricated_terms: frozenset[Signal | str] = frozenset(),
     unsupported_claims: frozenset[str] = frozenset(),
+    source: str = "",
 ) -> tuple[str, int]:
-    """Remove only source-disproved sentences; retain every other span intact."""
+    """Remove only the unsupported local fact/claim; retain adjacent content.
+
+    Numeric and term matchers now target exact occurrence spans (including
+    Persian number words and units). Independent clauses are salvaged locally;
+    only a high-risk medical clause is removed as a unit when it contains an
+    unsupported assertion. Claim-level removal is separately checked against
+    source clauses so one unsupported clause cannot erase a supported neighbor.
+    """
     if not text or not (fabricated_numbers or fabricated_terms or unsupported_claims):
         return text, 0
-    kept: list[str] = []
+    source_sentence_words = [
+        content_words(sentence) for sentence in split_sentences(source)
+    ]
+    if not source_sentence_words and source:
+        source_sentence_words = [content_words(source)]
+    normalized_claims = {
+        " ".join(normalize_for_compare(claim).split())
+        for claim in unsupported_claims
+        if claim.strip()
+    }
+    kept_sentences: list[str] = []
     removed = 0
     for sentence in _SCRUB_SENTENCE.split(text):
         stripped = sentence.strip()
         if not stripped:
             continue
-        signals = extract_signals(stripped, mask=False)
-        has_fabricated_signal = any(
-            (signal.kind == "number" and signal.value in fabricated_numbers)
-            or (signal.kind in ("term", "url") and signal.value in fabricated_terms)
-            for signal in signals
+        normalized_sentence = " ".join(normalize_for_compare(stripped).split())
+        sentence_is_unsupported = any(
+            claim and (normalized_sentence == claim or claim in normalized_sentence)
+            for claim in normalized_claims
         )
-        normalized = normalize_for_compare(stripped)
-        has_unsupported_claim = any(
-            claim and (normalized == claim or claim in normalized)
-            for claim in unsupported_claims
-        )
-        if has_fabricated_signal or has_unsupported_claim:
-            removed += 1
+        clauses = [part.strip() for part in _SCRUB_LOCAL_CLAUSE.split(stripped) if part.strip()]
+        if not clauses:
             continue
-        kept.append(stripped)
-    return " ".join(kept), removed
+        kept_clauses: list[str] = []
+        prior_clause_removed = False
+        for clause in clauses:
+            if sentence_is_unsupported and source:
+                if not _clause_has_source_support(clause, source_sentence_words):
+                    removed += 1
+                    prior_clause_removed = True
+                    continue
+            elif sentence_is_unsupported:
+                removed += 1
+                prior_clause_removed = True
+                continue
+
+            number_hits = [
+                occurrence
+                for occurrence in extract_number_occurrences(clause, mask=False)
+                if _scrub_occurrence_matches(occurrence.signal, fabricated_numbers)
+            ]
+            term_hits = [
+                occurrence
+                for occurrence in extract_term_occurrences(clause)
+                if _scrub_occurrence_matches(occurrence.signal, fabricated_terms)
+            ]
+            if (number_hits or term_hits) and classify_claim_risk(clause) == "high":
+                # For dose/treatment/diagnosis/threshold assertions, keeping the
+                # surrounding imperative or condition without its value can
+                # itself be unsafe. The clause split protects neighboring facts.
+                removed += 1
+                prior_clause_removed = True
+                continue
+            spans = [
+                (occurrence.start, occurrence.end)
+                for occurrence in (*number_hits, *term_hits)
+            ]
+            cleaned = _remove_local_spans(clause, spans)
+            removed += len(set(spans))
+            if not cleaned:
+                prior_clause_removed = True
+                continue
+            if prior_clause_removed:
+                cleaned = _SCRUB_LEADING_CONNECTOR.sub("", cleaned).strip()
+            kept_clauses.append(cleaned)
+            prior_clause_removed = False
+        if kept_clauses:
+            # A removed clause can leave a separator hanging at the join point;
+            # trim only that punctuation and preserve the remaining words.
+            kept_clauses[-1] = kept_clauses[-1].rstrip(" ،,؛;:")
+            sentence_result = " ".join(part for part in kept_clauses if part).strip()
+            if sentence_result:
+                kept_sentences.append(sentence_result)
+    if removed == 0:
+        return text, 0
+    return " ".join(kept_sentences), removed
 
 
 def scrub_unsupported_content(
-    notes: StructuredNotes, report: NoteQualityReport
+    notes: StructuredNotes, report: NoteQualityReport, *, source: str = ""
 ) -> tuple[StructuredNotes, int]:
     """Deterministically remove source-disproved claims without gutting a draft.
 
@@ -2651,10 +2793,10 @@ def scrub_unsupported_content(
     prose claims, unlike the former number-only scrub.
     """
     fabricated_numbers = frozenset(
-        signal.value for signal in report.audit.fabricated if signal.kind == "number"
+        signal for signal in report.audit.fabricated if signal.kind == "number"
     )
     fabricated_terms = frozenset(
-        signal.value for signal in report.audit.fabricated if signal.kind in ("term", "url")
+        signal for signal in report.audit.fabricated if signal.kind in ("term", "url")
     )
     unsupported_claims = frozenset(
         normalize_for_compare(claim.claim)
@@ -2672,6 +2814,7 @@ def scrub_unsupported_content(
             fabricated_numbers=fabricated_numbers,
             fabricated_terms=fabricated_terms,
             unsupported_claims=unsupported_claims,
+            source=source,
         )
         removed += count
         return cleaned
@@ -2707,7 +2850,9 @@ def scrub_unsupported_content(
             ]
             rows = [row for row in rows if any(cell.strip() for cell in row)]
             if rows:
-                tables.append(replace(table, headers=headers, rows=rows))
+                tables.append(
+                    replace(table, caption=scrub(table.caption), headers=headers, rows=rows)
+                )
         cleaned = replace(
             section,
             heading=scrub(section.heading) or f"بخش {to_persian_digits(section_index)}",
@@ -2727,8 +2872,9 @@ def scrub_unsupported_content(
     tips_list: list[PracticalTip] = []
     for tip in notes.practical_tips:
         cleaned_tip = scrub(tip.text)
-        if cleaned_tip.strip():
-            tips_list.append(replace(tip, text=cleaned_tip))
+        cleaned_basis = scrub(tip.basis)
+        if cleaned_tip.strip() and cleaned_basis.strip():
+            tips_list.append(replace(tip, text=cleaned_tip, basis=cleaned_basis))
     tips = tuple(tips_list)
     glossary_list: list[GlossaryEntry] = []
     for glossary_entry in notes.glossary:
@@ -2753,6 +2899,8 @@ def scrub_unsupported_content(
         review_questions=scrub_tuple(notes.review_questions),
         practical_tips=tips,
         glossary=glossary,
+        speakers=scrub_tuple(notes.speakers),
+        timeline=scrub_tuple(notes.timeline),
         quality_state=QUALITY_DEGRADED,
     )
     if removed:
@@ -2815,6 +2963,51 @@ def repair_improves(candidate: NoteQualityReport, current: NoteQualityReport) ->
 
 _FALLBACK_LOCATOR = re.compile(r"\[([^\]\n]{1,120})\]")
 _FALLBACK_HEADING = re.compile(r"^\s*#{1,6}\s+([^\n]{1,200})", re.MULTILINE)
+_GENERIC_BOOKLET_TITLES = frozenset(
+    normalize_for_compare(value)
+    for value in ("جزوه", "جزوهٔ منبع", "جزوهٔ کلاس", "درس", "عنوان", "عنوان جزوه", "untitled")
+)
+
+
+def is_usable_transcript(source: str) -> bool:
+    """Whether source has any readable substance for a source-only booklet.
+
+    Keep this deliberately permissive: short, valid spoken passages must not be
+    rejected by a completeness heuristic. Strip only pure locator/structural
+    scaffolding, then require at least one word or hard source signal.
+    """
+    raw = (source or "").strip()
+    if len(raw) < 2:
+        return False
+    material = _FALLBACK_LOCATOR.sub(" ", raw)
+    material = mask_structural(material)
+    material = re.sub(
+        r"(?:متن پیاده.?سازی.?شده.? صدای ارائه|گفتار بدون نگاشت مطمئن به اسلاید)",
+        " ", material, flags=re.IGNORECASE,
+    )
+    folded = normalize_for_compare(material)
+    has_letters = any(char.isalpha() for char in folded)
+    return has_letters and bool(content_words(folded) or extract_signals(material))
+
+
+def _fallback_title(source: str) -> str:
+    """Derive a short source-only title; never invent a subject label."""
+    for match in _FALLBACK_HEADING.finditer(source):
+        candidate = match.group(1).strip()
+        if not candidate or re.search(r"متن پیاده.?سازی|گفتار بدون نگاشت", candidate):
+            continue
+        candidate = re.sub(r"^(?:ادامهٔ\s+)?اسلاید\s+[0-9۰-۹٠-٩]+\s*[—–-]?\s*", "", candidate)
+        candidate = candidate.strip(" —–-:#")
+        if candidate:
+            return f"جزوهٔ {candidate[:80]}"
+    first = next((item.strip() for item in split_sentences(source) if item.strip()), "")
+    if not first:
+        first = next((line.strip() for line in source.splitlines() if line.strip()), "")
+    first = re.sub(r"^\s*#{1,6}\s*", "", first)
+    first = re.sub(r"\[[^\]\n]{1,120}\]", "", first).strip()
+    words = first.split()[:9]
+    subject = " ".join(words).strip(" .،؛:؟!?—–-")
+    return f"جزوهٔ {subject}" if subject else "جزوهٔ متن آموزشی"
 
 
 def _fallback_piece_boundaries(text: str, *, maximum: int = MAX_TEXT_CHARS) -> list[str]:
@@ -2861,8 +3054,8 @@ def deterministic_fallback_notes(
     citation while still being usable in the DOCX/PDF renderers.
     """
     raw = (source or "").strip()
-    if not raw:
-        raise StructuringError("متن ورودی خالی بود.")
+    if not is_usable_transcript(raw):
+        raise StructuringError("متن پیاده‌سازی‌شده برای ساخت جزوه محتوای قابل‌استفاده‌ای نداشت.")
     paragraphs: list[str] = []
     for block in re.split(r"\n\s*\n+", raw):
         paragraphs.extend(_fallback_piece_boundaries(block))
@@ -2910,11 +3103,45 @@ def deterministic_fallback_notes(
     if not sections:
         raise StructuringError("متن ورودی قابل‌استفاده نبود.")
     return StructuredNotes(
-        title=title.strip() or "جزوهٔ منبع",
+        title=title.strip() or _fallback_title(raw),
         sections=tuple(sections),
         quality_state=QUALITY_RECOVERED,
     )
 
+
+def ensure_structured_booklet(notes: StructuredNotes, source: str) -> StructuredNotes:
+    """Repair mandatory booklet structure locally, preserving source content.
+
+    A malformed/empty model shape is replaced with a source-preserving outline;
+    optional sections are never invented. The function is intentionally local
+    and deterministic so schema/format problems do not require another provider
+    call or turn a usable transcript into a failed job.
+    """
+    if not is_usable_transcript(source):
+        raise StructuringError("متن پیاده‌سازی‌شده برای ساخت جزوه محتوای قابل‌استفاده‌ای نداشت.")
+    sections: list[NoteSection] = []
+    changed = False
+    for index, section in enumerate(notes.sections, start=1):
+        body = section_plain_text(replace(section, heading="")).strip()
+        if not section.has_content or not body:
+            changed = True
+            continue
+        heading = section.heading.strip() or f"بخش {to_persian_digits(index)}"
+        if heading != section.heading:
+            changed = True
+        sections.append(replace(section, heading=heading))
+    if not sections:
+        return deterministic_fallback_notes(source)
+
+    title = notes.title.strip()
+    if not title or normalize_for_compare(title) in _GENERIC_BOOKLET_TITLES:
+        title = _fallback_title(source)
+        changed = True
+    if changed and notes.quality_state == QUALITY_VERIFIED:
+        state = QUALITY_REPAIRED
+    else:
+        state = notes.quality_state
+    return replace(notes, title=title, sections=tuple(sections), quality_state=state)
 
 
 # ===========================================================================
@@ -3156,19 +3383,41 @@ async def _audit_and_repair(
                 if not repeat_coverage or not notes_need_repair(report, mode=mode):
                     break
 
-    # A failed semantic repair is not a failed booklet. Remove only the exact
-    # source-disproved spans and re-audit the surviving valid content.
+    # A failed semantic repair is not a failed booklet. First remove only the
+    # exact disproved spans/claims and re-audit; if anything unsafe remains (or
+    # the local edits leave no valid structure), use the source-only fallback
+    # rather than reject an otherwise usable transcript.
     if acceptance_failure(report) is not None:
-        scrubbed, removed = scrub_unsupported_content(gated, report)
-        if removed and scrubbed.has_content:
-            gated, report = gate_notes(scrubbed, source, strict=True, mode=mode)
-            gated = replace(gated, quality_state=QUALITY_DEGRADED)
-            # A sentence-level removal can leave only metadata even when the
-            # source has plenty of usable material. Do not deliver an empty
-            # shell or destroy valid source facts: recover locally instead.
-            if not gated.sections and getattr(settings, "note_enable_deterministic_fallback", True):
-                gated = deterministic_fallback_notes(source)
-                gated, report = gate_notes(gated, source, strict=True, mode=mode)
+        scrubbed, removed = scrub_unsupported_content(gated, report, source=source)
+        signal_only_failure = bool(report.audit.fabricated) and not report.unsupported_claims
+        if removed:
+            try:
+                if scrubbed.sections:
+                    scrubbed = ensure_structured_booklet(scrubbed, source)
+            except StructuringError:
+                pass
+            if structurally_valid_booklet(scrubbed):
+                gated, report = gate_notes(scrubbed, source, strict=True, mode=mode)
+                quality = (
+                    QUALITY_RECOVERED
+                    if scrubbed.quality_state == QUALITY_RECOVERED or signal_only_failure
+                    else QUALITY_DEGRADED
+                )
+                gated = replace(gated, quality_state=quality)
+            else:
+                gated, report = scrubbed, report
+        if (
+            acceptance_failure(report) is not None
+            or not structurally_valid_booklet(gated)
+        ) and getattr(settings, "note_enable_deterministic_fallback", True):
+            fallback = deterministic_fallback_notes(source)
+            fallback, report = gate_notes(fallback, source, strict=True, mode=mode)
+            gated = replace(fallback, quality_state=QUALITY_RECOVERED)
+            logger.warning(
+                "note audit outcome=RECOVERED baseline=source_preserving_fallback "
+                "scrubbed_local_spans=%d",
+                removed,
+            )
     if notes_need_repair(report, mode=mode):
         logger.warning(
             "note repair complete attempts=%d unresolved=%d critical=%d quality=%s",
@@ -3177,6 +3426,13 @@ async def _audit_and_repair(
             _critical_issue_count(report),
             gated.quality_state,
         )
+    if not structurally_valid_booklet(gated):
+        if getattr(settings, "note_enable_deterministic_fallback", True):
+            fallback = deterministic_fallback_notes(source)
+            gated, report = gate_notes(fallback, source, strict=True, mode=mode)
+            gated = replace(gated, quality_state=QUALITY_RECOVERED)
+        else:
+            raise StructuringError("ساختار جزوه برای رندر معتبر نبود.")
     return enforce_final_acceptance(gated, report, mode=mode, stage="audit"), report
 
 def repair_request_document(
@@ -3446,34 +3702,23 @@ def _gate_compiled(
     *,
     mode: str,
 ) -> StructuredNotes | None:
-    """The editorial answer, unless it trades completeness for fluency."""
+    """Return a safe editorial answer; completeness loss is reported as partial."""
     if compiled is None:
         return None
     if not settings.note_strict_grounding:
         return compiled
     compiled, compiled_report = gate_notes(compiled, document, strict=True, mode=mode)
-    baseline = baseline_report
-    if baseline is None:
-        _, baseline = gate_notes(baseline_notes, document, strict=True, mode=mode)
-    # An answer that invents a fact, or that covers less of the source than the
-    # text it replaced, is rejected even if its shape looks better.
+    _ = baseline_report  # retained for API compatibility; completeness is absolute, not comparative
+    # Safety remains a hard gate. Lost source facts and lower lexical/sentence
+    # coverage are measured after compile, but only downgrade the final result;
+    # the already-safe editorial artifact is not discarded on completeness alone.
     if compiled_report.audit.fabricated or compiled_report.unsupported_claims:
         logger.warning("compiled notes rejected: they assert source-unsupported content")
         return None
-    if compiled_report.audit.coverage + 0.02 < baseline.audit.coverage:
-        logger.warning(
-            "compiled notes rejected: coverage %.2f < %.2f",
-            compiled_report.audit.coverage, baseline.audit.coverage,
-        )
-        return None
-    if compiled_report.coverage.ratio + 0.05 < baseline.coverage.ratio:
-        logger.warning(
-            "compiled notes rejected: sentence coverage %.2f < %.2f",
-            compiled_report.coverage.ratio, baseline.coverage.ratio,
-        )
-        return None
     if baseline_notes.quality_state != QUALITY_VERIFIED:
         return replace(compiled, quality_state=baseline_notes.quality_state)
+    if completeness_failure(compiled_report, mode=mode) is not None:
+        return replace(compiled, quality_state=QUALITY_DEGRADED)
     return compiled
 
 
@@ -4057,6 +4302,9 @@ async def structure_document(
         mode=mode, presentation=presentation, on_merged=on_merged,
         source_locators=source_locators, on_stage=on_stage,
     )
+    notes = ensure_structured_booklet(notes, document.strip())
+    if not structurally_valid_booklet(notes):
+        raise StructuringError("جزوهٔ تولیدشده ساختار لازم برای رندر نداشت.")
     if on_incomplete is None or not settings.note_strict_grounding:
         return notes
     _, report = gate_notes(notes, document.strip(), strict=False, mode=mode)
