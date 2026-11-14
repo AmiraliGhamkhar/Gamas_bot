@@ -66,6 +66,7 @@ from .jobs import Job
 from .learning import MAX_MODEL_INPUT_CHARS, SIZE_PRESETS, bound_content_text, preset_cards
 from .media import MediaToolError, convert_to_pptx
 from .notes import StructuringError
+from .review_sheet import generate_review_sheet
 from .ocr import I2OCRClient, OcrError, extract_text_problem
 from .office import (
     FORMAT_LABELS,
@@ -859,6 +860,9 @@ class DocumentOfficeWorkflowMixin:
                         f"{Path(filename).suffix.lower()} در حال ارسال است…",
                     )
                     await run_file_io(path.write_bytes, payload)
+                    extra: dict[str, Any] = (
+                        {"mime_type": "text/html"} if path.suffix.lower() == ".html" else {}
+                    )
                     try:
                         sent = await self._send_telegram_file(  # type: ignore[attr-defined]
                             user_id,
@@ -866,6 +870,7 @@ class DocumentOfficeWorkflowMixin:
                             caption=caption[:TELEGRAM_CAPTION_LIMIT],
                             reply_to=reply_to,
                             force_document=True,
+                            **extra,
                         )
                     except Exception as exc:
                         logger.warning(
@@ -1146,6 +1151,7 @@ class DocumentOfficeWorkflowMixin:
 
         async def build(_workdir: Path, progress: WorkProgress) -> list[Any]:
             fallback_used = False
+            full_notes: Any = None
             await progress.update(
                 10,
                 "آماده‌سازی بخش‌های سند",
@@ -1168,6 +1174,7 @@ class DocumentOfficeWorkflowMixin:
                     ),
                 )
                 notes = replace(notes, title=title)
+                full_notes = notes
                 markdown = notes.to_markdown()
                 word_payload = await run_file_io(
                     build_notes_docx,
@@ -1219,6 +1226,31 @@ class DocumentOfficeWorkflowMixin:
                 meta=meta,
                 mode_label=mode_label,
             )
+            # The interactive review sheet is only derived from a completed AI
+            # booklet. The deterministic source fallback is never planned again,
+            # and a failure here must not cost the Word and PDF files above.
+            review_output: tuple[str, bytes, str, str] | None = None
+            if mode == "full" and not fallback_used and full_notes is not None:
+                try:
+                    review_file = await generate_review_sheet(
+                        full_notes,
+                        self.settings,
+                        self._http_session() if self.settings.note_configured else None,  # type: ignore[attr-defined]
+                        reference=reference,
+                        announce=lambda label: progress.update(
+                            self.OFFICE_BUILD_PERCENT - 6, label
+                        ),
+                    )
+                except Exception:
+                    review_file = None
+                    logger.exception("document review HTML generation failed mode=%s", mode)
+                if review_file is not None:
+                    review_output = (
+                        review_file.filename,
+                        review_file.content,
+                        f"🌐 مرور تعاملی — HTML | {title}",
+                        f"{short_title(title, fallback=FALLBACK_OFFICE, max_words=2)} — مرور تعاملی HTML",
+                    )
             variant = "کامل" if mode == "full" else "مرور"
             if fallback_used:
                 logger.info(
@@ -1226,7 +1258,7 @@ class DocumentOfficeWorkflowMixin:
                     mode,
                 )
             base_title = short_title(title, fallback=FALLBACK_OFFICE, max_words=2)
-            return [
+            outputs: list[Any] = [
                 (
                     office_filename(title, "word", reference),
                     word_payload,
@@ -1240,6 +1272,9 @@ class DocumentOfficeWorkflowMixin:
                     f"{base_title} — {variant} PDF",
                 ),
             ]
+            if review_output is not None:
+                outputs.append(review_output)
+            return outputs
 
         await self._office_run_operation(
             event,
@@ -1250,7 +1285,7 @@ class DocumentOfficeWorkflowMixin:
                 else "استخراج نکته‌های فشرده و ساخت Word/PDF"
             ),
             success_text=(
-                f"✅ {mode_label} ساخته شد و هر دو فایل Word و PDF در کتابخانه ذخیره شدند.\n"
+                f"✅ {mode_label} ساخته شد و فایل‌های آن در کتابخانه ذخیره شدند.\n"
                 "برچسب‌های صفحه/اسلاید از سند استخراج‌شده حفظ شده‌اند؛ فایل اصلی هم همچنان قابل دریافت است."
             ),
             buttons=buttons,

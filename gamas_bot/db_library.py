@@ -8,6 +8,7 @@ from datetime import timedelta
 from typing import Any
 
 from .db_core import (
+    BINARY_ARTIFACT_KINDS,
     TERMINAL_SUBMISSION_STATUSES,
     DatabaseCore,
     SubmissionRow,
@@ -429,7 +430,7 @@ class LibraryRepositoryMixin(DatabaseCore):
         content: bytes,
         revision_id: int | None = None,
     ) -> None:
-        """Persist a generated PDF/DOCX so callbacks never render it again.
+        """Persist a generated PDF/DOCX/HTML so callbacks never render it again.
 
         File bytes intentionally live outside the compact JSON-pointer registry:
         SQLite BLOBs keep the deliverable private, durable across workdir cleanup,
@@ -438,7 +439,7 @@ class LibraryRepositoryMixin(DatabaseCore):
         ``revision_id`` (migration 028, optional) records which booklet revision
         the bytes were rendered from; the pipeline leaves it ``NULL``.
         """
-        if kind not in {"booklet", "docx"}:
+        if kind not in BINARY_ARTIFACT_KINDS:
             raise ValueError(f"unsupported binary artifact kind: {kind!r}")
         payload = bytes(content)
         if not payload:
@@ -551,7 +552,7 @@ class LibraryRepositoryMixin(DatabaseCore):
             return cursor.rowcount == 1
 
     async def binary_artifact_kinds(self, submission_id: int, user_id: int | None = None) -> set[str]:
-        """Available persisted PDF/DOCX kinds, optionally owner-scoped."""
+        """Available persisted binary kinds (PDF, DOCX, HTML), optionally owner-scoped."""
         if user_id is None:
             rows = await _rows(
                 self.read_db,

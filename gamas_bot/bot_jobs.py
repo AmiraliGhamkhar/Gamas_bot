@@ -36,6 +36,7 @@ from .docx_export import (
     resolve_fonts,
 )
 from .notes_pdf import build_notes_pdf, notes_pdf_filename
+from .review_sheet import generate_review_sheet
 from .fileio import AsyncFileReader, run_file_io, run_file_io_resource
 from .intake import (
     USER_VISIBLE_ERRORS,
@@ -1248,6 +1249,8 @@ class JobPipelineMixin:
         )
         pdf_ready = False
         docx_ready = False
+        review_ready = False
+        review_file = None
         notice_parts: list[tuple[str, str]] = []
 
         def add_notice(kind: str, text: str) -> None:
@@ -1386,6 +1389,41 @@ class JobPipelineMixin:
                         "\n\nنکته: ذخیرهٔ فایل Word جزوه انجام نشد.",
                     )
 
+            # The interactive review sheet is planned from the same validated
+            # notes after the PDF and DOCX are final. Any failure here adds a
+            # notice only: the PDF and DOCX bytes above are already stored.
+            from .artifacts import KIND_REVIEW_HTML
+
+            try:
+                review_file = await generate_review_sheet(
+                    notes,
+                    self.settings,
+                    self._http_session() if self.settings.note_configured else None,  # type: ignore[attr-defined]
+                    reference=reference,
+                    announce=lambda label: progress.update(95, label),
+                )
+            except Exception:
+                logger.exception(
+                    "review HTML generation failed submission=%s", job.submission_id
+                )
+                add_notice("review_html", texts.NOTICE_REVIEW_HTML)
+            if review_file is not None:
+                try:
+                    await self.db.binary_artifact_upsert(
+                        job.submission_id,
+                        job.user_id,
+                        KIND_REVIEW_HTML,
+                        filename=review_file.filename,
+                        content_type="text/html",
+                        content=review_file.content,
+                    )
+                    review_ready = True
+                except Exception:
+                    logger.exception(
+                        "could not persist review HTML submission=%s", job.submission_id
+                    )
+                    add_notice("review_html_storage", texts.NOTICE_REVIEW_HTML_STORAGE)
+
             # The Library retains the editable source text and learning entry
             # points.  It is a virtual record (no automatic Telegram upload);
             # re-download routes use the persisted PDF rather than message ids.
@@ -1447,6 +1485,7 @@ class JobPipelineMixin:
             reference,
             has_booklet=pdf_ready,
             has_docx=docx_ready,
+            has_review_html=review_ready,
             has_keypoints=bool(getattr(notes, "key_points", ()) or ()),
             progress=progress,
             notice=notice,
@@ -1546,6 +1585,7 @@ class JobPipelineMixin:
         has_booklet: bool,
         has_keypoints: bool,
         has_docx: bool = False,
+        has_review_html: bool = False,
         progress: Any | None = None,
         notice: str = "",
         notice_kind: str = "",
@@ -1562,6 +1602,7 @@ class JobPipelineMixin:
             KIND_FLASHCARDS,
             KIND_KEYPOINTS,
             KIND_QUIZ,
+            KIND_REVIEW_HTML,
             KIND_TRANSCRIPT,
             KIND_TXT,
             delivery_markup,
@@ -1576,6 +1617,8 @@ class JobPipelineMixin:
             kinds.update({KIND_BOOKLET, KIND_QUIZ, KIND_FLASHCARDS})
         if has_docx:
             kinds.add(KIND_DOCX)
+        if has_review_html:
+            kinds.add(KIND_REVIEW_HTML)
 
         # The library is one central submission with independent artifacts:
         # register exactly what exists, so the buttons and the results hub can
@@ -1584,8 +1627,8 @@ class JobPipelineMixin:
         # Migration 026's compact registry predates DOCX and has a CHECK
         # constraint for its original kinds. PDF/DOCX availability is recorded
         # in the additive binary-artifact table instead, so never attempt to
-        # insert ``docx`` into the legacy registry.
-        for kind in kinds - {KIND_DOCX}:
+        # insert ``docx`` or ``review_html`` into the legacy registry.
+        for kind in kinds - {KIND_DOCX, KIND_REVIEW_HTML}:
             try:
                 await self.db.artifact_upsert(
                     job.submission_id, job.user_id, kind, reference=ref
@@ -1631,6 +1674,7 @@ class JobPipelineMixin:
             has_transcript=KIND_TRANSCRIPT in kinds,
             has_txt=KIND_TXT in kinds,
             has_docx=KIND_DOCX in kinds,
+            has_review_html=KIND_REVIEW_HTML in kinds,
             has_learning_item=item_id is not None,
         )
         # Quality notices are a suffix to the single results message: do not
@@ -1687,6 +1731,7 @@ class JobPipelineMixin:
         from .artifacts import (
             KIND_BOOKLET,
             KIND_DOCX,
+            KIND_REVIEW_HTML,
             KIND_TRANSCRIPT,
             KIND_TXT,
             keypoints_artifact,
@@ -1705,7 +1750,7 @@ class JobPipelineMixin:
             await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
             return
         reference, kind = parsed
-        if kind in {KIND_BOOKLET, KIND_DOCX}:
+        if kind in {KIND_BOOKLET, KIND_DOCX, KIND_REVIEW_HTML}:
             if await self._fetch_persisted_booklet(
                 event, user_id, submission_id, kind, reference
             ):
@@ -1785,7 +1830,9 @@ class JobPipelineMixin:
         kind: str,
         reference: str,
     ) -> bool:
-        """Send one exact PDF/DOCX blob; return whether an artifact existed."""
+        """Send one exact stored blob (PDF, DOCX or HTML); return whether it existed."""
+        from .artifacts import KIND_REVIEW_HTML
+
         artifact = await self.db.binary_artifact(submission_id, user_id, kind)
         if artifact is None:
             return False
@@ -1831,7 +1878,17 @@ class JobPipelineMixin:
             await finish_tracking(succeeded=False, error_kind="artifact_malformed")
             await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
             return True
-        label = "📘 جزوه PDF" if kind == "booklet" else "📄 نسخه Word"
+        labels = {
+            "booklet": "📘 جزوه PDF",
+            "docx": "📄 نسخه Word",
+            "review_html": "🌐 جزوه مرور تعاملی HTML",
+        }
+        label = labels.get(kind, "📘 جزوه")
+        # The HTML sheet is sent as an explicit text/html document so Telegram
+        # never previews or re-encodes it; the bytes are the stored file.
+        extra: dict[str, Any] = (
+            {"mime_type": "text/html"} if kind == KIND_REVIEW_HTML else {}
+        )
         try:
             await self.client.send_file(
                 await event.get_input_chat(),
@@ -1839,6 +1896,7 @@ class JobPipelineMixin:
                 caption=f"{label} — {reference}",
                 force_document=True,
                 attributes=[DocumentAttributeFilename(filename)],
+                **extra,
             )
         except Exception:
             logger.warning(

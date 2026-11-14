@@ -2749,6 +2749,7 @@ TASK_PROVIDER_ORDER = {
     "BOOKLET_GENERATION": ("avalai", "gemini", "openrouter"),
     "BOOKLET_REPAIR": ("avalai", "gemini", "openrouter"),
     "BOOKLET_COMPILE": ("avalai", "gemini", "openrouter"),
+    "BOOKLET_REVIEW_PLAN": ("avalai", "gemini", "openrouter"),
     "KEY_POINTS": ("gemini", "avalai", "openrouter"),
     "COMPACT_NOTES": ("gemini", "avalai", "openrouter"),
     "QUIZ_GENERATION": ("gemini", "avalai", "openrouter"),

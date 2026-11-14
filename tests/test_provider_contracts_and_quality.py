@@ -173,7 +173,7 @@ class ApprovedRoutingEntryPointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_task_priorities_override_reversed_chain_and_primary_preferences(self):
         families = (
-            (("BOOKLET_GENERATION", "BOOKLET_REPAIR", "BOOKLET_COMPILE", "QUIZ_20", "QUIZ_DIFFICULT"),
+            (("BOOKLET_GENERATION", "BOOKLET_REPAIR", "BOOKLET_COMPILE", "BOOKLET_REVIEW_PLAN", "QUIZ_20", "QUIZ_DIFFICULT"),
              ("avalai", "gemini", "openrouter"), "gemini"),
             (("KEY_POINTS", "COMPACT_NOTES", "QUIZ_GENERATION", "FLASHCARD_GENERATION", "OFFICE_TABLE_GENERATION",
               "OFFICE_SLIDE_PLANNING", "OFFICE_DOCUMENT_GENERATION"),

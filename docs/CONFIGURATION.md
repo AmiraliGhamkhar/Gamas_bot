@@ -82,6 +82,14 @@ chain yields a local source-preserving booklet rather than discarding successful
 chunks. `NOTE_COMPLETENESS_FILL` remains strictly source-grounded and may run
 while `NOTE_STRICT_GROUNDING=true`.
 
+## Interactive HTML review sheet
+
+The review sheet adds **no environment variables**. It reuses the note-provider
+settings (`NOTE_*`, the provider chain and the allowlists) and the same
+`NOTE_DATA_SENSITIVITY` decision as the booklet, and its one planning call
+follows the same timeouts and failover. Its 30-minute duration is a default of
+the renderer and planner API, not a deployment setting.
+
 ## Sensitivity and validation
 
 `NOTE_DATA_SENSITIVITY` decides who may see a booklet's source. `auto` (the

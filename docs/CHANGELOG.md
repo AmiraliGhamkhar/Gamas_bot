@@ -4,6 +4,20 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Interactive HTML review sheet (third booklet output).** A completed AI booklet
+(verified or repaired; never the deterministic source fallback or a degraded
+booklet) can now also produce a self-contained, offline, Persian RTL HTML
+review sheet with a 30-minute study plan, collapsible questions, exam traps,
+comparison pairs and a final one-minute self-test. The planner is one
+note-provider call per booklet that emits structured JSON only; the HTML is
+rendered deterministically and checked by a hard-error/warning validator before
+it is stored or advertised. It is stored as the `review_html` binary artifact
+(migration `033_review_html_artifacts.sql` rebuilds the artifact table once,
+preserving every row, id and delivery counter), served from the results screen
+and Results Hub as a `.html` document, and never regenerated on download. PDF
+and DOCX delivery is unaffected when the sheet fails. Full-document Office
+workflows send the sheet with their Word/PDF outputs.
+
 **Telegram-only release: Gamas Studio removed.** The Telegram Mini App is
 permanently decommissioned: its frontend bundle, WSGI backend and SQLite store,
 the `initData` authentication layer, the WSGI/benchmark scripts, its

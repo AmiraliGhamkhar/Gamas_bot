@@ -984,6 +984,23 @@ class PresentationNotesDeliveryTests(BotPipelineTestCase):
 
 
 class PresentationPromptTests(BotPipelineTestCase):
+    @staticmethod
+    def _structuring_calls(session):
+        """The note-structuring requests only; the review-plan request is separate."""
+        return [
+            call
+            for call in session.llm_calls
+            if "عامل تولید جزوهٔ گاماس" in call["json"]["messages"][0]["content"]
+        ]
+
+    @staticmethod
+    def _review_plan_calls(session):
+        return [
+            call
+            for call in session.llm_calls
+            if "طراح جزوهٔ مرور امتحانی" in call["json"]["messages"][0]["content"]
+        ]
+
     """The deck's own text must be part of the note request, not only the audio."""
 
     def settings_overrides(self) -> dict:
@@ -1047,8 +1064,11 @@ class PresentationPromptTests(BotPipelineTestCase):
             await self.bot._run_job(job)
 
         fake_probe.assert_not_awaited()
-        self.assertEqual(len(session.llm_calls), 1, session.llm_calls)
-        request = session.llm_calls[0]["json"]
+        structuring = self._structuring_calls(session)
+        self.assertEqual(len(structuring), 1, session.llm_calls)
+        # One review-plan request follows the completed booklet.
+        self.assertLessEqual(len(self._review_plan_calls(session)), 1)
+        request = structuring[0]["json"]
         user_content = request["messages"][1]["content"]
         self.assertIn("## متن اسلایدها", user_content)
         self.assertIn("شبکهٔ عصبی", user_content)
@@ -1101,8 +1121,10 @@ class PresentationPromptTests(BotPipelineTestCase):
         ):
             await self.bot._run_job(job)
 
-        self.assertEqual(len(session.llm_calls), 1, session.llm_calls)
-        user_content = session.llm_calls[0]["json"]["messages"][1]["content"]
+        structuring = self._structuring_calls(session)
+        self.assertEqual(len(structuring), 1, session.llm_calls)
+        self.assertLessEqual(len(self._review_plan_calls(session)), 1)
+        user_content = structuring[0]["json"]["messages"][1]["content"]
         self.assertIn("آموزش", user_content)
         self.assertIn("گرادیان کاهشی", user_content)
 
@@ -2692,3 +2714,85 @@ class ReplyKeyboardRoutingTests(BotPipelineTestCase):
         self.bot.client = event.client
         await self.bot._handle_message(event)
         self.assertFalse(any("پنل مدیریت" in reply for reply in event.replies))
+
+
+class ReviewSheetDeliveryTests(BotPipelineTestCase):
+    """The interactive HTML sheet: persisted at completion, fetched without regeneration."""
+
+    async def _completed_job_with_planner(self, *, planner_error: BaseException | None = None):
+        from tests.test_review_sheet import sample_notes, sample_payload
+
+        self.bot.settings = replace(self.settings, avalai_api_key="note-key")
+        # The planner is patched, so a sentinel session stands in for aiohttp.
+        self.bot._http_session = lambda: mock.sentinel.http_session  # type: ignore[method-assign]
+        planner = (
+            mock.AsyncMock(side_effect=planner_error)
+            if planner_error is not None
+            else mock.AsyncMock(return_value=sample_payload())
+        )
+        event = self.media_event()
+        with mock.patch(
+            "gamas_bot.bot.structure_transcript",
+            new=mock.AsyncMock(return_value=sample_notes()),
+        ), mock.patch("gamas_bot.review_sheet.complete_json", new=planner):
+            submission = await self.run_media_job(event, transcribe=self._raw())
+        return event, submission, planner
+
+    async def test_a_completed_job_persists_pdf_docx_and_the_review_sheet(self):
+        from gamas_bot.artifact_validation import inspect_review_html
+
+        event, submission, planner = await self._completed_job_with_planner()
+        planner.assert_awaited_once()
+        pdf = await self.db.binary_artifact(submission, USER_ID, "booklet")
+        docx = await self.db.binary_artifact(submission, USER_ID, "docx")
+        review = await self.db.binary_artifact(submission, USER_ID, "review_html")
+        assert pdf is not None and docx is not None and review is not None
+        self.assertTrue(bytes(pdf["content"]).startswith(b"%PDF-"))
+        html_text = bytes(review["content"]).decode("utf-8")
+        self.assertEqual(inspect_review_html(html_text.encode("utf-8")).errors, ())
+        self.assertTrue(str(review["filename"]).endswith(".html"))
+        self.assertEqual(review["content_type"], "text/html")
+        results = [text for text in event.replies if "پردازش تمام شد" in text]
+        self.assertTrue(results)
+        self.assertIn(texts.DELIVERY_ROW_REVIEW_HTML, results[-1])
+
+    async def test_a_failing_planner_keeps_pdf_and_docx_and_says_so(self):
+        event, submission, _planner = await self._completed_job_with_planner(
+            planner_error=RuntimeError("provider unavailable")
+        )
+        self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
+        self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "docx"))
+        self.assertIsNone(await self.db.binary_artifact(submission, USER_ID, "review_html"))
+        results = [text for text in event.replies if "پردازش تمام شد" in text]
+        self.assertIn(texts.NOTICE_REVIEW_HTML.strip(), results[-1])
+
+    async def test_the_stored_sheet_is_sent_as_a_text_html_document_without_regeneration(self):
+        _event, submission, planner = await self._completed_job_with_planner()
+        planner_calls = planner.await_count
+        client = self.bot.client
+        before = len(client.deliveries)
+        data = f"art:GMS-{submission}:review_html"
+        callback = FakeCallbackEvent(client, data=data.encode("ascii"))
+        await self.bot._fetch_artifact(callback, USER_ID, data)
+        self.assertFalse(callback.answers[-1][1])
+        sent = client.deliveries[before:]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["mime_type"], "text/html")
+        self.assertTrue(sent[0]["force_document"])
+        # Downloading never plans or renders again: the stored bytes are sent as-is.
+        self.assertEqual(planner.await_count, planner_calls)
+        stored = await self.db.binary_artifact(submission, USER_ID, "review_html")
+        assert stored is not None
+        self.assertEqual(bytes(stored["content"]).count(b"<script>"), 1)
+
+    async def test_another_user_cannot_fetch_the_sheet(self):
+        _event, submission, _planner = await self._completed_job_with_planner()
+        other = 999
+        await self.db.ensure_user(other)
+        client = self.bot.client
+        data = f"art:GMS-{submission}:review_html"
+        callback = FakeCallbackEvent(client, data=data.encode("ascii"))
+        before = len(client.deliveries)
+        await self.bot._fetch_artifact(callback, other, data)
+        self.assertEqual(callback.answers[-1][0], texts.DELIVERY_ARTIFACT_GONE)
+        self.assertEqual(len(client.deliveries), before)

@@ -112,7 +112,13 @@ python scripts/ensure_running.py --force
 
 Re-enable cron only after `status` reports `running` and the log is clean.
 Migrations run at startup; there is no migration command. Never run older code
-against a migrated database — roll back code **and** data together.
+against a migrated database — roll back code **and** data together. Release
+migration `033_review_html_artifacts.sql` rebuilds the binary artifact table once;
+back up `data/` first (step 6 above) so a rollback can restore the earlier schema.
+The review-sheet renderer reads two deployed files: `assets/review_sheet/skeleton.html` and the
+`assets/fonts/` Vazirmatn files. Upload the whole `assets/` directory with the code. If either is
+missing, only the HTML sheet is skipped (logged as `review HTML generation failed`); PDF and DOCX
+are still delivered.
 
 ## 7. Permissions and disk
 

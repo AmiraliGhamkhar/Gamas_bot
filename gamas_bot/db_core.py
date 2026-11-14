@@ -74,6 +74,10 @@ APPLICATION_TABLES: frozenset[str] = frozenset(
 
 TERMINAL_SUBMISSION_STATUSES = ("done", "partial", "failed", "rejected")
 
+#: Student-facing files persisted in ``submission_binary_artifacts`` (migrations
+#: 027 and 033). The CHECK constraint in SQL must list the same values.
+BINARY_ARTIFACT_KINDS: frozenset[str] = frozenset({"booklet", "docx", "review_html"})
+
 ADD_COLUMN_RE = re.compile(
     r"(?i)^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+"
     r"[\"'`]?([A-Za-z_][A-Za-z0-9_]*)[\"'`]?"
