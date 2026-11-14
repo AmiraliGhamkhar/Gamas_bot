@@ -62,7 +62,7 @@ other callout borrows it.
 `components.py` names the vocabulary the renderers share:
 
 * Blocks: `DEFINITION`, `EXAMPLE`, `FORMULA`, `HIGH_YIELD`, `KEY_POINTS`,
-  `SUMMARY`, `QUOTE`, `GUIDE`, `GLANCE`, `EDITORIAL`, plus callouts (`نکته`,
+  `SUMMARY`, `QUOTE`, `GUIDE`, `GLANCE`, plus callouts (`نکته`,
   `هشدار`, `یادآوری`) and tips (`آزمونی`, `کاربردی`, `هشدار`).
 * Each block owns its fill, border, accent and label — renderers ask for the
   block, never for a colour.
@@ -73,15 +73,16 @@ Two heading registers, deliberately distinct:
 * **Navy banner** — chapters, the key-points recap, the glossary. A navy bar
   always means *a major destination in this booklet*.
 * **Teal display heading with a short ECG rule** — reading guide, at-a-glance,
-  objectives, summary, tips, review, speakers, editorial note.
+  objectives, summary, tips, review, pitfalls and final review.
 
 ## Cover
 
 Cream paper, navy frame, teal/cyan curves, an ECG trace, an open book, a
 graduation cap, a molecule, a capsule and a document card. The artwork is a
 generated PNG behind the layout; **all critical text is drawn by the renderer**
-(the wordmark, title, session metadata, quote, brand line), because image
-generators distort Persian script.
+(the wordmark, title, source-supported subtitle, quote and brand line), because
+image generators distort Persian script. Source/job metadata (filename, engine,
+reference, date, duration and session number) is deliberately never rendered.
 
 Topic-aware artwork is deterministic: `topic_for()` scores the booklet text
 against keyword families and falls back to `general`. A tie follows a fixed
@@ -98,9 +99,10 @@ priority list, so the same lecture always gets the same cover.
 
 **DOCX** — `build_notes_docx(notes, meta=…)`: the existing exporter, rewired to
 the theme. Cover → guide → at-a-glance → objectives → summary → chapters
-(banner, source line, prose, definition cards, bullets, tables, formulas,
-high-yield, callouts) → key points → tips → review → speaker/timeline →
-glossary → editorial page. Real `Heading 1/2/3` styles are kept so the file
+(banner, prose, definition cards, bullets, tables, formulas,
+high-yield, callouts) → key points → tips → review → pitfalls → glossary →
+final review. Speaker/timeline data stays in the transcript
+pipeline and is never a booklet component; processing diagnostics are not rendered. Real `Heading 1/2/3` styles are kept so the file
 stays editable and navigable, RTL is declared through `w:bidi`/`w:bidiVisual`,
 tables repeat their header row, and the footer carries a real `PAGE` field.
 

@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 import re
@@ -54,7 +53,9 @@ from .notes import (
     StructuredNotes,
     StructuringError,
     build_presentation_document,
+    enforce_final_acceptance,
     ensure_structured_booklet,
+    gate_notes,
     structurally_valid_booklet,
     structure_presentation,
 )
@@ -735,12 +736,6 @@ class JobPipelineMixin:
             reference=reference,
             meta=meta,
         )
-        if notes is not None:
-            speakers, timeline = self._booklet_context(document)
-            notes = replace(
-                notes, speakers=speakers, timeline=timeline
-            )
-
         await self.db.save_transcription(
             job.submission_id,
             engine=raw.engine,
@@ -1016,11 +1011,6 @@ class JobPipelineMixin:
         notes = await self._generate_presentation_notes(
             outline, transcript_text, job, progress, document=presentation_text
         )
-        if notes is not None:
-            speakers, timeline = self._booklet_context(document)
-            notes = replace(
-                notes, speakers=speakers, timeline=timeline
-            )
         await self.db.save_transcription(
             job.submission_id,
             engine=engine_label,
@@ -1230,13 +1220,19 @@ class JobPipelineMixin:
                     except Exception:
                         logger.warning("booklet source could not be read for structural check")
             try:
-                if not structurally_valid_booklet(notes):
-                    notes = ensure_structured_booklet(notes, source_text)
+                notes = ensure_structured_booklet(notes, source_text)
+                # This is intentionally not optional: a mocked/recovered or
+                # future booklet path still crosses the same final evidence and
+                # completeness gate immediately before DOCX/PDF rendering.
+                notes, final_report = gate_notes(notes, source_text, strict=True, mode="full")
+                notes = enforce_final_acceptance(
+                    notes, final_report, mode="full", stage="render_boundary"
+                )
                 if not structurally_valid_booklet(notes):
                     raise StructuringError("booklet structure is invalid")
                 if isinstance(getattr(job, "meta", None), dict):
                     job.meta["note_quality"] = getattr(notes, "quality_state", "VERIFIED")
-            except StructuringError:
+            except (NoteQualityError, StructuringError):
                 logger.warning(
                     "booklet rejected at render boundary: no usable structure submission=%s",
                     job.submission_id,
@@ -1530,50 +1526,6 @@ class JobPipelineMixin:
             max(0, int(getattr(document, "overlap_count", 0) or 0)),
         )
 
-    @staticmethod
-    def _booklet_context(document: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        """Source-derived speaker list and chapter stamps for the booklet.
-
-        Only real turns and real paragraph timings are used. An unknown
-        attribution is skipped rather than given a plausible-sounding name,
-        and a document without timings gets no invented timeline.
-        """
-        if not hasattr(document, "speaker_turns"):
-            return (), ()
-        try:
-            turns = document.speaker_turns()
-        except Exception:  # pragma: no cover - a malformed document is not fatal
-            return (), ()
-        words_by_speaker: dict[str, int] = {}
-        for turn in turns:
-            if not turn.display_name:
-                continue
-            key = str(turn.display_name).strip()
-            words_by_speaker[key] = words_by_speaker.get(key, 0) + len(turn.text.split())
-        speakers = tuple(
-            f"{name} — {to_persian_digits(count)} واژه"
-            for name, count in sorted(
-                words_by_speaker.items(), key=lambda pair: (-pair[1], pair[0])
-            )[:12]
-        )
-        timeline: list[str] = []
-        seen_minutes: set[int] = set()
-        for paragraph in getattr(document, "paragraphs", ()) or ():
-            start = getattr(paragraph, "start", None)
-            text = str(getattr(paragraph, "text", "") or "").strip()
-            if start is None or not text:
-                continue
-            minute = int(float(start)) // 60
-            if minute in seen_minutes:
-                continue
-            seen_minutes.add(minute)
-            minutes, seconds = divmod(int(float(start)), 60)
-            stamp = to_persian_digits(f"{minutes:02d}:{seconds:02d}")
-            snippet = " ".join(text.split())[:70]
-            timeline.append(f"[{stamp}] {snippet}")
-            if len(timeline) >= 40:
-                break
-        return speakers, tuple(timeline)
 
     # ----------------------------------------------------- button-driven delivery
     async def _deliver_results(

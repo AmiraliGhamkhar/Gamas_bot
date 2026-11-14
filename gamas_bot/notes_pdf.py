@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import io
 import logging
-from datetime import datetime
 from xml.sax.saxutils import escape as _xml_escape
 
 from reportlab.lib import colors
@@ -58,7 +57,7 @@ from .document.assets import optional as optional_asset
 from .document.layout import pdf_frame
 from .document.rtl import visual, visual_ltr, wrap_logical
 from .document.theme import THEME
-from .docx_export import DocumentMeta, jalali_date
+from .docx_export import DocumentMeta
 from .notes import NoteSection, NoteTable, StructuredNotes
 from .pdf_common import (
     BOLD_NAME,
@@ -760,29 +759,28 @@ def _body_flowables(notes: StructuredNotes, styles) -> list[Flowable]:
                                  *_display_heading(design.LABELS["review"], styles)]))
         out.append(_steps_table(list(notes.review_questions), styles))
 
-    if notes.speakers or notes.timeline:
+    if notes.common_mistakes:
         out.append(KeepTogether([Spacer(1, SPACE.section),
-                                 *_display_heading(design.LABELS["speakers"], styles)]))
-        if notes.speakers:
-            out.append(Spacer(1, 5))
-            out.append(_card(
-                design.KEY_POINTS,
-                [_rtl("گویندگان شناسایی‌شده", styles["card_label"], _FRAME_W - 26)]
-                + [_rtl(name, styles["card_item"], _FRAME_W - 30) for name in notes.speakers],
-                width=_FRAME_W,
-            ))
-        if notes.timeline:
-            out.append(KeepTogether(
-                [Spacer(1, 5)]
-                + [_rtl(entry, styles["bullet"], _FRAME_W - 16, marker="•")
-                   for entry in notes.timeline]
-            ))
+                                 *_display_heading("خطاها و دام‌های رایج", styles)]))
+        out.append(_high_yield_card(
+            "هشدارها و استثناهای پشتیبانی‌شده توسط منبع",
+            list(notes.common_mistakes),
+            styles,
+        ))
 
     if notes.glossary:
         out.append(KeepTogether([Spacer(1, SPACE.section),
                                  _banner(design.LABELS["glossary"], styles),
                                  Spacer(1, 5)]))
         out.append(_glossary_table(list(notes.glossary), styles))
+
+    if notes.final_review:
+        out.append(KeepTogether([
+            Spacer(1, SPACE.section),
+            _banner("مرور نهایی", styles),
+            Spacer(1, 5),
+            _high_yield_card("نکته‌های ضروری برای مرور پایانی", list(notes.final_review), styles),
+        ]))
     return out
 
 
@@ -790,25 +788,18 @@ def _cover_flowables(
     notes: StructuredNotes, meta: DocumentMeta, styles, *,
     duration_seconds: int | None, session_number: int | None,
 ) -> list[Flowable]:
-    created = meta.created_at or datetime.now()
+    # Audio duration and session/job labels remain operational data. They are
+    # deliberately accepted for caller compatibility but never rendered.
+    _ = (meta, duration_seconds, session_number)
     topic = topic_for(booklet_text(notes))
-    meta_lines = [f"تاریخ: {jalali_date(created)}"]
-    if session_number:
-        meta_lines.append(f"جلسهٔ {to_persian_digits(str(session_number))}")
-    if duration_seconds and duration_seconds > 0:
-        minutes = duration_seconds // 60
-        label = (
-            f"{to_persian_digits(minutes)} دقیقه"
-            if minutes < 60
-            else f"{to_persian_digits(minutes // 60)} ساعت"
-                 + (f" و {to_persian_digits(minutes % 60)} دقیقه" if minutes % 60 else "")
-        )
-        meta_lines.append(f"مدت: {label}")
+    meta_lines: list[str] = []
 
     panel_inner: list[Flowable] = [
         _rtl("جزوهٔ جلسه", styles["cover_label"], _FRAME_W * 0.78),
         _rtl(notes.display_title, styles["cover_title"], _FRAME_W * 0.78),
     ]
+    if notes.subtitle:
+        panel_inner.append(_rtl(notes.subtitle, styles["cover_meta"], _FRAME_W * 0.78))
     panel_inner.extend(_rtl(line, styles["cover_meta"], _FRAME_W * 0.78) for line in meta_lines)
     panel_table = Table([[item] for item in panel_inner], colWidths=[_FRAME_W * 0.78])
     panel_table.setStyle(TableStyle([
@@ -860,40 +851,9 @@ QUOTE_TEXT = "دانش اگر در ثریا باشد مردمی از سرزمی�
 
 
 def _final_flowables(meta: DocumentMeta, styles) -> list[Flowable]:
-    created = meta.created_at or datetime.now()
-    # A closing flourish, not a rule across the page: a full-width trace between
-    # two headings reads as a stray graphic.
-    divider = _EcgRule(170, height=9, color=LINE)
-    divider.hAlign = "CENTER"
-    out: list[Flowable] = [
-        Spacer(1, SPACE.section),
-        divider,
-        Spacer(1, 10),
-        *_display_heading(design.LABELS["about"], styles),
-        _card(
-            design.EDITORIAL,
-            [
-                _rtl(design.EDITORIAL.label, styles["card_label"], _FRAME_W - 26),
-                _rtl(
-                    "این جزوه به‌صورت خودکار از متن/صدای همین جلسه ساخته شده است؛ "
-                    "ساختار و جمله‌بندی آن بازنویسی ماشینی است و به منبع اصلی تکیه دارد. "
-                    "این سند جایگزین کتاب مرجع و بیان رسمی مدرس نیست.",
-                    styles["card_body"], _FRAME_W - 26,
-                ),
-                _rtl(f"تاریخ تولید: {jalali_date(created)}", styles["note_small"], _FRAME_W - 26),
-            ],
-            width=_FRAME_W,
-        ),
-        Spacer(1, 8),
-        _rtl(
-            "توجه: ممکن است خطای رونویسی یا برداشت نادرست در متن وجود داشته باشد. "
-            "در صورت مشاهدهٔ هرگونه مغایرت با محتوای اصلی، به منبع رسمی مراجعه کنید.",
-            styles["disclaimer"], _FRAME_W,
-        ),
-        Spacer(1, 4),
-        _rtl("Gamas · جزوه‌ساز هوشمند گاماس", styles["attribution"], _FRAME_W),
-    ]
-    return out
+    """No processing appendix: the educational final review is the booklet ending."""
+    _ = (meta, styles)
+    return []
 
 
 # ---------------------------------------------------------------------------

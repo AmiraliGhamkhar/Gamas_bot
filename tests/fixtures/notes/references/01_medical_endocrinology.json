@@ -124,5 +124,11 @@
       "term": "Metformin",
       "definition": "خط اول درمان دارویی دیابت نوع دو"
     }
+  ],
+  "final_review": [
+    "تشخیص با HbA1c برابر یا بیشتر از ۶.۵ درصد",
+    "Metformin خط اول با دوز ۵۰۰ mg تا ۲۰۰۰ mg روزانه",
+    "ممنوعیت Metformin در eGFR کمتر از ۳۰",
+    "Dapagliflozin با دوز ۱۰ mg به‌عنوان داروی دوم"
   ]
 }

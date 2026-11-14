@@ -75,7 +75,9 @@ primary/fallback-role caps. `LLM_TOKEN_ESTIMATION_CHARS_PER_TOKEN=1.5` controls
 conservative input estimation; the full requested output budget is reserved
 as well. Do not inflate operating budgets to match reference model windows.
 Compilation is optional and off by default; bounded map/merge, split/repair and
-grounding checks are retained. `NOTE_MAX_REPAIR_ATTEMPTS` caps the ordered
+grounding checks are retained. The final evidence, completeness and output-safety
+acceptance gate always runs; `NOTE_STRICT_GROUNDING=false` only skips earlier
+provider-assisted repair work. `NOTE_MAX_REPAIR_ATTEMPTS` caps the ordered
 claim-faithfulness, coverage, and structural repair passes (they stop early).
 When `NOTE_ENABLE_DETERMINISTIC_FALLBACK=true`, an exhausted eligible provider
 chain yields a local source-preserving booklet rather than discarding successful

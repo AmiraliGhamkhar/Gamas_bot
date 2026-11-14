@@ -494,14 +494,16 @@ class ProseClaimGateTests(unittest.IsolatedAsyncioTestCase):
         )
         with mock.patch("gamas_bot.notes.complete_json", new=fake_complete_json):
             notes = await structure_document(self.SOURCE, settings, object())
-        self.assertEqual(notes.quality_state, "DEGRADED")
+        # A critical unsupported claim now routes to the source-preserving
+        # fallback instead of delivering a merely degraded booklet.
+        self.assertEqual(notes.quality_state, "RECOVERED")
         body = " ".join(notes.sections[0].paragraphs)
         self.assertIn("نفرون", body)
         self.assertNotIn("اریتروپویتین", body)
 
 
-class IncompleteBookletTests(unittest.IsolatedAsyncioTestCase):
-    async def test_a_lost_number_makes_the_result_partial_not_verified(self):
+class CompleteBookletGateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_lost_number_routes_to_source_preserving_recovery(self):
         source = "دوز ۵۰۰ میلی‌گرم است و نسبت ۸.۵ درصد گزارش شد."
         payload = {
             "title": "دوز",
@@ -524,7 +526,13 @@ class IncompleteBookletTests(unittest.IsolatedAsyncioTestCase):
                 source, settings, object(), on_incomplete=on_incomplete
             )
         self.assertTrue(notes.has_content)
-        self.assertEqual(reasons, ["missing_numbers"])
+        # A complete booklet is never delivered as a partial synthesis: the
+        # fallback retains the exact source facts after bounded repair fails.
+        self.assertEqual(reasons, [])
+        self.assertEqual(notes.quality_state, "RECOVERED")
+        rendered = notes.to_markdown()
+        self.assertIn("۵۰۰", rendered)
+        self.assertIn("۸.۵", rendered)
 
 
 class CompileStageNotificationTests(unittest.IsolatedAsyncioTestCase):

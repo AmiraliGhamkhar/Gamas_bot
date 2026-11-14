@@ -1593,27 +1593,9 @@ def _new_document(meta: DocumentMeta, title: str) -> DocumentType:
     document = Document()
     document.core_properties.title = xml_safe(title)
     document.core_properties.author = "Gamas Bot"
-    document.core_properties.comments = meta.reference
+    # Submission references are operational identifiers, not booklet metadata.
+    document.core_properties.comments = ""
     return document
-
-
-def cover_meta_lines(meta: DocumentMeta, *, mode_label: str = "") -> list[str]:
-    """The cover's user-facing metadata, pre-split into short balanced lines.
-
-    Only educational/document-level information appears here. Internal backend
-    metadata (engine, source_name, reference/ID) is NOT shown to students.
-
-    The date is shown as it's useful educational context for when the document
-    was prepared. The mode label (e.g., production mode) is also shown as it's
-    relevant to the student's understanding of the document type.
-    """
-    created = meta.created_at or datetime.now()
-    lines: list[str] = []
-    if mode_label:
-        lines.append(mode_label)
-    # Only show the date - this is useful educational context
-    lines.append(f"تاریخ: {jalali_date(created)}")
-    return lines
 
 
 def _wrap_estimate(text: str, chars_per_line: int) -> list[str]:
@@ -1635,16 +1617,6 @@ def _wrap_estimate(text: str, chars_per_line: int) -> list[str]:
     if current or not lines:
         lines.append(current)
     return lines
-
-
-def _meta_line(meta: DocumentMeta) -> str:
-    """A single line of user-facing metadata for the body title block.
-
-    Internal backend metadata (engine, source_name, reference) is NOT included.
-    Only the document preparation date is shown as educational context.
-    """
-    created = meta.created_at or datetime.now()
-    return f"تاریخ: {jalali_date(created)}"
 
 
 # ---------------------------------------------------------------------------
@@ -1790,13 +1762,13 @@ def _add_cover_page(
         align=WD_ALIGN_PARAGRAPH.CENTER, space_after=10, line_spacing=1.0,
     )
 
-    # The navy title panel: label, title and metadata as one framed block.
+    # Booklet callers leave ``mode_label`` empty; the generic plain-document
+    # exporter may provide its user-facing document-type label. Source/job
+    # metadata is never supplied here.
     panel_lines: list[tuple[str, float, RGBColor, bool]] = []
     if mode_label:
         panel_lines.append((mode_label, 9.2, CYAN, True))
     panel_lines.append((title, 22.0, ON_ACCENT, True))
-    for line in cover_meta_lines(meta):
-        panel_lines.append((line, 9.0, _rgb(_PALETTE.cream_100), False))
     for index, (line, size, color, bold) in enumerate(panel_lines):
         paragraph = _add_rtl_paragraph(
             document, line, fonts=heading_fonts if bold else fonts, size=size,
@@ -1853,9 +1825,9 @@ def _add_body_title_block(
     """The title block of a cover-less document.
 
     Without the cover page nothing else in the file states what the booklet is
-    called, so the first page opens with the title, the mode and the same
-    metadata line the cover would have shown. The design is passed through so a
-    configured local logo is still used when the cover is switched off.
+    called, so the first page opens with the title alone. The design is passed
+    through so a configured local logo is still used when the cover is switched
+    off; processing modes and source/job metadata stay out of the booklet.
     """
     heading_fonts = _heading_fonts(fonts)
     _add_brand_mark(document, fonts=fonts, design=design or DocxDesign())
@@ -1864,15 +1836,12 @@ def _add_body_title_block(
         space_after=6, line_spacing=1.15, style=TITLE_STYLE,
     )
     _add_directional_text(paragraph, title, fonts=heading_fonts, size=22, bold=True, color=ACCENT)
+    _ = meta
     if mode_label:
         _add_rtl_paragraph(
             document, mode_label, fonts=fonts, size=10.5, color=ACCENT,
             align=WD_ALIGN_PARAGRAPH.CENTER, space_after=2, line_spacing=1.0,
         )
-    _add_rtl_paragraph(
-        document, _meta_line(meta), fonts=fonts, size=9.5, color=MUTED,
-        align=WD_ALIGN_PARAGRAPH.CENTER, space_after=6, line_spacing=1.2,
-    )
     _add_rule(document, fonts=fonts, space_after=14)
 
 
@@ -2807,14 +2776,6 @@ def _add_section(document, index: int, section: NoteSection, *, fonts: DocumentF
         _add_table(document, table, fonts=fonts)
 
 
-#: Persian label for the single note mode, shown on the cover (CR-3).
-#: ``note_mode`` on archived booklets always normalises to "full".
-MODE_LABELS = {
-    "full": "حالت تولید: کامل (حفظ کامل محتوای درس)",
-}
-
-
-
 def _glossary_rows(notes) -> list[tuple[str, str]]:
     """Glossary entries, falling back to section definitions.
 
@@ -2921,7 +2882,6 @@ def build_notes_docx(
             meta,
             fonts=resolved,
             design=style,
-            mode_label=MODE_LABELS.get(notes.note_mode, ""),
             subject=booklet_text(notes),
         )
         # The cover is a section of its own: no running header, no page number,
@@ -2937,7 +2897,6 @@ def build_notes_docx(
             meta,
             fonts=resolved,
             design=style,
-            mode_label=MODE_LABELS.get(notes.note_mode, ""),
         )
         if toc_needed:
             # Without a cover, title content is page one, TOC is page two, and
@@ -2983,7 +2942,7 @@ def build_notes_docx(
         _add_heading(document, "نکته‌های کاربردی", fonts=resolved, level=1, banner=False)
         _add_boxed_lines(
             document,
-            "توصیه‌های خودِ مدرس برای کاربرد و آزمون",
+            "نکته‌های کاربردی و آزمونیِ پشتیبانی‌شده توسط منبع",
             [f"{tip.kind}: {tip.text}" for tip in notes.practical_tips],
             fonts=resolved,
             fill=KEYPOINT_SHADE,
@@ -2994,33 +2953,19 @@ def build_notes_docx(
         _add_heading(document, "پرسش‌های مرور", fonts=resolved, level=1, banner=False)
         _add_numbered_steps(document, notes.review_questions, fonts=resolved)
 
-    # Gamas 2.0: a source-derived appendix. Speaker labels are the anonymous
-    # names the diarizer actually resolved (or the owner's renames) and the
-    # timeline is paragraph timings. Neither is generated by the note model,
-    # so a booklet never invents a speaker or a chapter that was not heard.
-    if notes.speakers or notes.timeline:
-        _add_heading(document, "گویندگان و زمان\u200cبندی", fonts=resolved, level=1, banner=False)
-        if notes.speakers:
-            _add_boxed_lines(
-                document,
-                "گویندگان شناسایی\u200cشده",
-                list(notes.speakers),
-                fonts=resolved,
-                fill=KEYPOINT_SHADE,
-                border=KEYPOINT_BORDER,
-            )
-        if notes.timeline:
-            _add_bullets(document, notes.timeline, fonts=resolved)
+    if notes.common_mistakes:
+        _add_heading(document, "خطاها و دام‌های رایج", fonts=resolved, level=1, banner=False)
+        _add_boxed_lines(
+            document,
+            "هشدارها و استثناهای پشتیبانی‌شده توسط منبع",
+            list(notes.common_mistakes),
+            fonts=resolved,
+            fill=KEYPOINT_SHADE,
+            border=KEYPOINT_BORDER,
+        )
 
-    # No end-of-booklet recap block. The notes model already writes the recap
-    # into the document's own `summary` and `key_points` (the prompt asks for
-    # exactly that, see ``_prompt_block``), so re-printing them under a «جمع‌بندی»
-    # heading was the booklet saying the same thing twice — the same sentences
-    # first as a summary, then as key points, then once more at the end. The one
-    # place a closing recap belongs is inside the body the model authored, in its
-    # own words and order, and that is where it now lives.
-    # CR-4: the glossary is derived from section definitions when the model did
-    # not supply one, so a complete booklet always carries this final section.
+    # The glossary is derived from section definitions when the model did not
+    # supply one, so technical terminology remains easy to review.
     glossary_rows = _glossary_rows(notes)
     if glossary_rows:
         _add_heading(document, "واژه‌نامهٔ اصطلاح‌ها", fonts=resolved, level=1)
@@ -3059,6 +3004,18 @@ def build_notes_docx(
         # own narrower first column, matched to the same content width.
         _set_table_widths(glossary_table, [4.6, TABLE_CONTENT_WIDTH_CM - 4.6])
         _add_rtl_paragraph(document, "", fonts=resolved, size=4, space_after=6, line_spacing=1.0)
+
+    if notes.final_review:
+        _add_heading(document, "مرور نهایی", fonts=resolved, level=1)
+        _add_boxed_lines(
+            document,
+            "نکته‌های ضروری برای مرور پایانی",
+            list(notes.final_review),
+            fonts=resolved,
+            fill=KEYPOINT_SHADE,
+            border=KEYPOINT_BORDER,
+            level=2,
+        )
 
     toc_entries = (
         _fill_static_toc(document, toc_table, fonts=resolved, levels=style.toc_levels)

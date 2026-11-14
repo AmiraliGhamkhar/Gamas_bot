@@ -622,10 +622,11 @@ class ContextOverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             " ".join((first + " " + second).split()), " ".join(document.split())
         )
-        # The merged booklet keeps both halves.
-        headings = [section.heading for section in notes.sections]
-        self.assertTrue(any("نیمهٔ نخست" in heading for heading in headings))
-        self.assertTrue(any("نیمهٔ دوم" in heading for heading in headings))
+        # The scripted answers are intentionally unsupported. The canonical
+        # final gate therefore replaces them with a source-preserving booklet
+        # instead of delivering their invented headings.
+        self.assertEqual(notes.quality_state, "RECOVERED")
+        self.assertIn("موضوع 0", notes.to_markdown())
 
     async def test_a_413_oversized_body_splits_too(self):
         """NaraRouter signals an oversized input with HTTP 413, not 400.
@@ -649,9 +650,8 @@ class ContextOverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             " ".join((first + " " + second).split()), " ".join(document.split())
         )
-        headings = [section.heading for section in notes.sections]
-        self.assertTrue(any("نیمهٔ نخست" in heading for heading in headings))
-        self.assertTrue(any("نیمهٔ دوم" in heading for heading in headings))
+        self.assertEqual(notes.quality_state, "RECOVERED")
+        self.assertIn("موضوع 0", notes.to_markdown())
 
     async def test_an_unchanged_oversized_request_recovers_with_bounded_source_fallback(self):
         settings = make_settings(note_chunk_chars=100_000)
@@ -836,7 +836,9 @@ class ProgressiveBookletTests(unittest.IsolatedAsyncioTestCase):
         notes = await structure_transcript(
             document, settings, session, on_merged=on_merged
         )
-        self.assertEqual(notes.title, "جزوهٔ نهایی")
+        # The compile call still occurs, but this deliberately unsupported
+        # editorial fixture cannot cross the final source-grounding gate.
+        self.assertEqual(notes.quality_state, "RECOVERED")
         self.assertEqual(len(seen), 1)
         self.assertTrue(seen[0][0].startswith("جزوهٔ "))
         self.assertEqual(seen[0][1], len(chunks))
@@ -945,7 +947,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         settings = make_settings(note_chunk_chars=100000)
         session = FakeSession([sample_notes_json("جزوهٔ تک‌بخشی")])
         notes = await structure_transcript("یک متن کوتاه است.", settings, session)
-        self.assertEqual(notes.title, "جزوهٔ تک‌بخشی")
+        self.assertEqual(notes.quality_state, "RECOVERED")
+        self.assertIn("یک متن کوتاه است", notes.to_markdown())
         self.assertEqual(len(session.calls), 1)
 
     async def test_multi_chunk_map_reduce(self):
@@ -976,9 +979,11 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             + [json.dumps(compile_answer, ensure_ascii=False)]
         )
         notes = await structure_transcript(document, settings, session)
-        # map calls + exactly one compile call
+        # map calls + exactly one compile call; unsafe fixture output is then
+        # replaced by the source-preserving final fallback.
         self.assertEqual(len(session.calls), len(chunks) + 1)
-        self.assertEqual(notes.title, "جزوهٔ نهایی")
+        self.assertEqual(notes.quality_state, "RECOVERED")
+        self.assertIn("موضوع 0", notes.to_markdown())
 
     async def test_compile_runs_above_the_former_fixed_bound(self):
         """A merged booklet over the old 48,000-char bound still gets compiled.
@@ -1008,9 +1013,11 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         notes = await structure_transcript(document, settings, session)
         # Map calls + exactly one compile call, despite the merged booklet
-        # being far above the former fixed 48,000-char bound.
+        # being far above the former fixed 48,000-char bound. The fixture's
+        # invented compile prose is blocked at final acceptance.
         self.assertEqual(len(session.calls), len(chunks) + 1)
-        self.assertEqual(notes.title, "جزوهٔ نهایی بزرگ")
+        self.assertEqual(notes.quality_state, "RECOVERED")
+        self.assertIn("موضوع 0", notes.to_markdown())
 
     async def test_compile_failure_falls_back_to_merge(self):
         from gamas_bot.transcript import split_transcript
@@ -1121,7 +1128,7 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("یادداشت گوینده: هر لایه ویژگی‌ها را", user_content)
         self.assertIn("## متن پیاده‌سازی‌شدهٔ صدای ارائه", user_content)
         self.assertIn(transcript, user_content)
-        self.assertIn("یادداشت گوینده", request["messages"][0]["content"])
+        self.assertIn("یادداشت ارائه", request["messages"][0]["content"])
         self.assertIn("متن اسلاید", request["messages"][0]["content"])
 
     def test_presentation_document_keeps_both_sources_separate(self):
@@ -1697,6 +1704,7 @@ class CompletenessValidatorTests(unittest.TestCase):
             "learning_objectives": ["آشنایی با Metformin"],
             "glossary": [{"term": "HbA1c", "definition": "هموگلوبین گلیکوزیله"}],
             "key_points": ["HbA1c هدف زیر ۷ درصد"],
+            "final_review": ["HbA1c هدف زیر ۷ درصد"],
             "sections": [{
                 "heading": "Metformin",
                 "paragraphs": ["خط اول درمان دیابت نوع ۲ است."],
@@ -1789,7 +1797,7 @@ class SkeletonPromptTests(unittest.TestCase):
         self.assertIn("این قالب‌ها اجباری نیستند", prompt)
         # Both source kinds are covered by the same static contract.
         self.assertIn("متن اسلاید", prompt)
-        self.assertIn("یادداشت گوینده", prompt)
+        self.assertIn("یادداشت ارائه", prompt)
         # The editorial pass keeps the same skeleton contract.
         self.assertIn("sections", COMPILE_SYSTEM_PROMPT)
         self.assertIn("حذف نکنید", COMPILE_SYSTEM_PROMPT)
@@ -1933,7 +1941,11 @@ class CoverageFillTests(unittest.IsolatedAsyncioTestCase):
         notes = await structure_transcript(self.SOURCE, settings, session)
         # All detected coverage gaps are combined into exactly one repair call.
         self.assertEqual(len(session.calls), 2)
-        self.assertGreater(len(notes.sections), 1)
+        # The tiny fill fixture cannot cover all six critical numbered units,
+        # so final acceptance keeps the source faithfully rather than shipping
+        # a partial two-section draft.
+        self.assertEqual(notes.quality_state, "RECOVERED")
+        self.assertIn("شمارهٔ 5", notes.to_markdown())
         fill_call = session.calls[1]["json"]["messages"]
         system = fill_call[0]["content"]
         user = fill_call[1]["content"]
@@ -1948,4 +1960,5 @@ class CoverageFillTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession([self.DRAFT])
         notes = await structure_transcript(self.SOURCE, settings, session)
         self.assertEqual(len(session.calls), 2)  # map + one failing fill
-        self.assertEqual(notes.title, "ترمودینامیک")
+        self.assertEqual(notes.quality_state, "RECOVERED")
+        self.assertIn("جملهٔ مستقل شمارهٔ 5", notes.to_markdown())

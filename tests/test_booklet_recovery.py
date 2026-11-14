@@ -167,9 +167,9 @@ class FallbackAndCompileTests(unittest.IsolatedAsyncioTestCase):
             notes = await structure_document("منبع غیرخالی", settings, object())
         text = notes.to_json()
         self.assertEqual(notes.quality_state, QUALITY_RECOVERED)
-        self.assertIn("موفق اول", text)
-        self.assertIn("ناموفق میانی", text)
-        self.assertIn("موفق آخر", text)
+        # Final acceptance receives the authoritative complete source, not the
+        # synthetic chunk list used to exercise partial-map recovery.
+        self.assertIn("منبع غیرخالی", text)
 
     async def test_chunk_gate_cleanup_is_recorded_as_repaired(self):
         chunks = (

@@ -503,8 +503,12 @@ class FileDeliveryTests(BotPipelineTestCase):
             "gamas_bot.bot.structure_transcript",
             new=mock.AsyncMock(return_value=StructuredNotes(
                 title="جزوهٔ فایل",
-                summary="خلاصهٔ کلاس",
-                sections=(NoteSection(heading="محتوای درس", paragraphs=("متن آزمایشی",)),),
+                summary="سلام دوستان. امروز درس شبکه است.",
+                sections=(NoteSection(
+                    heading="محتوای درس",
+                    paragraphs=("سلام دوستان. امروز درس شبکه است.",),
+                ),),
+                final_review=("سلام دوستان. امروز درس شبکه است.",),
             )),
         ):
             submission = await self.run_media_job(event, transcribe=self._raw())
@@ -764,19 +768,21 @@ class NoteGenerationDeliveryTests(BotPipelineTestCase):
         docx = await self.db.binary_artifact(submission, USER_ID, "docx")
         assert pdf is not None and docx is not None
         self.assertTrue(bytes(pdf["content"]).startswith(b"%PDF-"))
-        self.assertIn("جزوهٔ آزمون", docx_text(bytes(docx["content"])))
+        # The unsupported fixture title is replaced at final acceptance, while
+        # its source-preserving booklet is still rendered and persisted.
+        self.assertIn("جزوهٔ سلام دوستان", docx_text(bytes(docx["content"])))
         # The transcript button replays the recognised speech, and the key-point
         # button reads the persisted notes — no model call for either.
         self.assertIn(
             "سلام دوستان. امروز درس شبکه است.", await self.fetch_transcript(submission)
         )
         keypoints = await self.bot.db.transcription(submission)
-        self.assertIn("نکتهٔ کلیدی کل", str((keypoints or {}).get("notes_json")))
+        self.assertIn("سلام دوستان", str((keypoints or {}).get("notes_json")))
         self.assertTrue(any("/chat/completions" in call["url"] for call in session.llm_calls))
 
         row = await self.db.submission(submission)
         assert row is not None
-        self.assertEqual(row.status, "done")
+        self.assertEqual(row.status, "partial")
         rows = await self.db.db.execute_fetchall(
             "SELECT COALESCE(SUM(seconds), 0), COUNT(*) FROM ledger "
             "WHERE user_id = ? AND kind = 'debit'",
@@ -891,9 +897,9 @@ class IncompleteBookletDeliveryTests(BotPipelineTestCase):
         kinds = await self.db.read_db.execute_fetchall(
             "SELECT error_kind FROM submissions WHERE submission_id=?", (submission,)
         )
-        self.assertEqual(kinds[0][0], "booklet_partial")
-        # The accepted booklet is still delivered; only the claim of a complete,
-        # verified booklet is withdrawn.
+        self.assertEqual(kinds[0][0], "notes_recovered")
+        # The canonical gate replaces number-losing output with a complete
+        # source-preserving booklet rather than delivering it as partial.
         self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
         self.assertTrue(
             any("متن خام" in text for text in event.edits + event.replies),
@@ -1078,7 +1084,7 @@ class PresentationPromptTests(BotPipelineTestCase):
         self.assertIn("امروز درباره", user_content)
         row = await self.db.submission(submission)
         assert row is not None
-        self.assertEqual(row.status, "done")
+        self.assertEqual(row.status, "partial")
         self.assertAlmostEqual(row.duration_seconds, 10.0, delta=0.01)
         charges = await self.db.db.execute_fetchall(
             "SELECT seconds FROM ledger WHERE user_id = ? AND kind = 'debit' AND note = ?",
@@ -2731,11 +2737,16 @@ class ReviewSheetDeliveryTests(BotPipelineTestCase):
             else mock.AsyncMock(return_value=sample_payload())
         )
         event = self.media_event()
+        notes = sample_notes()
+        # The render-boundary gate receives a real source containing every
+        # fixture claim; this tests review delivery without bypassing the same
+        # grounding contract used in production.
+        raw = RawTranscript(words=(), text=notes.to_markdown(), engine="speechmatics")
         with mock.patch(
             "gamas_bot.bot.structure_transcript",
-            new=mock.AsyncMock(return_value=sample_notes()),
+            new=mock.AsyncMock(return_value=notes),
         ), mock.patch("gamas_bot.review_sheet.complete_json", new=planner):
-            submission = await self.run_media_job(event, transcribe=self._raw())
+            submission = await self.run_media_job(event, transcribe=raw)
         return event, submission, planner
 
     async def test_a_completed_job_persists_pdf_docx_and_the_review_sheet(self):

@@ -168,7 +168,7 @@ class ComponentTests(unittest.TestCase):
 
     def test_every_section_label_is_present(self):
         for key in ("guide", "glance", "objectives", "summary", "key_points",
-                    "tips", "review", "speakers", "glossary", "about"):
+                    "tips", "review", "common_mistakes", "glossary", "final_review"):
             with self.subTest(label=key):
                 self.assertTrue(components.LABELS[key].strip())
 

@@ -73,7 +73,7 @@ TIPS: dict[str, BlockStyle] = {
     "کاربردی": BlockStyle(_P.note_fill, _P.note_border, "کاربرد", _P.teal_700, _P.ink),
     "هشدار": BlockStyle(_P.warn_fill, _P.warn_border, "هشدار", _P.danger, _P.ink),
 }
-TIP_DEFAULT = BlockStyle(_P.tip_fill, _P.tip_border, "توصیهٔ مدرس", _P.warning, _P.ink)
+TIP_DEFAULT = BlockStyle(_P.tip_fill, _P.tip_border, "نکتهٔ کاربردی", _P.warning, _P.ink)
 
 DEFINITION = BlockStyle(_P.definition_fill, _P.definition_border, "تعریف", _P.navy_700, _P.ink)
 EXAMPLE = BlockStyle(_P.example_fill, _P.example_border, "مثال", _P.success, _P.ink)
@@ -82,11 +82,9 @@ KEY_POINTS = BlockStyle(_P.key_fill, _P.key_border, "نکته‌های کلید�
 SUMMARY = BlockStyle(_P.summary_fill, _P.summary_border, "خلاصه", _P.navy_800, _P.ink)
 QUOTE = BlockStyle(_P.quote_fill, _P.quote_border, "", _P.navy_800, _P.ink)
 HIGH_YIELD = BlockStyle(_P.navy_900, _P.teal_500, "نکات پرتکرار", _P.cyan_500, _P.on_dark)
-TEACHER = BlockStyle(_P.tip_fill, _P.tip_border, "توصیهٔ مدرس", _P.warning, _P.ink)
 GUIDE = BlockStyle(_P.cream_100, _P.line, "راهنمای استفاده", _P.teal_700, _P.ink)
 GLANCE = BlockStyle(_P.cream_50, _P.line, "در یک نگاه", _P.navy_800, _P.ink)
 SOURCE = BlockStyle(_P.cream_50, _P.line, "منبع", _P.muted, _P.muted)
-EDITORIAL = BlockStyle(_P.cream_100, _P.line, "یادداشت ویرایشی", _P.muted, _P.muted)
 
 TABLES = TableStyle(
     header_fill=_P.navy_900,
@@ -124,18 +122,17 @@ LABELS: dict[str, str] = {
     "key_points": "نکته‌های کلیدی",
     "tips": "نکته‌های کاربردی",
     "review": "پرسش‌های مرور",
-    "speakers": "گویندگان و زمان‌بندی",
+    "common_mistakes": "خطاها و دام‌های رایج",
     "glossary": "واژه‌نامهٔ اصطلاح‌ها",
+    "final_review": "مرور نهایی",
     "toc": "فهرست مطالب",
     "content_map": "نقشهٔ محتوا",
-    "about": "دربارهٔ این جزوه",
     "chapter": "فصل",
 }
 
 __all__ = [
     "CALLOUTS",
     "DEFINITION",
-    "EDITORIAL",
     "EXAMPLE",
     "FORMULA",
     "GLANCE",
@@ -148,7 +145,6 @@ __all__ = [
     "SOURCE",
     "SUMMARY",
     "TABLES",
-    "TEACHER",
     "TIPS",
     "BlockStyle",
     "HeadingStyle",
