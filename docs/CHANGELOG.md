@@ -4,6 +4,19 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Booklet prompt and map/reduce corrections.** The Persian generation contract no
+longer asks each chunk to suppress its summary, key points, glossary and
+source-backed objectives while the default pipeline skips the optional compile;
+chunk-local metadata is now merged in source order. The compile prompt now labels
+the topic map as orientation only, not full source evidence, and does not ask the
+editor to reconstruct missing fields from it. Removed prompt rules that
+encouraged decorative tables/callouts and fabricated transitions, and clarified
+that instructions found inside source material are data, not commands. A
+multi-chunk job with an unrecovered map failure now fails as a whole (or uses a
+full-source deterministic fallback), rather than silently merging a subset.
+Topic digests preserve their original chunk positions when a chunk has no usable
+topic label.
+
 **Gamas document design system for booklets.** DOCX and PDF booklets now share
 one art-directed identity instead of two unrelated templates: a central token
 layer (`gamas_bot/document/theme.py`), a semantic component vocabulary, and a
