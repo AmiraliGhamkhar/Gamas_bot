@@ -1,0 +1,181 @@
+{
+  "version": 1,
+  "note": "Semantic booklet assets. Paths are relative to assets/booklet/. Generated once by scripts/build_booklet_assets.py; never rendered per booklet.",
+  "assets": {
+    "brand/monogram": {
+      "path": "brand/monogram.png",
+      "role": "brand-mark",
+      "width": 640,
+      "height": 640,
+      "alt": "نشان گاماس: کتاب باز با خط قلب‌نگاری"
+    },
+    "cover/hero-general": {
+      "path": "cover/hero-general.png",
+      "role": "cover-art",
+      "width": 2100,
+      "height": 960,
+      "alt": "تصویر جلد عمومی: کتاب باز، خط قلب‌نگاری و اشکال علمی"
+    },
+    "cover/hero-medical": {
+      "path": "cover/hero-medical.png",
+      "role": "cover-art",
+      "width": 2100,
+      "height": 960,
+      "alt": "تصویر جلد پزشکی: کتاب باز، صلیب سلامت و مدار عصبی"
+    },
+    "cover/hero-pharma": {
+      "path": "cover/hero-pharma.png",
+      "role": "cover-art",
+      "width": 2100,
+      "height": 960,
+      "alt": "تصویر جلد داروشناسی: کتاب باز، کپسول و ساختار مولکولی"
+    },
+    "cover/hero-anatomy": {
+      "path": "cover/hero-anatomy.png",
+      "role": "cover-art",
+      "width": 2100,
+      "height": 960,
+      "alt": "تصویر جلد آناتومی: کتاب باز، استخوان و طرح اندام"
+    },
+    "cover/hero-nursing": {
+      "path": "cover/hero-nursing.png",
+      "role": "cover-art",
+      "width": 2100,
+      "height": 960,
+      "alt": "تصویر جلد پرستاری: کتاب باز، قلب و برگهٔ بالینی"
+    },
+    "cover/hero-epidemiology": {
+      "path": "cover/hero-epidemiology.png",
+      "role": "cover-art",
+      "width": 2100,
+      "height": 960,
+      "alt": "تصویر جلد اپیدمیولوژی: کتاب باز، نمودار جمعیت و آمار"
+    },
+    "cover/hero-chemistry": {
+      "path": "cover/hero-chemistry.png",
+      "role": "cover-art",
+      "width": 2100,
+      "height": 960,
+      "alt": "تصویر جلد بیوشیمی: کتاب باز، ارلن آزمایشگاهی و مولکول"
+    },
+    "cover/hero-data": {
+      "path": "cover/hero-data.png",
+      "role": "cover-art",
+      "width": 2100,
+      "height": 960,
+      "alt": "تصویر جلد داده و فناوری: کتاب باز، شبکه و نمودار داده"
+    },
+    "decorative/ecg-line": {
+      "path": "decorative/ecg-line.png",
+      "role": "divider",
+      "width": 1800,
+      "height": 160,
+      "alt": "خط قلب‌نگاری تزئینی"
+    },
+    "icons/book": {
+      "path": "icons/book.png",
+      "role": "emblem",
+      "width": 320,
+      "height": 320,
+      "alt": "کتاب باز"
+    },
+    "icons/cross": {
+      "path": "icons/cross.png",
+      "role": "emblem",
+      "width": 320,
+      "height": 320,
+      "alt": "صلیب سلامت"
+    },
+    "icons/capsule": {
+      "path": "icons/capsule.png",
+      "role": "emblem",
+      "width": 320,
+      "height": 320,
+      "alt": "کپسول دارویی"
+    },
+    "icons/bone": {
+      "path": "icons/bone.png",
+      "role": "emblem",
+      "width": 320,
+      "height": 320,
+      "alt": "استخوان"
+    },
+    "icons/heart": {
+      "path": "icons/heart.png",
+      "role": "emblem",
+      "width": 320,
+      "height": 320,
+      "alt": "قلب"
+    },
+    "icons/chart": {
+      "path": "icons/chart.png",
+      "role": "emblem",
+      "width": 320,
+      "height": 320,
+      "alt": "نمودار آماری"
+    },
+    "icons/flask": {
+      "path": "icons/flask.png",
+      "role": "emblem",
+      "width": 320,
+      "height": 320,
+      "alt": "ارلن آزمایشگاهی"
+    },
+    "icons/network": {
+      "path": "icons/network.png",
+      "role": "emblem",
+      "width": 320,
+      "height": 320,
+      "alt": "شبکهٔ داده"
+    },
+    "icons/leaf": {
+      "path": "icons/leaf.png",
+      "role": "decoration",
+      "width": 320,
+      "height": 320,
+      "alt": "برگ تزئینی"
+    }
+  },
+  "topics": {
+    "general": {
+      "label": "عمومی",
+      "cover": "cover/hero-general",
+      "emblem": "icons/book"
+    },
+    "medical": {
+      "label": "پزشکی و علوم سلامت",
+      "cover": "cover/hero-medical",
+      "emblem": "icons/cross"
+    },
+    "pharma": {
+      "label": "داروشناسی",
+      "cover": "cover/hero-pharma",
+      "emblem": "icons/capsule"
+    },
+    "anatomy": {
+      "label": "آناتومی",
+      "cover": "cover/hero-anatomy",
+      "emblem": "icons/bone"
+    },
+    "nursing": {
+      "label": "پرستاری",
+      "cover": "cover/hero-nursing",
+      "emblem": "icons/heart"
+    },
+    "epidemiology": {
+      "label": "اپیدمیولوژی",
+      "cover": "cover/hero-epidemiology",
+      "emblem": "icons/chart"
+    },
+    "chemistry": {
+      "label": "علوم آزمایشگاهی و بیوشیمی",
+      "cover": "cover/hero-chemistry",
+      "emblem": "icons/flask"
+    },
+    "data": {
+      "label": "داده و فناوری سلامت",
+      "cover": "cover/hero-data",
+      "emblem": "icons/network"
+    }
+  }
+}

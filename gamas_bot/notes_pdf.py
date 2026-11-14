@@ -1,33 +1,29 @@
-"""Reference-grade PDF renderer for Gamas structured educational notes.
+"""The Gamas PDF booklet renderer.
 
-Produces a professional Persian RTL study booklet with:
+This is the print deliverable of the same validated ``StructuredNotes`` model
+that :mod:`gamas_bot.docx_export` renders to Word. Both renderers read the same
+design system (:mod:`gamas_bot.document`): the same palette, type scale, page
+grid, component vocabulary and artwork. That shared source of truth — not a
+parallel look — is what makes the PDF and the DOCX read as one publication.
 
-* A cover page featuring a rounded dark-navy title panel, a label such as
-  ``جزوه جلسه``, the lecture title, source-derived date/class-number/duration
-  metadata, a vertical central connector, and alternating numbered topic cards
-  (a real topic map generated from actual section headings).
-* Body pages with hierarchical H1/H2/H3 headings, a cobalt vertical accent bar
-  beside major section titles, thin light-grey separator lines, readable
-  Persian body typography, consistent spacing, and proper RTL layout.
-* Visually distinct content blocks:
+Layout:
 
-  - Definitions — pale lavender/blue background, dark-blue accent border,
-    clear "تعریف" label.
-  - Examples — soft mint-green background with green accent border.
-  - Inline important terminology — controlled yellow highlighting.
-  - Key points — compact, visually distinct information blocks.
-  - Processes — rounded step cards.
-  - Tables — RTL tables with aligned headers, cell padding, and restrained
-    alternating row backgrounds.
-  - Glossary — three-column table: اصطلاح، معادل، تعریف.
+* **Cover** — cream paper, navy frame, the Gamas monogram, a navy title panel,
+  the topic-aware hero artwork, the quotation panel.
+* **Body** — chapter eyebrows and navy chapter banners, teal subheads, cream
+  and tinted cards for definitions/examples/formulas, navy high-yield cards for
+  exam-oriented lecturer notes, RTL tables with a repeating navy header, and a
+  running header/footer with real page numbers.
+* **Close** — glossary, editorial note and the automatic-generation disclaimer.
 
-* Final page with session glossary (when supported), source date, page
-  numbering, a concise Gamas attribution, and an honest automatic-generation
-  disclaimer.
+Persian is shaped with ``arabic_reshaper`` and reordered with ``python-bidi``;
+wrapping happens on the *logical* text (see :mod:`gamas_bot.document.rtl`), so a
+line break can never split a contextual letter form. The canvas is invariant:
+identical notes always produce identical bytes.
 
-Persian shaping uses ``arabic_reshaper``; visual reordering uses ``python-bidi``.
-The face is Vazirmatn (SIL OFL) from ``assets/fonts/``. The PDF canvas is
-``invariant`` so identical notes yield identical bytes.
+The module is deliberately a *renderer*: it never decides what the notes say,
+never adds a scientific claim, and never labels a sentence as exam material
+unless the source pipeline already attributed that tip to the lecturer.
 """
 
 from __future__ import annotations
@@ -38,15 +34,15 @@ from datetime import datetime
 from xml.sax.saxutils import escape as _xml_escape
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.units import cm, mm
+from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.platypus import (
     BaseDocTemplate,
     Flowable,
     Frame,
+    Image as RLImage,
     KeepTogether,
     PageBreak,
     PageTemplate,
@@ -55,134 +51,104 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
-from reportlab.platypus.flowables import HRFlowable
 
-from .docx_export import DocumentMeta, PAGE_HEADER_TEXT, jalali_date
-from .notes import GlossaryEntry, NoteSection, NoteTable, StructuredNotes
+from .document import components as design
+from .document.assets import booklet_text, topic_for
+from .document.assets import optional as optional_asset
+from .document.layout import pdf_frame
+from .document.rtl import visual, visual_ltr, wrap_logical
+from .document.theme import THEME
+from .docx_export import DocumentMeta, jalali_date
+from .notes import NoteSection, NoteTable, StructuredNotes
 from .pdf_common import (
     BOLD_NAME,
     REGULAR_NAME,
     InvariantCanvas as _InvariantCanvas,
     register_fonts,
-    visual,
 )
 from .progress import to_persian_digits
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Geometry
-# ---------------------------------------------------------------------------
+PAL = THEME.palette
+TYPE = THEME.type
+SPACE = THEME.space
+FRAME = pdf_frame()
 
-_PAGE_W, _PAGE_H = A4  # 595.27 x 841.89 pt
-_MARGIN_LR = 2.0 * cm
-_MARGIN_TOP = 2.2 * cm
-_MARGIN_BOTTOM = 2.0 * cm
-_FRAME_W = _PAGE_W - 2 * _MARGIN_LR
-_FRAME_H = _PAGE_H - _MARGIN_TOP - _MARGIN_BOTTOM
+_PAGE_W = FRAME.page_width
+_PAGE_H = FRAME.page_height
+_MARGIN_LR = FRAME.margin_lr
+_MARGIN_TOP = FRAME.margin_top
+_MARGIN_BOTTOM = FRAME.margin_bottom
+_FRAME_W = FRAME.width
+_FRAME_H = FRAME.height
 
-# ---------------------------------------------------------------------------
-# Palette (Gamas-native, matching the DOCX family and the reference design)
-# ---------------------------------------------------------------------------
 
-NAVY = colors.HexColor("#1D3557")        # deep navy — title, H1, brand, cover
-COBALT = colors.HexColor("#2C5F8A")      # cobalt — H2 accent bars
-STEEL = colors.HexColor("#457B9D")       # steel blue — H3, rules
-MUTED = colors.HexColor("#5C6B7A")       # slate grey — metadata, captions
-BODY_COLOR = colors.HexColor("#2A2F36")  # near-black for body
-RULE = colors.HexColor("#B9CFDD")        # hairline rules
+def _c(value: str) -> colors.Color:
+    return colors.HexColor(value)
 
-# Content-block tints + matching darker borders.
-DEF_FILL = colors.HexColor("#EEE8F6")    # pale lavender/blue — definitions
-DEF_BORDER = colors.HexColor("#9E8BC9")  # dark-blue/lavender border
-EX_FILL = colors.HexColor("#E6F4EA")     # soft mint green — examples
-EX_BORDER = colors.HexColor("#8CC39D")   # green border
-KEY_FILL = colors.HexColor("#EAF2F5")    # light blue — key points
-KEY_BORDER = colors.HexColor("#9EC2D3")  # steel border
-HL_YELLOW = colors.HexColor("#FFF4B8")   # controlled yellow inline highlight
-ZEBRA = colors.HexColor("#F4F8FA")       # table alternating rows
-GRID = colors.HexColor("#C7D3DE")        # table grid
-COVER_CARD_COLORS: tuple[colors.HexColor, ...] = (
-    colors.HexColor("#E8F0F7"),  # mist blue
-    colors.HexColor("#FDEDE8"),  # soft peach
-    colors.HexColor("#E8F6EE"),  # mint
-    colors.HexColor("#F3ECF8"),  # lilac
-    colors.HexColor("#FFF6E0"),  # cream
-    colors.HexColor("#E2F0F5"),  # sky
-    colors.HexColor("#FBE8EE"),  # rose
-    colors.HexColor("#EAF0E5"),  # sage
-)
-STEP_FILL = colors.HexColor("#EEF4F8")
-STEP_BORDER = colors.HexColor("#7DA7C7")
-GLOSSARY_HEADER_FILL = NAVY
+
+NAVY = _c(PAL.navy_900)
+NAVY_DEEP = _c(PAL.navy_950)
+TEAL = _c(PAL.teal_700)
+TEAL_LIGHT = _c(PAL.teal_400)
+CYAN = _c(PAL.cyan_500)
+CREAM = _c(PAL.cream_50)
+CREAM_100 = _c(PAL.cream_100)
+PAPER = _c(PAL.paper)
+INK = _c(PAL.ink)
+BODY = _c(PAL.body)
+MUTED = _c(PAL.muted)
+LINE = _c(PAL.line)
+ZEBRA = _c(PAL.zebra)
+ON_DARK = _c(PAL.on_dark)
+WHITE = colors.white
+
 
 # ---------------------------------------------------------------------------
-# Fonts (Vazirmatn, SIL OFL, bundled in the repository)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Persian text shaping: logical wrap, then reshape/bidi per line.
+# Text helpers
 # ---------------------------------------------------------------------------
 
 
-def _wrap_words(text: str, font: str, size: float, max_width: float) -> list[str]:
-    """Word-wrap on logical text; returns logical lines."""
-    words = (text or "").split()
-    lines: list[str] = []
-    cur = ""
-    for word in words:
-        cand = f"{cur} {word}".strip()
-        if not cur or pdfmetrics.stringWidth(cand, font, size) <= max_width:
-            cur = cand
-        else:
-            if cur:
-                lines.append(cur)
-            # word itself wider than max width? hard break
-            if pdfmetrics.stringWidth(word, font, size) > max_width:
-                piece = ""
-                for ch in word:
-                    trial = piece + ch
-                    if not piece or pdfmetrics.stringWidth(trial, font, size) <= max_width:
-                        piece = trial
-                    else:
-                        lines.append(piece)
-                        piece = ch
-                cur = piece
-            else:
-                cur = word
-    if cur:
-        lines.append(cur)
-    return lines
+def _measure(font: str, size: float):
+    def measure(text: str) -> float:
+        return pdfmetrics.stringWidth(text, font, size)
+
+    return measure
 
 
-def _rtl_paragraph(
-    text: str,
-    style: ParagraphStyle,
-    width: float,
-    *,
-    highlight_terms: tuple[str, ...] = (),
+def _rtl(
+    text: str, style: ParagraphStyle, width: float, *, marker: str = ""
 ) -> Paragraph:
-    """Produce a pre-wrapped, shaped Paragraph so ReportLab never re-wraps us."""
-    lines = _wrap_words(text or "", style.fontName, style.fontSize, width)
-    shaped_lines: list[str] = []
+    """A right-to-left paragraph pre-wrapped in logical order, then shaped.
+
+    ``marker`` is appended to each *visual* line: appending to the logical text
+    would place a leading bullet at the visual left edge, because BiDi treats
+    it as a neutral character and the paragraph is RTL.
+    """
+    lines = wrap_logical(text or "", _measure(style.fontName, style.fontSize), width)
+    shaped = []
     for line in lines:
-        # ``shaped`` holds display-order markup; ``visual`` stays the helper.
-        shaped = _xml_escape(visual(line))
-        if highlight_terms:
-            for term in highlight_terms:
-                if not term:
-                    continue
-                # We highlight at the visual level for simple terms: this is
-                # a controlled approach — only known terms get yellow.
-                vterm = visual(term)
-                if vterm and vterm in shaped:
-                    shaped = shaped.replace(
-                        vterm,
-                        f'<back color="{HL_YELLOW.hexval()[2:]}">{vterm}</back>',
-                    )
-        shaped_lines.append(shaped)
-    body = "<br/>".join(shaped_lines) if shaped_lines else " "
+        rendered = _xml_escape(visual(line))
+        shaped.append(f"{rendered} {marker}" if marker else rendered)
+    return Paragraph("<br/>".join(shaped) or " ", style)
+
+
+def _ltr(text: str, style: ParagraphStyle, width: float) -> Paragraph:
+    """A left-to-right paragraph (formulas, Latin-only technical lines)."""
+    lines = wrap_logical(text or "", _measure(style.fontName, style.fontSize), width)
+    body = "<br/>".join(_xml_escape(visual_ltr(line)) for line in lines) or " "
     return Paragraph(body, style)
+
+
+def _mixed(text: str, style: ParagraphStyle, width: float) -> Paragraph:
+    """Shape Persian, keep pure-Latin lines LTR (used for glossary terms)."""
+    lines = wrap_logical(text or "", _measure(style.fontName, style.fontSize), width)
+    shaped = []
+    for line in lines:
+        latin_only = all(ord(char) < 0x0590 for char in line)
+        shaped.append(_xml_escape(line) if latin_only else _xml_escape(visual(line)))
+    return Paragraph("<br/>".join(shaped) or " ", style)
 
 
 # ---------------------------------------------------------------------------
@@ -193,776 +159,842 @@ def _rtl_paragraph(
 def _styles() -> dict[str, ParagraphStyle]:
     regular, bold = register_fonts()
 
-    def s(name, font, size, leading, color, align, **kw):
+    def style(name, font, size, leading, color, align, **kwargs):
         return ParagraphStyle(
             name, fontName=font, fontSize=size, leading=leading,
-            textColor=color, alignment=align, **kw,
+            textColor=color, alignment=align, **kwargs,
         )
 
     return {
-        "body": s("NBody", regular, 11, 17, BODY_COLOR, TA_JUSTIFY,
-                 spaceAfter=5, wordWrap="RTL"),
-        "bullet": s("NBullet", regular, 11, 16.5, BODY_COLOR, TA_RIGHT,
-                    spaceAfter=3, rightIndent=8, leftIndent=4, wordWrap="RTL"),
-        "h1": s("NH1", bold, 16, 22, NAVY, TA_RIGHT,
-                spaceBefore=14, spaceAfter=6, keepWithNext=1, wordWrap="RTL"),
-        "h2": s("NH2", bold, 13.5, 19, COBALT, TA_RIGHT,
-                spaceBefore=10, spaceAfter=4, keepWithNext=1, wordWrap="RTL"),
-        "h3": s("NH3", bold, 12, 17, STEEL, TA_RIGHT,
-                spaceBefore=8, spaceAfter=3, keepWithNext=1, wordWrap="RTL"),
-        # Cover
-        "cover_label": s("NCLabel", bold, 11, 14, colors.white, TA_CENTER, spaceAfter=4),
-        "cover_title": s("NCTitle", bold, 22, 30, colors.white, TA_CENTER, spaceAfter=8),
-        "cover_meta": s("NCMeta", regular, 10, 14, colors.HexColor("#D6E2ED"), TA_CENTER, spaceAfter=2),
-        "cover_brand": s("NCBrand", bold, 13, 17, MUTED, TA_CENTER, spaceAfter=2),
-        # Topic card styles
-        "card_num": s("NCardNum", bold, 13, 16, colors.white, TA_CENTER),
-        "card_text": s("NCardText", bold, 10, 14, NAVY, TA_RIGHT),
-        # Content blocks
-        "def_label": s("NDefLabel", bold, 10.5, 14, DEF_BORDER, TA_RIGHT, spaceAfter=2),
-        "def_body": s("NDefBody", regular, 11, 16, BODY_COLOR, TA_JUSTIFY),
-        "def_term": s("NDefTerm", bold, 11.5, 16, NAVY, TA_RIGHT, spaceAfter=2),
-        "ex_label": s("NExLabel", bold, 10.5, 14, EX_BORDER, TA_RIGHT, spaceAfter=2),
-        "ex_body": s("NExBody", regular, 11, 16, BODY_COLOR, TA_JUSTIFY),
-        "key_label": s("NKeyLabel", bold, 10.5, 14, KEY_BORDER, TA_RIGHT, spaceAfter=2),
-        "key_item": s("NKeyItem", regular, 10.5, 15.5, BODY_COLOR, TA_RIGHT,
-                      spaceAfter=2, rightIndent=6),
-        "step_num": s("NStepNum", bold, 11, 14, colors.white, TA_CENTER),
-        "step_body": s("NStepBody", regular, 10.5, 15.5, BODY_COLOR, TA_RIGHT),
-        # Tables
-        "cell_head": s("NCellHead", bold, 10.5, 14, colors.white, TA_CENTER),
-        "cell": s("NCell", regular, 10, 14, BODY_COLOR, TA_RIGHT),
-        "cell_center": s("NCellC", regular, 10, 14, BODY_COLOR, TA_CENTER),
-        # Glossary
-        "glos_head": s("NGlosHead", bold, 10.5, 14, colors.white, TA_CENTER),
-        "glos_term": s("NGlosTerm", bold, 10.5, 14, NAVY, TA_RIGHT),
-        "glos_en": s("NGlosEn", regular, 9.5, 13, MUTED, TA_LEFT),
-        "glos_def": s("NGlosDef", regular, 10, 14, BODY_COLOR, TA_RIGHT),
-        # Disclaimer / footer
-        "disclaimer": s("NDisclaimer", regular, 8.5, 12, MUTED, TA_JUSTIFY, spaceAfter=4),
-        "attribution": s("NAttrib", regular, 9, 12, MUTED, TA_CENTER, spaceAfter=2),
-        "summary": s("NSummary", regular, 11, 17, BODY_COLOR, TA_JUSTIFY, spaceAfter=8),
+        "body": style("GmsBody", regular, TYPE.body, TYPE.body_pdf_leading, BODY, TA_RIGHT,
+                      spaceAfter=6),
+        "bullet": style("GmsBullet", regular, TYPE.body, TYPE.body_pdf_leading, BODY, TA_RIGHT,
+                        spaceAfter=4, rightIndent=6, leftIndent=4),
+        "h2": style("GmsH2", bold, TYPE.h2, TYPE.h2 * 1.35, TEAL, TA_RIGHT,
+                    spaceBefore=10, spaceAfter=4, keepWithNext=1),
+        "h3": style("GmsH3", bold, TYPE.h3, TYPE.h3 * 1.35, _c(PAL.navy_700), TA_RIGHT,
+                    spaceBefore=7, spaceAfter=3, keepWithNext=1),
+        "banner": style("GmsBanner", bold, TYPE.banner, TYPE.banner * 1.3, ON_DARK, TA_RIGHT),
+        "h1_light": style("GmsH1Light", bold, TYPE.banner, TYPE.banner * 1.35, TEAL, TA_RIGHT,
+                          spaceBefore=10, spaceAfter=3, keepWithNext=1),
+        "eyebrow": style("GmsEyebrow", bold, TYPE.eyebrow, TYPE.eyebrow * 1.4, TEAL, TA_RIGHT),
+        "card_label": style("GmsCardLabel", bold, 8.8, 11.5, TEAL, TA_RIGHT, spaceAfter=2),
+        "card_label_dark": style("GmsCardLabelDark", bold, 8.8, 11.5, CYAN, TA_RIGHT, spaceAfter=2),
+        "card_term": style("GmsCardTerm", bold, 11, 15, NAVY, TA_RIGHT, spaceAfter=2),
+        "card_body": style("GmsCardBody", regular, 10.6, 16, BODY, TA_RIGHT),
+        "card_body_dark": style("GmsCardBodyDark", regular, 10.6, 16, CREAM, TA_RIGHT),
+        "card_item": style("GmsCardItem", regular, 10.4, 15.5, BODY, TA_RIGHT,
+                           rightIndent=6, spaceAfter=2),
+        "card_item_dark": style("GmsCardItemDark", regular, 10.4, 15.5, CREAM, TA_RIGHT,
+                                rightIndent=6, spaceAfter=2),
+        "formula": style("GmsFormula", regular, 10.6, 15.5, _c(PAL.navy_800), TA_LEFT),
+        "caption": style("GmsCaption", regular, TYPE.caption, 12, MUTED, TA_CENTER, spaceAfter=4),
+        "cell_head": style("GmsCellHead", bold, TYPE.table_head, 13.5, WHITE, TA_CENTER),
+        "cell": style("GmsCell", regular, TYPE.table, 14, BODY, TA_RIGHT),
+        "cell_strong": style("GmsCellStrong", bold, TYPE.table, 14, NAVY, TA_RIGHT),
+        "cell_ltr": style("GmsCellLtr", regular, TYPE.table, 14, BODY, TA_LEFT),
+        # cover
+        "cover_brand": style("GmsCoverBrand", bold, 30, 34, NAVY, TA_CENTER),
+        "cover_sub": style("GmsCoverSub", regular, 7.8, 10, TEAL, TA_CENTER),
+        "cover_god": style("GmsCoverGod", regular, 10, 13, MUTED, TA_CENTER, spaceAfter=6),
+        "cover_label": style("GmsCoverLabel", bold, 9.2, 12, CYAN, TA_CENTER, spaceAfter=4),
+        "cover_title": style("GmsCoverTitle", bold, 20, 27, ON_DARK, TA_CENTER, spaceAfter=6),
+        "cover_meta": style("GmsCoverMeta", regular, 9, 12.5, CREAM_100, TA_CENTER),
+        "quote": style("GmsQuote", regular, 11.5, 17, NAVY, TA_CENTER),
+        "attribution": style("GmsAttribution", regular, 8.6, 12, MUTED, TA_CENTER, spaceAfter=2),
+        "disclaimer": style("GmsDisclaimer", regular, 8.4, 12.5, MUTED, TA_RIGHT, spaceAfter=4),
+        "note_small": style("GmsNoteSmall", regular, 8.2, 11.5, MUTED, TA_RIGHT),
+        "step_num": style("GmsStepNum", bold, 9.5, 12, WHITE, TA_CENTER),
     }
 
 
 # ---------------------------------------------------------------------------
-# Custom flowables
+# Flowables
 # ---------------------------------------------------------------------------
 
 
-class _VerticalBar(Flowable):
-    """A cobalt vertical accent bar drawn on the right edge of a heading."""
+class _EcgRule(Flowable):
+    """The Gamas motif as a hairline: a flat ECG complex, drawn as vectors.
 
-    def __init__(self, height: float, color: colors.Color = COBALT, width: float = 4):
-        super().__init__()
-        self.height = height
-        self.color = color
-        self.width = width
-
-    def wrap(self, availW, availH):
-        return self.width, self.height
-
-    def draw(self):
-        self.canv.setFillColor(self.color)
-        self.canv.roundRect(0, 0, self.width, self.height, 2, fill=1, stroke=0)
-
-
-class _CircleBadge(Flowable):
-    """A numbered circle used for step cards."""
-
-    def __init__(self, number: int, size: float = 22,
-                 bg: colors.Color = STEP_BORDER, fg: colors.Color = colors.white):
-        super().__init__()
-        self.number = number
-        self.size = size
-        self.bg = bg
-        self.fg = fg
-
-    def wrap(self, w, h):
-        return self.size, self.size
-
-    def draw(self):
-        c = self.canv
-        r = self.size / 2
-        c.setFillColor(self.bg)
-        c.circle(r, r, r, fill=1, stroke=0)
-        c.setFillColor(self.fg)
-        c.setFont(BOLD_NAME, 10.5)
-        label = to_persian_digits(str(self.number))
-        c.drawCentredString(r, r - 3.5, visual(label))
-
-
-class _ArrowDown(Flowable):
-    """The connector between step cards, drawn as a vector.
-
-    Vazirmatn has no U+2193 (↓) glyph, so a text arrow rendered as an empty
-    .notdef box — the gap visual QA caught between step cards. Canvas
-    primitives need no font coverage and stay crisp at every size.
+    Canvas primitives need no font coverage and stay crisp at any size, unlike
+    a glyph (Vazirmatn has no arrow/ECG character and would draw ``.notdef``).
     """
 
-    def __init__(self, height: float = 12, color: colors.Color = STEP_BORDER):
+    def __init__(self, width: float, *, height: float = 9, color: colors.Color = CYAN,
+                 thickness: float = 1.0) -> None:
         super().__init__()
-        self.height = height
-        self.color = color
-        self._cx = 0.0
+        self._width = width
+        self._height = height
+        self._color = color
+        self._thickness = thickness
+        # Flush the motif to the reading start (right) in this RTL document.
+        self.hAlign = "RIGHT"
 
-    def wrap(self, availW, availH):
-        self._cx = availW / 2.0
-        return availW, self.height
+    def wrap(self, availWidth, availHeight):
+        return self._width, self._height
 
     def draw(self):
-        c = self.canv
-        c.setStrokeColor(self.color)
-        c.setFillColor(self.color)
-        c.setLineWidth(1.4)
-        c.setLineCap(1)
-        top = self.height - 1.0
-        c.line(self._cx, top, self._cx, 5.0)
-        head = c.beginPath()
-        head.moveTo(self._cx - 3.4, 6.4)
-        head.lineTo(self._cx + 3.4, 6.4)
-        head.lineTo(self._cx, 1.4)
-        head.close()
-        c.drawPath(head, fill=1, stroke=0)
+        canv = self.canv
+        canv.saveState()
+        canv.setStrokeColor(self._color)
+        canv.setLineWidth(self._thickness)
+        canv.setLineCap(1)
+        base = self._height / 2
+        span = self._width
+        path = canv.beginPath()
+        path.moveTo(0, base)
+        for fraction, height in (
+            (0.18, 0), (0.24, 2.4), (0.27, -1.6), (0.30, 6.4), (0.33, -4.2),
+            (0.37, 1.2), (0.42, 0), (0.78, 0),
+        ):
+            path.lineTo(span * fraction, base + height * (self._height / 12))
+        path.lineTo(span, base)
+        canv.drawPath(path, stroke=1, fill=0)
+        canv.restoreState()
 
 
-class _TopicMap(Flowable):
-    """The cover topic map: central vertical connector + alternating cards."""
+class _StepBadge(Flowable):
+    """A teal numbered circle, drawn as vectors."""
 
-    def __init__(self, topics: list[str], *, width: float):
+    def __init__(self, number: int, size: float = 16) -> None:
         super().__init__()
-        self.topics = topics[:8]
-        self.width = width
-        self.card_h = 22 * mm
-        self.card_w = width * 0.42
-        self.gap_x = width * 0.08
-        self.gap_y = 6 * mm
-        self.top_pad = 6 * mm
-        self.bot_pad = 4 * mm
+        self._number = number
+        self._size = size
 
-    def wrap(self, w, h):
-        n = len(self.topics)
-        height = self.top_pad + self.bot_pad + n * self.card_h + (n - 1) * self.gap_y
-        return self.width, height
+    def wrap(self, availWidth, availHeight):
+        return self._size, self._size
 
     def draw(self):
-        c = self.canv
-        n = len(self.topics)
-        total_h = self.top_pad + self.bot_pad + n * self.card_h + (n - 1) * self.gap_y
-        center_x = self.width / 2
-
-        # Central connector
-        c.setStrokeColor(STEEL)
-        c.setLineWidth(1.5)
-        c.setDash([3, 3], 0)
-        c.line(center_x, 0, center_x, total_h)
-        c.setDash()
-
-        # Small circles at top and bottom of connector
-        for cy in (total_h - 2, 2):
-            c.setFillColor(NAVY)
-            c.circle(center_x, cy, 3, fill=1, stroke=0)
-
-        for idx, topic in enumerate(self.topics):
-            row_y = total_h - self.top_pad - (idx + 1) * self.card_h - idx * self.gap_y
-            is_left = (idx % 2 == 1)  # 0,2,4... on right, 1,3,5... on left
-            color = COVER_CARD_COLORS[idx % len(COVER_CARD_COLORS)]
-            # Card position
-            if is_left:
-                cx = self.gap_x
-                dot_x = cx + self.card_w
-                conn_end_x = center_x - 6
-            else:
-                cx = self.width - self.gap_x - self.card_w
-                dot_x = cx
-                conn_end_x = center_x + 6
-            cy = row_y
-            # Draw connecting line from card edge to central axis
-            c.setStrokeColor(STEEL)
-            c.setLineWidth(0.8)
-            c.line(dot_x, cy + self.card_h / 2, conn_end_x, cy + self.card_h / 2)
-
-            # Card background (rounded rectangle)
-            c.setFillColor(color)
-            c.setStrokeColor(NAVY)
-            c.setLineWidth(0.7)
-            c.roundRect(cx, cy, self.card_w, self.card_h, 4 * mm, fill=1, stroke=1)
-
-            # Number badge on the connector node at the card edge. It used to
-            # sit inside the card corner, right where the right-aligned RTL
-            # text begins — visual QA caught the circle printed over the first
-            # word. On the edge (replacing the old connection dot) it can
-            # never collide with the text.
-            badge_r = 3 * mm
-            badge_cx = dot_x
-            badge_cy = cy + self.card_h / 2
-            c.setFillColor(NAVY)
-            c.setStrokeColor(colors.white)
-            c.setLineWidth(1.2)
-            c.circle(badge_cx, badge_cy, badge_r, fill=1, stroke=1)
-            # Number text
-            c.setFillColor(colors.white)
-            c.setFont(BOLD_NAME, 9)
-            nlabel = to_persian_digits(str(idx + 1))
-            c.drawCentredString(badge_cx, badge_cy - 3, visual(nlabel))
-
-            # Topic text (wrapped), right-aligned like any RTL line, with
-            # margins that clear the edge badge.
-            label_w = self.card_w - 10 * mm
-            # Since we are drawing at canvas level, do our own wrap & draw.
-            lines = _wrap_words(topic, REGULAR_NAME, 10, label_w)
-            text_y = cy + self.card_h / 2 + (len(lines) - 1) * 6
-            c.setFillColor(NAVY)
-            c.setFont(BOLD_NAME, 10)
-            for line in lines[:2]:
-                lw = pdfmetrics.stringWidth(line, BOLD_NAME, 10)
-                tx = cx + self.card_w - 5 * mm - lw
-                c.drawString(tx, text_y, visual(line))
-                text_y -= 12
+        canv = self.canv
+        radius = self._size / 2
+        canv.setFillColor(TEAL)
+        canv.setStrokeColor(CYAN)
+        canv.setLineWidth(0.8)
+        canv.circle(radius, radius, radius, stroke=1, fill=1)
+        canv.setFillColor(WHITE)
+        canv.setFont(BOLD_NAME, 9)
+        canv.drawCentredString(radius, radius - 3.2, visual(to_persian_digits(str(self._number))))
 
 
 # ---------------------------------------------------------------------------
-# Block builders
+# Component builders
 # ---------------------------------------------------------------------------
 
 
-def _h1_with_bar(text: str, styles) -> list[Flowable]:
-    """H1 heading with a cobalt vertical bar to its right."""
-    p = _rtl_paragraph(text, styles["h1"], _FRAME_W - 10)
-    bar = _VerticalBar(22, COBALT, 4)
-    # Use a 1-row table: bar on the right, heading in the rest
-    t = Table(
-        [[p, bar]],
-        colWidths=[_FRAME_W - 10, 6],
-        hAlign="RIGHT",
-    )
-    t.setStyle(TableStyle([
+def _banner(text: str, styles) -> Table:
+    """The navy chapter banner: white title on a deep-navy bar."""
+    body = _rtl(text, styles["banner"], _FRAME_W - 26)
+    table = Table([[body]], colWidths=[_FRAME_W], hAlign="CENTER")
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), NAVY),
+        ("ROUNDEDCORNERS", [6, 6, 6, 6]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 13),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 13),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LINEBELOW", (0, 0), (-1, -1), 1.4, CYAN),
+    ]))
+    return table
+
+
+def _display_heading(text: str, styles) -> list[Flowable]:
+    """A front-matter heading: teal type over a short cyan ECG rule.
+
+    Deliberately lighter than a chapter banner. Chapters, the key-points
+    summary and the glossary own the navy bars; the reading guide, the overview
+    and the closing material use this register, so a navy bar always means "a
+    major destination in this booklet".
+    """
+    return [
+        _rtl(text, styles["h1_light"], _FRAME_W),
+        _EcgRule(96, height=7, color=TEAL_LIGHT),
+        Spacer(1, 5),
+    ]
+
+
+def _subheading(text: str, styles, *, level: int = 2) -> Table:
+    """A teal subheading with a short accent bar on its right edge."""
+    paragraph = _rtl(text, styles["h2" if level == 2 else "h3"], _FRAME_W - 14)
+    accent = TEAL_LIGHT if level == 2 else LINE
+    bar = Table([[""]], colWidths=[3.2], rowHeights=[max(13.0, TYPE.h2 * 1.1)])
+    bar.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), accent),
         ("LEFTPADDING", (0, 0), (-1, -1), 0),
         ("RIGHTPADDING", (0, 0), (-1, -1), 0),
         ("TOPPADDING", (0, 0), (-1, -1), 0),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
     ]))
-    return [Spacer(1, 2), t]
-
-
-def _definition_block(term: str, term_en: str, definition: str, styles,
-                      width: float) -> Flowable:
-    parts = [
-        Paragraph(_xml_escape(visual("تعریف")), styles["def_label"]),
-    ]
-    label = term
-    if term_en:
-        label = f"{term} ({term_en})"
-    parts.append(Paragraph(_xml_escape(visual(label)), styles["def_term"]))
-    parts.append(_rtl_paragraph(definition, styles["def_body"], width - 16))
-    inner = Table([[p] for p in parts], colWidths=[width - 16])
-    inner.setStyle(TableStyle([
+    table = Table([[paragraph, bar]], colWidths=[_FRAME_W - 6, 6], hAlign="RIGHT")
+    table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("LEFTPADDING", (0, 0), (-1, -1), 0),
         ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 1),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
     ]))
-    outer = Table([[inner]], colWidths=[width])
-    outer.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), DEF_FILL),
-        ("LINEBEFORE", (0, 0), (0, -1), 3, DEF_BORDER),  # RTL: accent on right
-        ("LEFTPADDING", (0, 0), (-1, -1), 10),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-        ("TOPPADDING", (0, 0), (-1, -1), 8),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-    ]))
-    return KeepTogether([outer, Spacer(1, 6)])
+    return table
 
 
-def _example_block(example: str, styles, width: float) -> Flowable:
-    parts = [
-        Paragraph(_xml_escape(visual("مثال")), styles["ex_label"]),
-        _rtl_paragraph(example, styles["ex_body"], width - 16),
-    ]
-    inner = Table([[p] for p in parts], colWidths=[width - 16])
+def _card(block: design.BlockStyle, rows: list[Flowable], *, width: float) -> Table:
+    """One Gamas card: tinted panel, deeper frame, accent edge, rounded corners."""
+    inner_width = width - 24
+    inner = Table([[row] for row in rows], colWidths=[inner_width])
     inner.setStyle(TableStyle([
         ("LEFTPADDING", (0, 0), (-1, -1), 0),
         ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 1),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-    ]))
-    outer = Table([[inner]], colWidths=[width])
-    outer.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), EX_FILL),
-        ("LINEBEFORE", (0, 0), (0, -1), 3, EX_BORDER),
-        ("LEFTPADDING", (0, 0), (-1, -1), 10),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-        ("TOPPADDING", (0, 0), (-1, -1), 8),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-    ]))
-    return KeepTogether([outer, Spacer(1, 6)])
-
-
-def _keypoints_block(label: str, points: list[str], styles, width: float) -> Flowable:
-    parts = [Paragraph(_xml_escape(visual(label)), styles["key_label"])]
-    bullet_style = styles["key_item"]
-    for pt in points:
-        parts.append(_rtl_paragraph(f"• {pt}", bullet_style, width - 20))
-    inner = Table([[p] for p in parts], colWidths=[width - 20])
-    inner.setStyle(TableStyle([
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 1),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ]))
     outer = Table([[inner]], colWidths=[width])
     outer.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), KEY_FILL),
-        ("BOX", (0, 0), (-1, -1), 0.8, KEY_BORDER),
+        ("BACKGROUND", (0, 0), (-1, -1), _c(block.fill)),
+        ("BOX", (0, 0), (-1, -1), 0.7, _c(block.border)),
+        ("LINEAFTER", (0, 0), (0, -1), 3.4, _c(block.accent)),
+        ("ROUNDEDCORNERS", [5, 5, 5, 5]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+        ("TOPPADDING", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    return outer
+
+
+def _definition_card(term: str, term_en: str, definition: str, styles) -> Flowable:
+    """Label, bold term (with its Latin name), then the definition.
+
+    The definition is its own paragraph rather than bracketed after the term:
+    a parenthetical that wraps across two lines leaves its opening bracket
+    orphaned at the visual start of the second line, which looks like a typo.
+    Word's version of this card already separates the two.
+    """
+    rows: list[Flowable] = [
+        _rtl(design.DEFINITION.label, styles["card_label"], _FRAME_W - 26),
+        _mixed(f"{term} ({term_en})" if term_en else term,
+               styles["card_term"], _FRAME_W - 26),
+    ]
+    if definition:
+        rows.append(_rtl(definition, styles["card_body"], _FRAME_W - 26))
+    return _card(design.DEFINITION, rows, width=_FRAME_W)
+
+
+def _example_card(example: str, styles) -> Flowable:
+    return _card(
+        design.EXAMPLE,
+        [
+            _rtl(design.EXAMPLE.label, styles["card_label"], _FRAME_W - 26),
+            _rtl(example, styles["card_body"], _FRAME_W - 26),
+        ],
+        width=_FRAME_W,
+    )
+
+
+def _formula_card(formula: str, styles) -> Flowable:
+    return _card(
+        design.FORMULA,
+        [
+            _rtl(design.FORMULA.label, styles["card_label"], _FRAME_W - 26),
+            _ltr(formula, styles["formula"], _FRAME_W - 26),
+        ],
+        width=_FRAME_W,
+    )
+
+
+def _high_yield_card(label: str, items: list[str], styles) -> Flowable:
+    """The dark high-yield card: navy panel, cyan label, cream text."""
+    rows: list[Flowable] = [_rtl(label, styles["card_label_dark"], _FRAME_W - 26)]
+    for item in items:
+        rows.append(_rtl(item, styles["card_item_dark"], _FRAME_W - 34, marker="•"))
+    return _card(design.HIGH_YIELD, rows, width=_FRAME_W)
+
+
+def _tip_card(kind: str, text: str, styles) -> Flowable:
+    block = design.tip_style(kind)
+    dark = block is design.TIPS["آزمونی"]
+    label_style = styles["card_label_dark"] if dark else styles["card_label"]
+    body_style = styles["card_body_dark"] if dark else styles["card_body"]
+    return _card(
+        block,
+        [
+            _rtl(block.label, label_style, _FRAME_W - 26),
+            _rtl(text, body_style, _FRAME_W - 26),
+        ],
+        width=_FRAME_W,
+    )
+
+
+def _callout_card(kind: str, text: str, styles) -> Flowable:
+    block = design.callout_style(kind)
+    return _card(
+        block,
+        [_rtl(f"{block.label}: ", styles["card_label"], _FRAME_W - 26),
+         _rtl(text, styles["card_body"], _FRAME_W - 26)],
+        width=_FRAME_W,
+    )
+
+
+def _steps_table(steps: list[str], styles) -> Table:
+    """Numbered steps in one panel; the badge leads each row."""
+    rows: list[list] = []
+    for index, step in enumerate(steps, start=1):
+        rows.append([
+            _rtl(step, styles["card_body"], _FRAME_W - 52),
+            _StepBadge(index),
+        ])
+    table = Table(rows, colWidths=[_FRAME_W - 34, 26], hAlign="CENTER")
+    commands: list = [
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("BACKGROUND", (0, 0), (-1, -1), _c(PAL.note_fill)),
+        ("BOX", (0, 0), (-1, -1), 0.7, _c(PAL.note_border)),
+        ("ROUNDEDCORNERS", [5, 5, 5, 5]),
         ("LEFTPADDING", (0, 0), (-1, -1), 10),
         ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-        ("TOPPADDING", (0, 0), (-1, -1), 8),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-    ]))
-    return KeepTogether([outer, Spacer(1, 6)])
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]
+    table.setStyle(TableStyle(commands))
+    return table
 
 
-def _steps_flowables(steps: list[str], styles, width: float) -> list[Flowable]:
-    out: list[Flowable] = []
-    for idx, step in enumerate(steps, start=1):
-        badge = _CircleBadge(idx, size=22)
-        text_p = _rtl_paragraph(step, styles["step_body"], width - 36)
-        arrow_p = _ArrowDown() if idx < len(steps) else None
-        row = Table([[text_p, badge]], colWidths=[width - 28, 26])
-        row.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("BACKGROUND", (0, 0), (-1, -1), STEP_FILL),
-            ("BOX", (0, 0), (-1, -1), 0.6, STEP_BORDER),
-            ("ROUNDEDCORNERS", [4, 4, 4, 4]),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-            ("TOPPADDING", (0, 0), (-1, -1), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ]))
-        out.append(KeepTogether(row))
-        if arrow_p is not None:
-            out.append(Spacer(1, 2))
-            out.append(arrow_p)
-            out.append(Spacer(1, 2))
-    out.append(Spacer(1, 6))
-    return out
+def _column_widths(headers: list[str], rows: list[list[str]]) -> list[float]:
+    """Column widths for an RTL table, sized from the text that must fit.
+
+    A character count says nothing about rendered width: a short drug name in a
+    bold Persian face is wider than several Latin characters. Columns start from
+    a proportional share of the frame, then any column whose longest single word
+    would still be clipped claims the width it needs, taken from the roomiest
+    column. That is what keeps a name like "سیتاگلیپتین" on one line instead of
+    breaking it with a stray final letter.
+    """
+    pad = 14.0
+    regular = _measure(REGULAR_NAME, TYPE.table)
+    bold = _measure(BOLD_NAME, TYPE.table)
+    count = len(headers)
+
+    weights: list[float] = []
+    for index in range(count):
+        longest = len(headers[index] or "")
+        for row in rows:
+            longest = max(longest, min(len(row[index] or ""), 90))
+        weights.append(float(min(max(longest + 2, 10), 52)))
+    total = sum(weights) or 1.0
+    widths = [_FRAME_W * weight / total for weight in weights]
+
+    needs: list[float] = []
+    for index in range(count):
+        cells = [headers[index] or ""] + [row[index] or "" for row in rows]
+        widest = 0.0
+        for cell in cells:
+            measure = bold if index == 0 else regular
+            for word in cell.split():
+                widest = max(widest, measure(word))
+        needs.append(min(widest + pad, _FRAME_W * 0.42))
+
+    for _ in range(count):
+        short = [i for i in range(count) if widths[i] < needs[i] - 0.5]
+        if not short:
+            break
+        index = max(short, key=lambda i: needs[i] - widths[i])
+        deficit = needs[index] - widths[index]
+        donors = [i for i in range(count) if i != index and widths[i] - needs[i] > 6]
+        if not donors:
+            break
+        pool = sum(widths[i] - needs[i] for i in donors)
+        for i in donors:
+            widths[i] -= deficit * (widths[i] - needs[i]) / pool
+        widths[index] = needs[index]
+
+    scale = _FRAME_W / sum(widths)
+    return [width * scale for width in widths]
 
 
-def _callout_block(kind: str, text: str, styles, width: float) -> Flowable:
-    from .docx_export import CALLOUT_BORDERS, CALLOUT_SHADES
-    fill = colors.HexColor("#" + CALLOUT_SHADES.get(kind, CALLOUT_SHADES["نکته"]))
-    border = colors.HexColor("#" + CALLOUT_BORDERS.get(kind, CALLOUT_BORDERS["نکته"]))
-    # No emoji prefix here: Vazirmatn carries none of the dingbats (⚠ 🔔 💡),
-    # so they would draw as empty .notdef boxes. The tinted background, the
-    # colored border and the colored label already carry the tone; the DOCX
-    # keeps its emoji because Word resolves fallback fonts at view time.
-    label = kind
-    p_label = Paragraph(_xml_escape(visual(label)), styles["key_label"])
-    p_label.textColor = border
-    p_body = _rtl_paragraph(text, styles["def_body"], width - 16)
-    inner = Table([[p_label], [p_body]], colWidths=[width - 16])
-    inner.setStyle(TableStyle([
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 1),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-    ]))
-    outer = Table([[inner]], colWidths=[width])
-    outer.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), fill),
-        ("BOX", (0, 0), (-1, -1), 0.8, border),
-        ("LEFTPADDING", (0, 0), (-1, -1), 10),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-        ("TOPPADDING", (0, 0), (-1, -1), 8),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-    ]))
-    return KeepTogether([outer, Spacer(1, 6)])
+def _table_flowable(table: NoteTable, styles) -> Table:
+    """An RTL content table: first logical column on the right, navy header.
 
+    The caption is the first (spanning) row rather than a separate paragraph:
+    a caption alone at the foot of a page, with its table overleaf, tells the
+    reader nothing. As a repeating row the title travels with the table across
+    a page break.
+    """
+    headers = list(table.headers) or [""]
+    rows = [list(row) + [""] * (len(headers) - len(row)) for row in table.rows]
+    width = len(headers)
 
-def _table_flowable(table: NoteTable, styles, width: float) -> Flowable:
-    headers = list(table.headers)
-    rows = [list(r) for r in table.rows]
-    n_cols = len(headers)
-    # Compute column widths proportional to content
-    max_lens = [len(h) for h in headers]
-    for r in rows:
-        for i, cell in enumerate(r):
-            if i < n_cols:
-                max_lens[i] = max(max_lens[i], len(cell))
-    total = max(sum(max_lens), 1)
-    # Cap min/max
-    col_widths = []
-    for ml in max_lens:
-        w = max(ml / total, 0.08)
-        col_widths.append(w)
-    s = sum(col_widths)
-    col_widths = [width * w / s for w in col_widths]
+    col_widths = _column_widths(headers, rows)
 
-    # RTL: reverse column order for visual layout
-    order = list(range(n_cols - 1, -1, -1))
-    data: list = []
-    # Header row
-    data.append([
-        Paragraph(_xml_escape(visual(headers[i] or " ")), styles["cell_head"])
-        for i in order
-    ])
-    for r in rows:
-        padded = list(r) + [""] * (n_cols - len(r))
+    order = list(range(width - 1, -1, -1))
+    data: list[list[Paragraph]] = []
+    if table.caption:
+        data.append([_rtl(table.caption, styles["caption"], _FRAME_W - 14)])
+        data[-1].extend([""] * (width - 1))
+    # Cell text is measured unshaped, while shaping can widen a line; the slack
+    # keeps a long name or a Latin term from being split mid-word inside a cell.
+    def cell_width(index: int) -> float:
+        return max(20.0, col_widths[index] * 0.92 - 12)
+
+    header_cells = [
+        _mixed(headers[index] or " ", styles["cell_head"], cell_width(index))
+        for index in order
+    ]
+    data.append(header_cells)
+    for row in rows:
         data.append([
-            _rtl_paragraph(padded[i] or " ", styles["cell"], max(20.0, col_widths[i] - 12))
-            for i in order
+            _mixed(
+                row[index] or " ",
+                styles["cell_strong"] if position == 0 else styles["cell"],
+                cell_width(index),
+            )
+            for position, index in enumerate(order)
         ])
 
-    t = Table(data, colWidths=[col_widths[i] for i in order], repeatRows=1)
-    cmds: list = [
-        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-        ("GRID", (0, 0), (-1, -1), 0.5, GRID),
+    body_start = 2 if table.caption else 1
+    flowable = Table(
+        data,
+        colWidths=[col_widths[index] for index in order],
+        repeatRows=body_start,
+    )
+    commands: list = [
+        ("BACKGROUND", (0, body_start - 1), (-1, body_start - 1), NAVY),
+        ("TEXTCOLOR", (0, body_start - 1), (-1, body_start - 1), WHITE),
+        ("GRID", (0, body_start - 1), (-1, -1), 0.4, LINE),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("TOPPADDING", (0, 0), (-1, -1), 5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ("LEFTPADDING", (0, 0), (-1, -1), 6),
         ("RIGHTPADDING", (0, 0), (-1, -1), 6),
     ]
+    if table.caption:
+        commands.extend([
+            ("SPAN", (0, 0), (-1, 0)),
+            ("BACKGROUND", (0, 0), (-1, 0), CREAM),
+            ("LINEBELOW", (0, 0), (-1, 0), 0.8, CYAN),
+        ])
     if rows:
-        cmds.append(("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, ZEBRA]))
-    t.setStyle(TableStyle(cmds))
-    return KeepTogether([t, Spacer(1, 8)])
+        commands.append(("ROWBACKGROUNDS", (0, body_start), (-1, -1), [WHITE, ZEBRA]))
+        commands.append(("BOX", (0, body_start), (-1, -1), 0.6, _c(PAL.border)))
+    flowable.setStyle(TableStyle(commands))
+    return flowable
 
 
-def _glossary_table(entries: list[GlossaryEntry], styles, width: float) -> Flowable:
-    # 3 columns: اصطلاح (term, bold), معادل (English term, left-aligned), تعریف (def, RTL)
-    col_widths = [width * 0.22, width * 0.20, width * 0.58]
-    # RTL visual order: [تعریف, معادل, اصطلاح]
-    # But since reportlab tables draw left-to-right visually, we must reverse.
-    # Logical order: col0=اصطلاح, col1=معادل, col2=تعریف.
-    # Visual RTL means اصطلاح appears on the RIGHT → last in reportlab column order.
-    order = [2, 1, 0]
-    headers = ["اصطلاح", "معادل", "تعریف"]
-    data = [[
-        Paragraph(_xml_escape(visual(headers[i])), styles["glos_head"])
-        for i in order
+def _glossary_table(entries, styles) -> Table:
+    """Glossary: term (with its English equivalent) and definition."""
+    data: list[list] = [[
+        _rtl("توضیح", styles["cell_head"], _FRAME_W * 0.55 - 14),
+        _rtl("اصطلاح", styles["cell_head"], _FRAME_W * 0.45 - 14),
     ]]
-    for e in entries:
-        term_p = Paragraph(_xml_escape(visual(e.term)), styles["glos_term"])
-        en_p = Paragraph(_xml_escape(e.term_en or "—"), styles["glos_en"])
-        def_p = _rtl_paragraph(e.definition, styles["glos_def"], col_widths[2] - 12)
-        # Logical term/equivalent/definition order becomes visual
-        # definition/equivalent/term in ReportLab's left-to-right table.
-        row = [term_p, en_p, def_p]
-        data.append([row[i] for i in order])
-
-    t = Table(data, colWidths=[col_widths[i] for i in order], repeatRows=1)
-    cmds = [
-        ("BACKGROUND", (0, 0), (-1, 0), GLOSSARY_HEADER_FILL),
-        ("GRID", (0, 0), (-1, -1), 0.5, GRID),
+    for entry in entries:
+        term = entry.term if not entry.term_en else f"{entry.term} ({entry.term_en})"
+        data.append([
+            _rtl(entry.definition, styles["cell"], _FRAME_W * 0.55 - 16),
+            _mixed(term, styles["cell_strong"], _FRAME_W * 0.45 - 16),
+        ])
+    table = Table(data, colWidths=[_FRAME_W * 0.55, _FRAME_W * 0.45], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+        ("GRID", (0, 0), (-1, -1), 0.4, LINE),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, ZEBRA]),
         ("LEFTPADDING", (0, 0), (-1, -1), 6),
         ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, ZEBRA]),
-    ]
-    t.setStyle(TableStyle(cmds))
-    return KeepTogether([t, Spacer(1, 8)])
-
-
-# ---------------------------------------------------------------------------
-# Cover flowables
-# ---------------------------------------------------------------------------
-
-
-def _cover_flowables(
-    styles,
-    notes: StructuredNotes,
-    meta: DocumentMeta,
-    *,
-    duration_seconds: int | None,
-    session_number: int | None,
-) -> list[Flowable]:
-    created = meta.created_at or datetime.now()
-    out: list[Flowable] = []
-
-    # "In the name of God" line
-    out.append(Paragraph(_xml_escape(visual("به نام خدا")),
-                         ParagraphStyle("cover_god", fontName=REGULAR_NAME,
-                                        fontSize=11, leading=14, textColor=MUTED,
-                                        alignment=TA_CENTER, spaceAfter=10)))
-
-    # ---- Large rounded dark-navy title panel ----
-    title = notes.display_title or "جزوهٔ کلاس"
-    mode_label = "جزوه جلسه"
-
-    # Metadata lines
-    date_str = jalali_date(created)
-    meta_lines = [f"تاریخ: {date_str}"]
-    if session_number:
-        meta_lines.append(f"جلسهٔ {to_persian_digits(str(session_number))}")
-    if duration_seconds is not None and duration_seconds > 0:
-        minutes = duration_seconds // 60
-        if minutes >= 60:
-            h = minutes // 60
-            m = minutes % 60
-            duration_label = f"{to_persian_digits(h)} ساعت"
-            if m:
-                duration_label += f" و {to_persian_digits(m)} دقیقه"
-            meta_lines.append(f"مدت: {duration_label}")
-        else:
-            meta_lines.append(f"مدت: {to_persian_digits(minutes)} دقیقه")
-
-    label_p = Paragraph(_xml_escape(visual(mode_label)), styles["cover_label"])
-    title_p = Paragraph(_xml_escape(visual(title)), styles["cover_title"])
-    meta_ps = [Paragraph(_xml_escape(visual(line)), styles["cover_meta"]) for line in meta_lines]
-
-    panel_inner: list = [label_p, Spacer(1, 4), title_p, Spacer(1, 6)]
-    panel_inner.extend(meta_ps)
-    inner_table = Table([[p] for p in panel_inner], colWidths=[_FRAME_W * 0.9])
-    inner_table.setStyle(TableStyle([
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 2),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
-
-    panel = Table([[inner_table]], colWidths=[_FRAME_W * 0.94])
-    panel.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), NAVY),
-        ("ROUNDEDCORNERS", [8, 8, 8, 8]),
-        ("LEFTPADDING", (0, 0), (-1, -1), 18),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 18),
-        ("TOPPADDING", (0, 0), (-1, -1), 18),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 18),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
-    out.append(panel)
-    out.append(Spacer(1, 18))
-
-    # ---- Topic map (generated from section headings) ----
-    topics = [sec.heading for sec in notes.sections[:8]]
-    if topics:
-        out.append(_TopicMap(topics, width=_FRAME_W * 0.94))
-
-    # ---- Brand footer ----
-    out.append(Spacer(1, 12))
-    out.append(HRFlowable(width="40%", thickness=0.6, color=RULE,
-                          hAlign="CENTER", spaceAfter=6))
-    out.append(Paragraph(_xml_escape(visual("Gamas — جزوه‌ساز هوشمند گاماس")),
-                         styles["cover_brand"]))
-    return out
+    return table
 
 
-# ---------------------------------------------------------------------------
-# Body flowables
-# ---------------------------------------------------------------------------
+def _asset_image(key: str, *, width: float, height: float | None = None) -> RLImage | None:
+    asset = optional_asset(key)
+    if asset is None:
+        return None
+    try:
+        if height is None:
+            height = width / asset.aspect if asset.aspect else width
+        image = RLImage(str(asset.path), width=width, height=height)
+        image.hAlign = "CENTER"
+        return image
+    except Exception:
+        logger.warning("booklet asset %s could not be placed in the PDF", key, exc_info=True)
+        return None
 
 
-def _section_flowables(
-    section: NoteSection,
-    styles,
-) -> list[Flowable]:
+def _section_flowables(section: NoteSection, index: int, styles) -> list[Flowable]:
     out: list[Flowable] = []
-    # H1 with vertical cobalt bar
-    out.extend(_h1_with_bar(section.heading, styles))
-    out.append(HRFlowable(width="100%", thickness=0.5, color=RULE, spaceAfter=8))
+    eyebrow = _rtl(
+        f"فصل {design.chapter_number(index)}", styles["eyebrow"], _FRAME_W
+    )
+    out.append(KeepTogether([Spacer(1, SPACE.section), eyebrow, _banner(section.heading, styles)]))
+    out.append(Spacer(1, 6))
+    out.append(_EcgRule(96, height=7, color=TEAL_LIGHT))
+    out.append(Spacer(1, 4))
+    if section.source_locators:
+        out.append(_rtl(
+            "منبع: " + "، ".join(section.source_locators), styles["note_small"], _FRAME_W
+        ))
+        out.append(Spacer(1, 3))
 
-    # Paragraphs
-    for p in section.paragraphs:
-        out.append(_rtl_paragraph(p, styles["body"], _FRAME_W))
+    for paragraph_text in section.paragraphs:
+        out.append(_rtl(paragraph_text, styles["body"], _FRAME_W))
+    for definition in section.definitions:
+        out.append(_definition_card(
+            definition.term, definition.term_en, definition.definition, styles
+        ))
+        out.append(Spacer(1, 6))
+    if section.bullets:
+        bullets = [
+            _rtl(bullet, styles["bullet"], _FRAME_W - 16, marker="•")
+            for bullet in section.bullets
+        ]
+        out.append(KeepTogether(bullets) if len(bullets) <= 8 else bullets)
 
-    # Definitions
-    for d in section.definitions:
-        out.append(_definition_block(d.term, d.term_en, d.definition, styles, _FRAME_W))
+    # A subsection heading travels with the first block it introduces: a heading
+    # alone at the foot of a page, with its card overleaf, is an orphan.
+    if section.examples:
+        cards: list[Flowable] = []
+        for example in section.examples:
+            cards.extend([_example_card(example, styles), Spacer(1, 6)])
+        out.append(KeepTogether([_subheading("مثال‌ها", styles), cards[0]]))
+        out.extend(cards[1:])
 
-    # Bullets
-    for b in section.bullets:
-        out.append(_rtl_paragraph(f"• {b}", styles["bullet"], _FRAME_W - 10))
-
-    # Examples
-    for ex in section.examples:
-        out.append(_example_block(ex, styles, _FRAME_W))
-
-    # Steps
     if section.steps:
-        out.extend(_steps_flowables(list(section.steps), styles, _FRAME_W))
+        out.append(KeepTogether(
+            [_subheading("مراحل انجام", styles), _steps_table(list(section.steps), styles)]
+        ))
+        out.append(Spacer(1, 8))
 
-    # Formulas (render as a key-point style block for now)
     if section.formulas:
-        out.append(_keypoints_block(
-            "فرمول‌ها",
-            list(section.formulas),
-            styles,
-            _FRAME_W,
-        ))
+        cards = []
+        for formula in section.formulas:
+            cards.extend([_formula_card(formula, styles), Spacer(1, 6)])
+        out.append(KeepTogether([_subheading("فرمول‌ها", styles), cards[0]]))
+        out.extend(cards[1:])
 
-    # Key points
     if section.key_points:
-        out.append(_keypoints_block(
-            "نکات کلیدی این بخش",
-            list(section.key_points),
-            styles,
-            _FRAME_W,
-        ))
+        out.append(_high_yield_card("نکته‌های کلیدی این بخش", list(section.key_points), styles))
+        out.append(Spacer(1, 8))
 
-    # Tables
-    for tbl in section.all_tables:
-        if tbl.caption:
-            cap_p = _rtl_paragraph(tbl.caption, ParagraphStyle(
-                "tcap", fontName=BOLD_NAME, fontSize=10, leading=13,
-                textColor=MUTED, alignment=TA_CENTER, spaceAfter=4,
-            ), _FRAME_W)
-            out.append(cap_p)
-        out.append(_table_flowable(tbl, styles, _FRAME_W))
+    for callout in section.callouts:
+        out.append(_callout_card(callout.kind, callout.text, styles))
+        out.append(Spacer(1, 6))
 
-    # Callouts
-    for c in section.callouts:
-        out.append(_callout_block(c.kind, c.text, styles, _FRAME_W))
-
+    for table_model in section.all_tables:
+        out.append(_table_flowable(table_model, styles))
+        out.append(Spacer(1, 10))
     return out
+
+
+def _guide_flowables(styles) -> list[Flowable]:
+    rows = [
+        _rtl("پیش از مطالعه: «در یک نگاه» را بخوانید تا نقشهٔ کار روشن شود.",
+             styles["card_item"], _FRAME_W - 30),
+        _rtl("هنگام مطالعه: هر فصل را با جدول‌ها، مثال‌ها و کادرهای کلیدی جلو ببرید.",
+             styles["card_item"], _FRAME_W - 30),
+        _rtl("پس از مطالعه: پرسش‌های مرور را پاسخ دهید و اصطلاح‌های تازه را مرور کنید.",
+             styles["card_item"], _FRAME_W - 30),
+    ]
+    return [
+        *_display_heading(design.LABELS["guide"], styles),
+        _card(design.GUIDE, rows, width=_FRAME_W),
+        Spacer(1, SPACE.lg),
+    ]
+
+
+def _glance_flowables(notes: StructuredNotes, styles) -> list[Flowable]:
+    lines = [f"موضوع: {notes.display_title}"]
+    headings = [section.heading for section in notes.sections if section.heading]
+    if headings:
+        lines.append(f"تعداد فصل‌ها: {to_persian_digits(len(headings))}")
+        route = headings[:5]
+        suffix = " · …" if len(headings) > len(route) else ""
+        lines.append("مسیر مطالعه: " + " · ".join(route) + suffix)
+    rows: list[Flowable] = []
+    rows.extend(_rtl(line, styles["card_item"], _FRAME_W - 30) for line in lines)
+    return [
+        *_display_heading(design.LABELS["glance"], styles),
+        _card(design.GLANCE, rows, width=_FRAME_W),
+        Spacer(1, SPACE.lg),
+    ]
 
 
 def _body_flowables(notes: StructuredNotes, styles) -> list[Flowable]:
     out: list[Flowable] = []
+    out.extend(_guide_flowables(styles))
+    out.extend(_glance_flowables(notes, styles))
 
-    # Document title (repeated on body start in smaller form)
-    title_p = Paragraph(_xml_escape(visual(notes.display_title)),
-                        ParagraphStyle("bdytitle", fontName=BOLD_NAME,
-                                       fontSize=18, leading=24, textColor=NAVY,
-                                       alignment=TA_CENTER, spaceAfter=10))
-    out.append(title_p)
-    out.append(HRFlowable(width="60%", thickness=0.8, color=RULE,
-                          hAlign="CENTER", spaceAfter=12))
-
-    # Learning objectives
     if notes.learning_objectives:
-        out.append(_keypoints_block("اهداف یادگیری", list(notes.learning_objectives),
-                                    styles, _FRAME_W))
+        out.extend(_display_heading(design.LABELS["objectives"], styles))
+        out.append(_high_yield_card("آنچه این جزوه پوشش می‌دهد",
+                                    list(notes.learning_objectives), styles))
+        out.append(Spacer(1, SPACE.lg))
 
-    # Summary
     if notes.summary:
-        summ_label = Paragraph(_xml_escape(visual("خلاصه")),
-                               ParagraphStyle("sumlab", fontName=BOLD_NAME, fontSize=11,
-                                              leading=14, textColor=NAVY,
-                                              alignment=TA_RIGHT, spaceAfter=4))
-        summ_body = _rtl_paragraph(notes.summary, styles["summary"], _FRAME_W - 16)
-        summ_inner = Table([[summ_label], [summ_body]], colWidths=[_FRAME_W - 16])
-        summ_inner.setStyle(TableStyle([
-            ("LEFTPADDING", (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ]))
-        summ_outer = Table([[summ_inner]], colWidths=[_FRAME_W])
-        summ_outer.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#EEF4F8")),
-            ("LINEBEFORE", (0, 0), (0, -1), 3, STEEL),
-            ("LEFTPADDING", (0, 0), (-1, -1), 10),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-            ("TOPPADDING", (0, 0), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
-        ]))
-        out.append(summ_outer)
-        out.append(Spacer(1, 10))
+        out.extend(_display_heading(design.LABELS["summary"], styles))
+        out.append(_card(
+            design.SUMMARY,
+            [_rtl(notes.summary, styles["card_body"], _FRAME_W - 26)],
+            width=_FRAME_W,
+        ))
+        out.append(Spacer(1, SPACE.lg))
 
-    # Sections
-    for sec in notes.sections:
-        out.extend(_section_flowables(sec, styles))
+    for index, section in enumerate(notes.sections, start=1):
+        out.extend(_section_flowables(section, index, styles))
 
-    # Global key points
     if notes.key_points:
-        out.extend(_h1_with_bar("نکته‌های کلیدی", styles))
-        out.append(HRFlowable(width="100%", thickness=0.5, color=RULE, spaceAfter=8))
-        out.append(_keypoints_block("مهم‌ترین نکته‌های این جزوه",
-                                    list(notes.key_points), styles, _FRAME_W))
+        out.append(KeepTogether([
+            Spacer(1, SPACE.section),
+            _banner(design.LABELS["key_points"], styles),
+            Spacer(1, 5),
+            _high_yield_card("مهم‌ترین نکته‌های این جزوه", list(notes.key_points), styles),
+        ]))
 
-    # Practical tips
     if notes.practical_tips:
-        out.extend(_h1_with_bar("نکته‌های کاربردی", styles))
-        out.append(HRFlowable(width="100%", thickness=0.5, color=RULE, spaceAfter=8))
-        tips_list = [f"({tip.kind}) {tip.text}" for tip in notes.practical_tips]
-        out.append(_keypoints_block("توصیه‌های مدرس", tips_list, styles, _FRAME_W))
+        out.append(KeepTogether([Spacer(1, SPACE.section),
+                                 *_display_heading(design.LABELS["tips"], styles)]))
+        for tip in notes.practical_tips:
+            out.append(Spacer(1, 5))
+            out.append(_tip_card(tip.kind, tip.text, styles))
 
-    # Review questions
     if notes.review_questions:
-        out.extend(_h1_with_bar("پرسش‌های مرور", styles))
-        out.append(HRFlowable(width="100%", thickness=0.5, color=RULE, spaceAfter=8))
-        out.extend(_steps_flowables(list(notes.review_questions), styles, _FRAME_W))
+        out.append(KeepTogether([Spacer(1, SPACE.section),
+                                 *_display_heading(design.LABELS["review"], styles)]))
+        out.append(_steps_table(list(notes.review_questions), styles))
 
-    # Glossary
+    if notes.speakers or notes.timeline:
+        out.append(KeepTogether([Spacer(1, SPACE.section),
+                                 *_display_heading(design.LABELS["speakers"], styles)]))
+        if notes.speakers:
+            out.append(Spacer(1, 5))
+            out.append(_card(
+                design.KEY_POINTS,
+                [_rtl("گویندگان شناسایی‌شده", styles["card_label"], _FRAME_W - 26)]
+                + [_rtl(name, styles["card_item"], _FRAME_W - 30) for name in notes.speakers],
+                width=_FRAME_W,
+            ))
+        if notes.timeline:
+            out.append(KeepTogether(
+                [Spacer(1, 5)]
+                + [_rtl(entry, styles["bullet"], _FRAME_W - 16, marker="•")
+                   for entry in notes.timeline]
+            ))
+
     if notes.glossary:
-        out.extend(_h1_with_bar("واژه‌نامهٔ اصطلاح‌ها", styles))
-        out.append(HRFlowable(width="100%", thickness=0.5, color=RULE, spaceAfter=8))
-        out.append(_glossary_table(list(notes.glossary), styles, _FRAME_W))
-
+        out.append(KeepTogether([Spacer(1, SPACE.section),
+                                 _banner(design.LABELS["glossary"], styles),
+                                 Spacer(1, 5)]))
+        out.append(_glossary_table(list(notes.glossary), styles))
     return out
 
 
-def _final_page_flowables(notes: StructuredNotes, meta: DocumentMeta, styles) -> list[Flowable]:
+def _cover_flowables(
+    notes: StructuredNotes, meta: DocumentMeta, styles, *,
+    duration_seconds: int | None, session_number: int | None,
+) -> list[Flowable]:
     created = meta.created_at or datetime.now()
-    out: list[Flowable] = []
-    out.append(Spacer(1, 14))
-    out.append(HRFlowable(width="100%", thickness=0.4, color=RULE, spaceAfter=8))
-    # Attribution
-    out.append(Paragraph(
-        _xml_escape(visual(
-            "این جزوه به‌صورت خودکار توسط Gamas تهیه شده است."
-        )),
-        styles["attribution"],
+    topic = topic_for(booklet_text(notes))
+    meta_lines = [f"تاریخ: {jalali_date(created)}"]
+    if session_number:
+        meta_lines.append(f"جلسهٔ {to_persian_digits(str(session_number))}")
+    if duration_seconds and duration_seconds > 0:
+        minutes = duration_seconds // 60
+        label = (
+            f"{to_persian_digits(minutes)} دقیقه"
+            if minutes < 60
+            else f"{to_persian_digits(minutes // 60)} ساعت"
+                 + (f" و {to_persian_digits(minutes % 60)} دقیقه" if minutes % 60 else "")
+        )
+        meta_lines.append(f"مدت: {label}")
+
+    panel_inner: list[Flowable] = [
+        _rtl("جزوهٔ جلسه", styles["cover_label"], _FRAME_W * 0.78),
+        _rtl(notes.display_title, styles["cover_title"], _FRAME_W * 0.78),
+    ]
+    panel_inner.extend(_rtl(line, styles["cover_meta"], _FRAME_W * 0.78) for line in meta_lines)
+    panel_table = Table([[item] for item in panel_inner], colWidths=[_FRAME_W * 0.78])
+    panel_table.setStyle(TableStyle([
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 1),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+    ]))
+    panel = Table([[panel_table]], colWidths=[_FRAME_W * 0.9])
+    panel.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), NAVY),
+        ("ROUNDEDCORNERS", [10, 10, 10, 10]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 16),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 16),
+        ("TOPPADDING", (0, 0), (-1, -1), 15),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 16),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+
+    out: list[Flowable] = [
+        _rtl("به نام خدا", styles["cover_god"], _FRAME_W),
+        _asset_image("brand/monogram", width=2.3 * cm, height=2.3 * cm) or Spacer(1, 1),
+        Spacer(1, 4),
+        _rtl("GAMAS", styles["cover_brand"], _FRAME_W),
+        Spacer(1, 9),
+        _rtl("SMART STUDY ASSISTANT", styles["cover_sub"], _FRAME_W),
+        Spacer(1, 8),
+        panel,
+        Spacer(1, 10),
+    ]
+    hero = _asset_image(topic.cover, width=_FRAME_W)
+    if hero is not None:
+        out.append(hero)
+        out.append(Spacer(1, 5))
+
+    out.append(_card(
+        design.QUOTE,
+        [_rtl(f"«{QUOTE_TEXT}»", styles["quote"], _FRAME_W - 26)],
+        width=_FRAME_W,
     ))
-    out.append(Paragraph(
-        _xml_escape(visual(f"تاریخ تولید: {jalali_date(created)}")),
-        styles["attribution"],
-    ))
-    # Disclaimer
-    out.append(Spacer(1, 6))
-    disclaimer = (
-        "توجه: این جزوه به‌کمک هوش مصنوعی از روی فایل صوتی/متنی کلاس تولید شده و ممکن است حاوی "
-        "اشتباهات رونویسی یا برداشتی باشد. این سند جایگزین منابع معتبر، کتاب‌های مرجع و بیان رسمی استاد نیست. "
-        "در صورت مشاهدهٔ هرگونه مغایرت با محتوای اصلی، به منبع رسمی مراجعه کنید."
-    )
-    out.append(_rtl_paragraph(disclaimer, styles["disclaimer"], _FRAME_W))
+    out.append(Spacer(1, 8))
+    out.append(_rtl("Gamas · دستیار مطالعهٔ هوشمند", styles["attribution"], _FRAME_W))
+    return out
+
+
+#: Quoted verbatim from the Word cover; never reworded or normalized.
+QUOTE_TEXT = "دانش اگر در ثریا باشد مردمی از سرزمین پارس به آن دست خواهند یافت"
+
+
+def _final_flowables(meta: DocumentMeta, styles) -> list[Flowable]:
+    created = meta.created_at or datetime.now()
+    # A closing flourish, not a rule across the page: a full-width trace between
+    # two headings reads as a stray graphic.
+    divider = _EcgRule(170, height=9, color=LINE)
+    divider.hAlign = "CENTER"
+    out: list[Flowable] = [
+        Spacer(1, SPACE.section),
+        divider,
+        Spacer(1, 10),
+        *_display_heading(design.LABELS["about"], styles),
+        _card(
+            design.EDITORIAL,
+            [
+                _rtl(design.EDITORIAL.label, styles["card_label"], _FRAME_W - 26),
+                _rtl(
+                    "این جزوه به‌صورت خودکار از متن/صدای همین جلسه ساخته شده است؛ "
+                    "ساختار و جمله‌بندی آن بازنویسی ماشینی است و به منبع اصلی تکیه دارد. "
+                    "این سند جایگزین کتاب مرجع و بیان رسمی مدرس نیست.",
+                    styles["card_body"], _FRAME_W - 26,
+                ),
+                _rtl(f"تاریخ تولید: {jalali_date(created)}", styles["note_small"], _FRAME_W - 26),
+            ],
+            width=_FRAME_W,
+        ),
+        Spacer(1, 8),
+        _rtl(
+            "توجه: ممکن است خطای رونویسی یا برداشت نادرست در متن وجود داشته باشد. "
+            "در صورت مشاهدهٔ هرگونه مغایرت با محتوای اصلی، به منبع رسمی مراجعه کنید.",
+            styles["disclaimer"], _FRAME_W,
+        ),
+        Spacer(1, 4),
+        _rtl("Gamas · جزوه‌ساز هوشمند گاماس", styles["attribution"], _FRAME_W),
+    ]
     return out
 
 
 # ---------------------------------------------------------------------------
-# Page frame / header / footer
+# Page furniture
 # ---------------------------------------------------------------------------
 
 
-def _make_on_page(title: str):
+def _cover_background(canv) -> None:
+    """The cover's paper field, frame, teal curve and ECG motif (vectors)."""
+    canv.saveState()
+    canv.setFillColor(CREAM)
+    canv.rect(0, 0, _PAGE_W, _PAGE_H, stroke=0, fill=1)
+    # One restrained teal sweep in the upper third, behind the title panel and
+    # artwork — never behind the quotation or the closing line.
+    canv.setStrokeColor(_c(PAL.teal_400))
+    canv.setLineWidth(1.0)
+    path = canv.beginPath()
+    path.moveTo(-10, _PAGE_H * 0.62)
+    path.curveTo(_PAGE_W * 0.28, _PAGE_H * 0.80,
+                 _PAGE_W * 0.62, _PAGE_H * 0.55,
+                 _PAGE_W + 10, _PAGE_H * 0.74)
+    canv.drawPath(path, stroke=1, fill=0)
+    canv.setStrokeColor(_c(PAL.cyan_500))
+    canv.setLineWidth(0.7)
+    path = canv.beginPath()
+    path.moveTo(-10, _PAGE_H * 0.575)
+    path.curveTo(_PAGE_W * 0.30, _PAGE_H * 0.74,
+                 _PAGE_W * 0.64, _PAGE_H * 0.505,
+                 _PAGE_W + 10, _PAGE_H * 0.695)
+    canv.drawPath(path, stroke=1, fill=0)
+    # The navy frame, then its cyan inner hairline.
+    canv.setStrokeColor(NAVY)
+    canv.setLineWidth(1.2)
+    canv.rect(FRAME.frame_inset, FRAME.frame_inset,
+              _PAGE_W - 2 * FRAME.frame_inset, _PAGE_H - 2 * FRAME.frame_inset)
+    canv.setStrokeColor(_c(PAL.cyan_500))
+    canv.setLineWidth(0.35)
+    inset = FRAME.frame_inset + 5
+    canv.rect(inset, inset, _PAGE_W - 2 * inset, _PAGE_H - 2 * inset)
+    canv.restoreState()
+
+
+def _page_furniture(title: str):
+    """The ``onPage`` callback: paper on page 1, header/footer on the rest."""
     regular, _bold = register_fonts()
 
-    def on_page(canv, doc):
+    def on_page(canv, _doc) -> None:
         page = canv.getPageNumber()
-        canv.saveState()
-        # Light outer frame
-        canv.setStrokeColor(colors.HexColor("#C2CEDC"))
-        canv.setLineWidth(0.6)
-        inset = 20
-        canv.rect(inset, inset, _PAGE_W - 2 * inset, _PAGE_H - 2 * inset)
         canv.setTitle(title)
         canv.setAuthor("Gamas Bot")
-        if page > 1:
-            # Header
-            canv.setFont(regular, 8.5)
-            canv.setFillColor(MUTED)
-            header = f"{title} | {PAGE_HEADER_TEXT}"
-            canv.drawCentredString(_PAGE_W / 2, _PAGE_H - 1.1 * cm, visual(header))
-            canv.setStrokeColor(STEEL)
-            canv.setLineWidth(0.4)
-            canv.line(_MARGIN_LR, _PAGE_H - 1.15 * cm, _PAGE_W - _MARGIN_LR, _PAGE_H - 1.15 * cm)
-            # Footer
-            canv.setFont(regular, 9)
-            canv.setFillColor(MUTED)
-            canv.drawCentredString(
-                _PAGE_W / 2, 1.1 * cm,
-                visual(f"Gamas — صفحهٔ {to_persian_digits(page - 1)}"),
-            )
+        if page == 1:
+            _cover_background(canv)
+            return
+        canv.saveState()
+        canv.setStrokeColor(_c(PAL.line))
+        canv.setLineWidth(0.6)
+        canv.rect(FRAME.frame_inset, FRAME.frame_inset,
+                  _PAGE_W - 2 * FRAME.frame_inset, _PAGE_H - 2 * FRAME.frame_inset)
+
+        # Running header: brand at the Far Right (start), title at the other end.
+        baseline = FRAME.header_baseline
+        canv.setFillColor(TEAL)
+        canv.setFont(BOLD_NAME, 8.4)
+        canv.drawString(_MARGIN_LR, baseline, "GAMAS")
+        canv.setFillColor(MUTED)
+        canv.setFont(regular, 8.4)
+        canv.drawRightString(_PAGE_W - _MARGIN_LR, baseline, visual(title[:44]))
+        canv.setStrokeColor(_c(PAL.cyan_500))
+        canv.setLineWidth(0.5)
+        canv.line(_MARGIN_LR, baseline - 5, _PAGE_W - _MARGIN_LR, baseline - 5)
+
+        # Footer: a small ECG motif, the brand, and the real page number.
+        footer_y = FRAME.footer_baseline
+        canv.setStrokeColor(_c(PAL.line))
+        canv.setLineWidth(0.5)
+        canv.line(_MARGIN_LR, footer_y + 9, _PAGE_W - _MARGIN_LR, footer_y + 9)
+        canv.setFillColor(MUTED)
+        canv.setFont(regular, 8.4)
+        number = page - 1
+        canv.drawCentredString(
+            _PAGE_W / 2, footer_y,
+            visual(f"GAMAS  ·  صفحهٔ {to_persian_digits(number)}"),
+        )
+        canv.setStrokeColor(_c(PAL.teal_400))
+        canv.setLineWidth(0.7)
+        path = canv.beginPath()
+        base = footer_y + 2
+        path.moveTo(_MARGIN_LR, base)
+        path.lineTo(_MARGIN_LR + 16, base)
+        path.lineTo(_MARGIN_LR + 19, base + 3)
+        path.lineTo(_MARGIN_LR + 22, base - 4)
+        path.lineTo(_MARGIN_LR + 25, base + 1)
+        path.lineTo(_MARGIN_LR + 40, base)
+        canv.drawPath(path, stroke=1, fill=0)
         canv.restoreState()
+
     return on_page
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# Entry point
 # ---------------------------------------------------------------------------
 
 
@@ -973,48 +1005,41 @@ def build_notes_pdf(
     duration_seconds: int | None = None,
     session_number: int | None = None,
 ) -> bytes:
-    """Render structured notes as a professional Persian RTL PDF booklet.
+    """Render validated structured notes as the Gamas PDF booklet.
 
-    Deterministic: invariant canvas, no wall clock in the body (the date is
-    taken from ``meta.created_at``), the same notes always yield the same bytes.
+    Deterministic: invariant canvas, no wall clock beyond ``meta.created_at``,
+    and the same notes always yield the same bytes.
     """
     styles = _styles()
     title = notes.display_title or "جزوهٔ کلاس"
-    regular, _bold = register_fonts()
+    register_fonts()
 
-    story: list[Flowable] = []
-
-    # Cover
-    story.extend(_cover_flowables(styles, notes, meta,
-                                  duration_seconds=duration_seconds,
-                                  session_number=session_number))
+    story: list[Flowable] = _cover_flowables(
+        notes, meta, styles,
+        duration_seconds=duration_seconds, session_number=session_number,
+    )
     story.append(PageBreak())
-
-    # Body
     story.extend(_body_flowables(notes, styles))
-
-    # Final page block (disclaimer / attribution)
-    story.extend(_final_page_flowables(notes, meta, styles))
+    story.extend(_final_flowables(meta, styles))
 
     buffer = io.BytesIO()
     frame = Frame(
         _MARGIN_LR, _MARGIN_BOTTOM, _FRAME_W, _FRAME_H,
-        id="notes_main",
+        id="gamas_main",
         leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0,
     )
-    template = PageTemplate(
-        id="notes",
-        frames=[frame],
-        onPage=_make_on_page(title),
+    template = PageTemplate(id="gamas", frames=[frame], onPage=_page_furniture(title))
+    document = BaseDocTemplate(
+        buffer, pagesize=(_PAGE_W, _PAGE_H), title=title, author="Gamas Bot",
     )
-    doc = BaseDocTemplate(buffer, pagesize=A4, title=title, author="Gamas Bot")
-    doc.addPageTemplates([template])
-    doc.build(story, canvasmaker=_InvariantCanvas)
+    document.addPageTemplates([template])
+    document.build(story, canvasmaker=_InvariantCanvas)
     return buffer.getvalue()
 
 
 def notes_pdf_filename(notes: StructuredNotes, reference: str) -> str:
     from .docx_export import sanitize_filename_part
+
     title_part = sanitize_filename_part(notes.display_title)
     name = f"جزوه - {title_part}" if title_part else "جزوه"
     return f"{name} - {reference}.pdf"

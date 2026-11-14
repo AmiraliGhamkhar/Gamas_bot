@@ -64,6 +64,10 @@ from lxml import etree
 
 from .bidi import TextRun, is_rtl_dominant, split_direction_runs
 from .config import PROJECT_DIR
+from .document import components as design
+from .document.assets import booklet_text, topic_for
+from .document.assets import optional as optional_asset
+from .document.theme import THEME
 from .mdblocks import heading_level, parse_blocks
 from .progress import to_persian_digits
 from .notes import NoteSection, NoteTable, StructuredNotes
@@ -87,42 +91,55 @@ _BOOKMARK_COUNTER_ATTRIBUTE = "_gamas_bookmark_ids"
 #: because a box framed with its own fill colour has no frame at all: the
 #: border disappears and the block reads as a flat stain on the page.
 #: ---------------------------------------------------------------------------
-#: Deep navy: document title, Heading 1, brand mark, table header fill.
-ACCENT = RGBColor(0x1D, 0x35, 0x57)
-ACCENT_HEX = "1D3557"
-#: Steel blue: Heading 2/3, the running-header rule — hierarchy without
-#: introducing a second, unrelated hue.
-ACCENT_SOFT = RGBColor(0x45, 0x7B, 0x9D)
-ACCENT_SOFT_HEX = "457B9D"
+#: Every value below is *derived* from the Gamas design system
+#: (:mod:`gamas_bot.document.theme`); this module never invents a colour, size
+#: or spacing step. The names stay because callers, the Office PDF exporter and
+#: the regression tests read them.
+_PALETTE = THEME.palette
+
+
+def _rgb(value: str) -> RGBColor:
+    """``#RRGGBB`` → ``RGBColor`` for python-docx run/edge colours."""
+    return RGBColor.from_string(value.lstrip("#").upper())
+
+
+#: Deep navy: document title, chapter banners, brand mark, table header fill.
+ACCENT = _rgb(_PALETTE.navy_900)
+ACCENT_HEX = THEME.ooxml(_PALETTE.navy_900)
+#: Teal: Heading 2/3, the running-header rule, structural accents.
+ACCENT_SOFT = _rgb(_PALETTE.teal_700)
+ACCENT_SOFT_HEX = THEME.ooxml(_PALETTE.teal_700)
+#: Cyan: the Gamas accent that appears in the cover and chapter bars.
+CYAN = _rgb(_PALETTE.cyan_500)
+CYAN_HEX = THEME.ooxml(_PALETTE.cyan_500)
 #: Cool slate grey: metadata, footers, subtitles, secondary terms.
-MUTED = RGBColor(0x5C, 0x6B, 0x7A)
-#: Text on the accent-filled (dark) table header cells.
-ON_ACCENT = RGBColor(0xFF, 0xFF, 0xFF)
+MUTED = _rgb(_PALETTE.muted)
+#: Text on the accent-filled (dark) table header cells and chapter banners.
+ON_ACCENT = _rgb(_PALETTE.on_accent)
 #: Decorative hairline rules (cover, section separators).
-RULE_FILL = "B9CFDD"
-SUMMARY_SHADE = "EEF4F8"
-SUMMARY_BORDER = "C7D9E5"
-KEYPOINT_SHADE = "EAF3EC"
-KEYPOINT_BORDER = "C0DCC6"
+RULE_FILL = THEME.ooxml(_PALETTE.line)
+SUMMARY_SHADE = THEME.ooxml(design.SUMMARY.fill)
+SUMMARY_BORDER = THEME.ooxml(design.SUMMARY.border)
+KEYPOINT_SHADE = THEME.ooxml(design.KEY_POINTS.fill)
+KEYPOINT_BORDER = THEME.ooxml(design.KEY_POINTS.border)
 #: Definitions and formulas are flat tinted panels, not framed boxes — only
 #: the blocks that read as a box (summary, key points, callouts, the cover
 #: quote) own a border tone.
-DEFINITION_SHADE = "F1EEF7"
-QUOTE_SHADE = "FAF6EC"
-QUOTE_BORDER = "E2D6BB"
-FORMULA_SHADE = "F1F3F6"
+DEFINITION_SHADE = THEME.ooxml(design.DEFINITION.fill)
+QUOTE_SHADE = THEME.ooxml(design.QUOTE.fill)
+QUOTE_BORDER = THEME.ooxml(design.QUOTE.border)
+FORMULA_SHADE = THEME.ooxml(design.FORMULA.fill)
 #: Alternating body-row fill in content tables (kept cooler than every callout
 #: tint so stripes never compete with the boxes around them).
-ZEBRA_SHADE = "F4F8FA"
+ZEBRA_SHADE = THEME.ooxml(design.TABLES.zebra)
 #: Content-table grid lines: a soft blue-grey instead of Table Grid's black.
-TABLE_BORDER_COLOR = "C7D3DE"
+TABLE_BORDER_COLOR = THEME.ooxml(design.TABLES.grid)
 #: Callout families: fill + the deeper border tone of the same hue. «نکته»
 #: gets its own informational blue tint instead of sharing «یادآوری»'s amber.
-CALLOUT_SHADES = {"هشدار": "FBEAEC", "یادآوری": "FDF3E0", "نکته": "EAF2F5"}
-CALLOUT_BORDERS = {"هشدار": "EABFC7", "یادآوری": "ECD6A6", "نکته": "C3D9E2"}
-CALLOUT_EMOJI = {"هشدار": "⚠️", "یادآوری": "🔔"}
-#: Heading colour by level: navy for section headings, steel blue below.
-HEADING_COLORS = {1: ACCENT, 2: ACCENT_SOFT, 3: ACCENT_SOFT}
+CALLOUT_SHADES = {kind: THEME.ooxml(style.fill) for kind, style in design.CALLOUTS.items()}
+CALLOUT_BORDERS = {kind: THEME.ooxml(style.border) for kind, style in design.CALLOUTS.items()}
+#: Heading colour by level: navy chapter banners, teal below.
+HEADING_COLORS = {level: _rgb(style.color) for level, style in design.HEADINGS.items()}
 
 #: The exact cover quotation. It is quoted verbatim and must never be
 #: reworded, translated or normalized away.
@@ -135,9 +152,9 @@ BRAND_SUBTITLE = "Gamas Bot"
 
 #: Default page-border look: a thin, elegant line 24 pt inside the page edge,
 #: which clears the 2.2 cm text margin and the footer.
-DEFAULT_BORDER_COLOR = "C2CEDC"
+DEFAULT_BORDER_COLOR = THEME.ooxml(_PALETTE.border)
 DEFAULT_BORDER_SIZE = 8  # eighths of a point -> 1 pt
-DEFAULT_BORDER_SPACE = 24  # points from the page edge (0-31)
+DEFAULT_BORDER_SPACE = THEME.geometry.border_space_pt
 #: The complete ECMA-376 ``ST_Border`` line-style enumeration (the "border
 #: art" values -- ``apples``, ``archedScallops``, ... -- are deliberately
 #: excluded: they are decorations, not the frame this document draws). Anything
@@ -168,8 +185,8 @@ WARNING_STYLE = "Warning"
 CALLOUT_STYLE_BY_KIND = {"هشدار": WARNING_STYLE, "یادآوری": NOTE_STYLE, "نکته": NOTE_STYLE}
 
 #: Heading typography: level -> (size, space before, space after).
-HEADING_SIZES = {1: 15.0, 2: 12.5, 3: 11.5}
-HEADING_SPACING = {1: (14, 6), 2: (10, 4), 3: (8, 3)}
+HEADING_SIZES = {1: THEME.type.h1, 2: THEME.type.h2, 3: THEME.type.h3}
+HEADING_SPACING = {1: (16, 8), 2: (11, 5), 3: (8, 3)}
 
 #: A table of contents needs a document with enough structure to browse. A short
 #: note is read in one sitting, and a TOC in front of it costs a page and adds a
@@ -1115,12 +1132,13 @@ def _set_section_rtl(section) -> None:
 
 def _configure_section(section) -> None:
     """A4 with comfortable Persian-document margins."""
-    section.page_width = Cm(21.0)
-    section.page_height = Cm(29.7)
-    section.top_margin = Cm(2.4)
-    section.bottom_margin = Cm(2.2)
-    section.left_margin = Cm(2.2)
-    section.right_margin = Cm(2.2)
+    geometry = THEME.geometry
+    section.page_width = Cm(geometry.page_width_cm)
+    section.page_height = Cm(geometry.page_height_cm)
+    section.top_margin = Cm(geometry.docx_margin_top_cm)
+    section.bottom_margin = Cm(geometry.docx_margin_bottom_cm)
+    section.left_margin = Cm(geometry.docx_margin_side_cm)
+    section.right_margin = Cm(geometry.docx_margin_side_cm)
     section.header_distance = Cm(1.2)
     section.footer_distance = Cm(1.2)
     _set_section_rtl(section)
@@ -1145,10 +1163,11 @@ def _set_section_rtl_gutter(section) -> None:
 
 
 def _add_page_number_footer(section, *, fonts: DocumentFonts, design: DocxDesign) -> None:
-    """A professional footer: optional brand plus a real ``PAGE`` field.
+    """A premium minimal footer: Gamas, a dot, and a real ``PAGE`` field.
 
-    The footer page number is a Word field (``w:fldChar``/``w:instrText``),
-    never a hardcoded integer, so it stays correct when pagination changes.
+    The page number is a Word field (``w:fldChar``/``w:instrText``), never a
+    hardcoded integer, so it stays correct when pagination changes. The field
+    renders as the reader's locale digits (Persian in a Persian Word UI).
     """
     footer = section.footer
     footer.is_linked_to_previous = False
@@ -1156,17 +1175,26 @@ def _add_page_number_footer(section, *, fonts: DocumentFonts, design: DocxDesign
     for run in list(paragraph.runs):
         run._r.getparent().remove(run._r)
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    paragraph.paragraph_format.space_before = Pt(2)
+    paragraph.paragraph_format.space_before = Pt(3)
     paragraph.paragraph_format.space_after = Pt(0)
     if design.footer_brand:
         _add_directional_text(
-            paragraph, FOOTER_BRAND_TEXT, fonts=fonts, size=9, color=MUTED
+            paragraph, "GAMAS", fonts=_heading_fonts(fonts), size=8.5,
+            bold=True, color=ACCENT_SOFT,
         )
-        _add_directional_text(
-            paragraph, "  —  ", fonts=fonts, size=9, color=MUTED, rtl_bold=None
-        )
-        _add_directional_text(paragraph, "صفحهٔ ", fonts=fonts, size=9, color=MUTED)
-    _add_field(paragraph, "PAGE", fonts=fonts, size=9, color=MUTED)
+        _add_directional_text(paragraph, "  ·  ", fonts=fonts, size=8.5, color=MUTED)
+    _add_directional_text(paragraph, "صفحهٔ ", fonts=fonts, size=8.5, color=MUTED)
+    _add_field(paragraph, "PAGE", fonts=fonts, size=8.5, color=MUTED)
+    p_pr = paragraph._p.get_or_add_pPr()
+    _remove_ppr_child(p_pr, "w:pBdr")
+    borders = OxmlElement("w:pBdr")
+    top = OxmlElement("w:top")
+    top.set(qn("w:val"), "single")
+    top.set(qn("w:sz"), "4")
+    top.set(qn("w:space"), "4")
+    top.set(qn("w:color"), CYAN_HEX)
+    borders.append(top)
+    _insert_ppr_child(p_pr, borders, ("w:shd",) + PPR_SUCCESSORS)
 
 
 def _add_field(paragraph, instruction: str, *, fonts: DocumentFonts, size: float,
@@ -1195,22 +1223,25 @@ def _add_field(paragraph, instruction: str, *, fonts: DocumentFonts, size: float
 
 
 def _add_document_header(section, *, fonts: DocumentFonts, title: str) -> None:
-    """A small running header: document title on one side, brand on the other."""
+    """A minimal running header: the brand, then the booklet's own title.
+
+    Deliberately one line. A running header should orient the reader, not
+    compete with the chapter banner below it; the cyan hairline is the only
+    decoration.
+    """
     header = section.header
     header.is_linked_to_previous = False
     paragraph = header.paragraphs[0]
     for run in list(paragraph.runs):
         run._r.getparent().remove(run._r)
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    header_text = f"{xml_safe(title)} | {PAGE_HEADER_TEXT}"
     paragraph.paragraph_format.space_after = Pt(2)
     _add_directional_text(
-        paragraph,
-        header_text,
-        fonts=fonts,
-        size=8.5,
-        color=MUTED,
+        paragraph, "GAMAS", fonts=_heading_fonts(fonts), size=8.4,
+        bold=True, color=ACCENT_SOFT,
     )
+    _add_directional_text(paragraph, "  ·  ", fonts=fonts, size=8.4, color=MUTED)
+    _add_directional_text(paragraph, xml_safe(title), fonts=fonts, size=8.4, color=MUTED)
     p_pr = paragraph._p.get_or_add_pPr()
     _remove_ppr_child(p_pr, "w:pBdr")
     borders = OxmlElement("w:pBdr")
@@ -1218,9 +1249,7 @@ def _add_document_header(section, *, fonts: DocumentFonts, title: str) -> None:
     bottom.set(qn("w:val"), "single")
     bottom.set(qn("w:sz"), "4")
     bottom.set(qn("w:space"), "2")
-    # The steel-blue secondary accent: a hairline under a running header
-    # should whisper, not shout in the same navy as every Heading 1.
-    bottom.set(qn("w:color"), ACCENT_SOFT_HEX)
+    bottom.set(qn("w:color"), CYAN_HEX)
     borders.append(bottom)
     _insert_ppr_child(p_pr, borders, ("w:shd",) + PPR_SUCCESSORS)
 
@@ -1663,8 +1692,46 @@ def _add_body_section(document):
     return section
 
 
+def _add_image_paragraph(
+    document,
+    asset,
+    *,
+    fonts: DocumentFonts,
+    width_cm: float,
+    space_after: float = 6,
+    align=WD_ALIGN_PARAGRAPH.CENTER,
+) -> bool:
+    """Place one registered booklet asset, degrading to no image on failure.
+
+    Artwork is decoration: a missing or unreadable file must never cost the
+    student the booklet, so the failure is logged and the layout continues.
+    """
+    if asset is None:
+        return False
+    try:
+        paragraph = _add_rtl_paragraph(
+            document, "", fonts=fonts, align=align,
+            space_after=space_after, space_before=0, line_spacing=1.0,
+        )
+        paragraph.add_run().add_picture(str(asset.path), width=Cm(width_cm))
+        return True
+    except Exception:
+        logger.warning("booklet asset %s could not be embedded", getattr(asset, "key", "?"), exc_info=True)
+        return False
+
+
 def _add_brand_mark(document, *, fonts: DocumentFonts, design: DocxDesign) -> None:
-    """The Gamas mark: a local logo when one exists, else a typographic wordmark."""
+    """The Gamas mark: the bundled monogram, a configured logo, or a wordmark.
+
+    Order matters. The monogram is the document identity and ships with the
+    repository, so it is preferred; a configured logo still wins when an owner
+    supplies one, and a typographic wordmark is the last resort.
+    """
+    monogram = optional_asset("brand/monogram")
+    if monogram is not None and _add_image_paragraph(
+        document, monogram, fonts=fonts, width_cm=2.7, space_after=2
+    ):
+        return
     logo = design.logo_file
     if logo is not None:
         try:
@@ -1678,11 +1745,11 @@ def _add_brand_mark(document, *, fonts: DocumentFonts, design: DocxDesign) -> No
             logger.warning("Gamas logo could not be embedded; using the typographic mark", exc_info=True)
     heading_fonts = _heading_fonts(fonts)
     _add_rtl_paragraph(
-        document, BRAND_NAME, fonts=heading_fonts, size=34, bold=True, color=ACCENT,
+        document, BRAND_NAME, fonts=heading_fonts, size=32, bold=True, color=ACCENT,
         align=WD_ALIGN_PARAGRAPH.CENTER, space_after=0, line_spacing=1.0,
     )
     _add_rtl_paragraph(
-        document, BRAND_SUBTITLE, fonts=fonts, size=13, color=MUTED,
+        document, BRAND_SUBTITLE, fonts=fonts, size=12, color=MUTED,
         align=WD_ALIGN_PARAGRAPH.CENTER, space_after=2, line_spacing=1.0,
     )
 
@@ -1695,62 +1762,83 @@ def _add_cover_page(
     fonts: DocumentFonts,
     design: DocxDesign,
     mode_label: str = "",
+    subject: str = "",
 ) -> None:
-    """The dedicated first page: brand, lecture title, metadata, quotation.
+    """The Gamas cover: cream paper, navy title panel, topic artwork, quote.
 
-    Deliberately restrained: the page carries only what identifies the
-    booklet, so it stays calm and uncrowded.
+    Every word here is real, editable Word text rendered in the document's own
+    fonts — the artwork carries no text at all, so Persian can never be
+    distorted by an image. The composition follows the booklet's internal
+    pages: same navy, same cyan accent, same cream panels.
     """
     heading_fonts = _heading_fonts(fonts)
+    topic = topic_for(subject or title)
+    hero = optional_asset(topic.cover)
+
+    # The traditional opening line, quiet and small.
     _add_rtl_paragraph(
-        document, COVER_GOD_LINE, fonts=fonts, size=12, color=MUTED,
-        align=WD_ALIGN_PARAGRAPH.CENTER, space_after=18, line_spacing=1.0,
+        document, COVER_GOD_LINE, fonts=fonts, size=10, color=MUTED,
+        align=WD_ALIGN_PARAGRAPH.CENTER, space_after=6, line_spacing=1.0,
     )
     _add_brand_mark(document, fonts=fonts, design=design)
-    _add_rule(document, fonts=fonts, space_after=16)
-
-    title_paragraph = _add_rtl_paragraph(
-        document, "", fonts=heading_fonts, align=WD_ALIGN_PARAGRAPH.CENTER,
-        space_after=6, line_spacing=1.15, style=TITLE_STYLE,
+    _add_rtl_paragraph(
+        document, BRAND_NAME, fonts=heading_fonts, size=26, bold=True, color=ACCENT,
+        align=WD_ALIGN_PARAGRAPH.CENTER, space_after=0, space_before=2, line_spacing=1.0,
     )
-    _add_directional_text(title_paragraph, title, fonts=heading_fonts, size=24, bold=True, color=ACCENT)
-    _keep_with_next(title_paragraph)
-    # The mode label and the metadata are separate short lines (see
-    # cover_meta_lines): a single wrapped line strands the tracking reference.
-    meta_lines = cover_meta_lines(meta, mode_label=mode_label)
-    for position, line in enumerate(meta_lines):
-        _add_rtl_paragraph(
-            document,
-            line,
-            fonts=fonts,
-            size=10.5 if position == 0 and mode_label else 9.5,
-            color=ACCENT if position == 0 and mode_label else MUTED,
-            align=WD_ALIGN_PARAGRAPH.CENTER,
-            space_after=2,
-            line_spacing=1.2,
-        )
-    _add_rule(document, fonts=fonts, fill=RULE_FILL, space_after=14)
+    _add_rtl_paragraph(
+        document, "SMART STUDY ASSISTANT", fonts=fonts, size=7.8, color=ACCENT_SOFT,
+        align=WD_ALIGN_PARAGRAPH.CENTER, space_after=10, line_spacing=1.0,
+    )
 
-    # Flexible space so the quotation sits quietly in the lower third of the
-    # page (fixed spacer paragraphs: Word has no "flexible space" that survives
-    # a font substitution, so the offset is deliberately conservative).
-    # A longer title and a longer metadata block push the quotation down, so
-    # they give back one spacer line each — the cover keeps the same balance
-    # whatever the job metadata looks like.
-    extra_lines = max(0, len(_wrap_estimate(title, 48)) - 1) + max(0, len(meta_lines) - 2)
-    for _ in range(max(5, 12 - extra_lines)):
-        _add_rtl_paragraph(
-            document, "", fonts=fonts, size=11, space_after=12, line_spacing=1.0
+    # The navy title panel: label, title and metadata as one framed block.
+    panel_lines: list[tuple[str, float, RGBColor, bool]] = []
+    if mode_label:
+        panel_lines.append((mode_label, 9.2, CYAN, True))
+    panel_lines.append((title, 22.0, ON_ACCENT, True))
+    for line in cover_meta_lines(meta):
+        panel_lines.append((line, 9.0, _rgb(_PALETTE.cream_100), False))
+    for index, (line, size, color, bold) in enumerate(panel_lines):
+        paragraph = _add_rtl_paragraph(
+            document, line, fonts=heading_fonts if bold else fonts, size=size,
+            bold=bold, color=color, align=WD_ALIGN_PARAGRAPH.CENTER,
+            space_after=3 if index < len(panel_lines) - 1 else 4,
+            space_before=8 if index == 0 else 0, line_spacing=1.2,
         )
+        _shade_paragraph(paragraph, ACCENT_HEX)
+        edges = ["left", "right"]
+        if index == 0:
+            edges.insert(0, "top")
+        if index == len(panel_lines) - 1:
+            edges.append("bottom")
+        _paragraph_border_edges(paragraph, CYAN_HEX, size="6", edges=tuple(edges))
+        if index == 0:
+            _keep_with_next(paragraph, keep_lines=False)
+
+    # Topic artwork: one committed asset, selected deterministically.
+    _add_rtl_paragraph(document, "", fonts=fonts, size=4, space_after=4, line_spacing=1.0)
+    _add_image_paragraph(
+        document, hero, fonts=fonts, width_cm=THEME.geometry.cover_art_width_cm, space_after=6
+    )
+
+    # Editorial line + the quotation panel.
+    _add_rtl_paragraph(
+        document, "جزوهٔ درسی · نسخهٔ PDF و Word", fonts=fonts, size=8.2, color=MUTED,
+        align=WD_ALIGN_PARAGRAPH.CENTER, space_after=6, space_before=4, line_spacing=1.0,
+    )
     quote_paragraph = _add_rtl_paragraph(
-        document, "", fonts=fonts, size=12, align=WD_ALIGN_PARAGRAPH.CENTER,
-        space_after=0, space_before=0, line_spacing=1.4, style=QUOTE_STYLE,
+        document, "", fonts=fonts, size=THEME.type.cover_quote, align=WD_ALIGN_PARAGRAPH.CENTER,
+        space_after=0, space_before=2, line_spacing=1.4, style=QUOTE_STYLE,
     )
     _add_directional_text(
-        quote_paragraph, f"«{COVER_QUOTE}»", fonts=fonts, size=12, bold=False, color=ACCENT,
+        quote_paragraph, f"«{COVER_QUOTE}»", fonts=fonts,
+        size=THEME.type.cover_quote, bold=False, color=ACCENT,
     )
     _shade_paragraph(quote_paragraph, QUOTE_SHADE)
     _paragraph_borders(quote_paragraph, QUOTE_BORDER, size="4")
+    _add_rtl_paragraph(
+        document, "Gamas · دستیار مطالعهٔ هوشمند", fonts=fonts, size=8.2, color=MUTED,
+        align=WD_ALIGN_PARAGRAPH.CENTER, space_before=6, space_after=0, line_spacing=1.0,
+    )
 
 
 def _add_body_title_block(
@@ -2163,28 +2251,62 @@ def _add_heading(
     size: float | None = None,
     space_before: float | None = None,
     space_after: float | None = None,
+    banner: bool | None = None,
 ) -> Paragraph:
-    """A *real* Word heading: ``w:pStyle`` Heading 1/2/3, not a styled Normal.
+    """A *real* Word heading, dressed as the Gamas hierarchy.
 
-    The explicit run formatting keeps the Persian complex-script face and the
-    configured sizes; the style is what gives Word the outline level.
+    Level 1 is a chapter banner: a deep-navy bar with cream text and a cyan
+    hairline frame, so every major section opens at the same visual register in
+    Word and PDF. Levels 2/3 are teal/navy text without a bar, which keeps the
+    banner meaningful. The paragraph stays a genuine ``Heading N`` paragraph, so
+    the Navigation Pane, the static TOC bookmarks and restructuring still work.
     """
     level = level if level in HEADING_STYLES else 1
     resolved_size = size if size is not None else HEADING_SIZES[level]
     heading_fonts = _heading_fonts(fonts)
+    resolved_before = HEADING_SPACING[level][0] if space_before is None else space_before
+    resolved_after = HEADING_SPACING[level][1] if space_after is None else space_after
     paragraph = container.add_paragraph()
     _apply_paragraph_style(paragraph, container, HEADING_STYLES[level])
-    _fill_paragraph(
-        paragraph,
-        text,
-        fonts=heading_fonts,
-        size=resolved_size,
-        bold=True,
-        color=HEADING_COLORS.get(level, ACCENT),
-        align=WD_ALIGN_PARAGRAPH.RIGHT,
-        space_after=(HEADING_SPACING[level][1] if space_after is None else space_after),
-        space_before=(HEADING_SPACING[level][0] if space_before is None else space_before),
-    )
+    if level == 1 and banner is not False:
+        _fill_paragraph(
+            paragraph,
+            "",
+            fonts=heading_fonts,
+            size=resolved_size,
+            bold=True,
+            color=ON_ACCENT,
+            align=WD_ALIGN_PARAGRAPH.RIGHT,
+            space_after=resolved_after,
+            space_before=resolved_before,
+            line_spacing=1.2,
+        )
+        _add_directional_text(
+            paragraph, text, fonts=heading_fonts, size=resolved_size,
+            bold=True, color=ON_ACCENT,
+        )
+        _shade_paragraph(paragraph, ACCENT_HEX)
+        _paragraph_borders(paragraph, CYAN_HEX, size="6")
+    else:
+        # Front-matter and closing headings: teal type over a cyan hairline.
+        # Lighter than a chapter banner, so a navy bar always means a major
+        # destination (a chapter, the key-points recap, the glossary).
+        color = ACCENT_SOFT if level == 1 else HEADING_COLORS.get(level, ACCENT)
+        _fill_paragraph(
+            paragraph,
+            text,
+            fonts=heading_fonts,
+            size=resolved_size if level > 1 else THEME.type.banner,
+            bold=True,
+            color=color,
+            align=WD_ALIGN_PARAGRAPH.RIGHT,
+            space_after=resolved_after,
+            space_before=resolved_before,
+        )
+        _paragraph_border_edges(
+            paragraph, CYAN_HEX, size="8",
+            edges=("bottom",),
+        )
     # A heading alone at the foot of a page reads as a broken booklet.
     _keep_with_next(paragraph)
     _add_bookmark(paragraph, container)
@@ -2199,7 +2321,7 @@ def _add_boxed_lines(
     fonts: DocumentFonts,
     fill: str,
     border: str | None = None,
-    marker: str = "✦",
+    marker: str = "•",
     level: int = 2,
     style: str = NOTE_STYLE,
 ) -> None:
@@ -2442,6 +2564,9 @@ def _add_table(document, table_data, *, fonts: DocumentFonts) -> None:
                 _table_cell_text(value),
                 fonts=fonts,
                 size=10.5,
+                # The first column is the row's label: emphasised so a wide
+                # comparison table can be read down its left edge at a glance.
+                bold=(column == 0 and len(headers) > 1),
                 align=WD_ALIGN_PARAGRAPH.RIGHT,
                 space_after=0,
             )
@@ -2472,29 +2597,39 @@ def _table_column_widths(columns: int, *, total_cm: float = TABLE_CONTENT_WIDTH_
 
 
 def _add_callout(document, callout, *, fonts: DocumentFonts) -> None:
-    # «نکته» (and anything unexpected upstream let through) is the informational
-    # default: its own blue tint, never «یادآوری»'s amber.
-    fill = CALLOUT_SHADES.get(callout.kind) or CALLOUT_SHADES["نکته"]
-    frame = CALLOUT_BORDERS.get(callout.kind) or CALLOUT_BORDERS["نکته"]
-    emoji = CALLOUT_EMOJI.get(callout.kind, "💡")
-    style = CALLOUT_STYLE_BY_KIND.get(callout.kind, NOTE_STYLE)
+    """A branded callout: coloured label, tinted panel, visible frame.
+
+    The label is a bold run in the component's accent colour — no emoji. Emoji
+    are the visual language of chat, not of a printed academic booklet, and they
+    do not survive every PDF font. The kind itself («نکته»/«هشدار»/«یادآوری»)
+    is the icon.
+
+    A warning split across a page boundary is exactly the note a reader can
+    lose, so Word keeps the paragraph together (and ignores the rule when the
+    paragraph is longer than a page, so this can never break the layout).
+    """
+    style = design.callout_style(callout.kind)
     paragraph = _add_rtl_paragraph(
         document,
-        f"{emoji} {callout.kind}: {callout.text}",
+        "",
         fonts=fonts,
-        size=11,
+        size=THEME.type.body,
         align=WD_ALIGN_PARAGRAPH.RIGHT,
         space_after=6,
-        style=style,
+        space_before=2,
+        line_spacing=1.4,
+        style=CALLOUT_STYLE_BY_KIND.get(callout.kind, NOTE_STYLE),
     )
-    _shade_paragraph(paragraph, fill)
-    # A frame drawn in the fill colour is invisible; the border tone is the
-    # deeper step of the same hue, so the box keeps its shape on screen and
-    # survives a grey-scale print.
-    _paragraph_borders(paragraph, frame)
-    # A warning split across a page boundary is exactly the note a reader can
-    # lose. Word keeps the whole paragraph together (and ignores the rule when
-    # the paragraph is longer than a page, so this can never break the layout).
+    _add_directional_text(
+        paragraph, f"{style.label}: ", fonts=fonts, size=10.6, bold=True,
+        color=_rgb(style.accent),
+    )
+    _add_directional_text(
+        paragraph, callout.text, fonts=fonts, size=THEME.type.body,
+        color=_rgb(_PALETTE.ink),
+    )
+    _shade_paragraph(paragraph, THEME.ooxml(style.fill))
+    _paragraph_borders(paragraph, THEME.ooxml(style.border), size="4")
     _keep_lines(paragraph)
 
 
@@ -2608,6 +2743,21 @@ def _numbered_heading(index: int, heading: str) -> str:
 
 
 def _add_section(document, index: int, section: NoteSection, *, fonts: DocumentFonts) -> None:
+    # The chapter eyebrow: a small teal label above the banner, kept with it so
+    # a chapter never starts with its label stranded at a page foot.
+    eyebrow = _add_rtl_paragraph(
+        document,
+        f"فصل {design.chapter_number(index)}",
+        fonts=fonts,
+        size=THEME.type.eyebrow,
+        bold=True,
+        color=ACCENT_SOFT,
+        align=WD_ALIGN_PARAGRAPH.RIGHT,
+        space_before=12,
+        space_after=0,
+        line_spacing=1.0,
+    )
+    _keep_with_next(eyebrow)
     _add_heading(document, _numbered_heading(index, section.heading), fonts=fonts, level=1)
     if section.source_locators:
         _add_rtl_paragraph(
@@ -2688,6 +2838,59 @@ def _glossary_rows(notes) -> list[tuple[str, str]]:
     return rows
 
 
+#: How to study this booklet. Editorial furniture, not course content: the same
+#: three instructions apply to every Gamas booklet and are never model-written.
+_GUIDE_LINES = (
+    "پیش از مطالعه: «در یک نگاه» را بخوانید تا نقشهٔ کار روشن شود.",
+    "هنگام مطالعه: هر فصل را با جدول‌ها، مثال‌ها و کادرهای کلیدی جلو ببرید.",
+    "پس از مطالعه: پرسش‌های مرور را پاسخ دهید و اصطلاح‌های تازه را مرور کنید.",
+)
+
+
+def _add_study_guide(document, *, fonts: DocumentFonts) -> None:
+    """The quick guide: how to use this booklet, in the branded panel dress."""
+    _add_heading(document, design.LABELS["guide"], fonts=fonts, level=1, space_before=4, banner=False)
+    _add_boxed_lines(
+        document,
+        "",
+        list(_GUIDE_LINES),
+        fonts=fonts,
+        fill=THEME.ooxml(design.GUIDE.fill),
+        border=THEME.ooxml(design.GUIDE.border),
+    )
+
+
+def _add_at_a_glance(
+    document,
+    *,
+    fonts: DocumentFonts,
+    title: str,
+    sections,
+) -> None:
+    """A source-derived overview: the topic, its size and its real structure.
+
+    Only facts the booklet already contains are shown — the title and the
+    section headings the model authored from the source. Nothing is invented to
+    fill the panel, and no learning objective is claimed when none exists.
+    """
+    lines = [f"موضوع: {title}"]
+    headings = [section.heading for section in sections or () if section.heading]
+    if headings:
+        lines.append(f"تعداد فصل‌ها: {to_persian_digits(len(headings))}")
+        route = headings[:5]
+        suffix = " · …" if len(headings) > len(route) else ""
+        lines.append("مسیر مطالعه: " + " · ".join(route) + suffix)
+    _add_heading(document, design.LABELS["glance"], fonts=fonts, level=1, banner=False)
+    _add_boxed_lines(
+        document,
+        "",
+        lines,
+        fonts=fonts,
+        fill=THEME.ooxml(design.GLANCE.fill),
+        border=THEME.ooxml(design.GLANCE.border),
+    )
+
+
 def build_notes_docx(
     notes: StructuredNotes,
     *,
@@ -2719,6 +2922,7 @@ def build_notes_docx(
             fonts=resolved,
             design=style,
             mode_label=MODE_LABELS.get(notes.note_mode, ""),
+            subject=booklet_text(notes),
         )
         # The cover is a section of its own: no running header, no page number,
         # and the body restarts at page one behind a page break.
@@ -2750,12 +2954,17 @@ def build_notes_docx(
         # The skeleton owns its own page break so the page can be dropped whole.
         toc_table = _add_static_toc_skeleton(document, fonts=resolved)
 
+    _add_study_guide(document, fonts=resolved)
+    _add_at_a_glance(
+        document, fonts=resolved, title=notes.display_title, sections=notes.sections
+    )
+
     if notes.learning_objectives:
-        _add_heading(document, "اهداف یادگیری", fonts=resolved, level=1, space_before=0)
+        _add_heading(document, "اهداف یادگیری", fonts=resolved, level=1, space_before=0, banner=False)
         _add_bullets(document, notes.learning_objectives, fonts=resolved)
 
     if notes.summary:
-        _add_heading(document, "خلاصه", fonts=resolved, level=1, space_before=4)
+        _add_heading(document, "خلاصه", fonts=resolved, level=1, space_before=4, banner=False)
         paragraph = _add_rtl_paragraph(document, notes.summary, fonts=resolved, size=11.5, space_after=10)
         _shade_paragraph(paragraph, SUMMARY_SHADE)
         _paragraph_borders(paragraph, SUMMARY_BORDER)
@@ -2771,7 +2980,7 @@ def build_notes_docx(
         )
 
     if notes.practical_tips:
-        _add_heading(document, "نکته‌های کاربردی", fonts=resolved, level=1)
+        _add_heading(document, "نکته‌های کاربردی", fonts=resolved, level=1, banner=False)
         _add_boxed_lines(
             document,
             "توصیه‌های خودِ مدرس برای کاربرد و آزمون",
@@ -2782,7 +2991,7 @@ def build_notes_docx(
         )
 
     if notes.review_questions:
-        _add_heading(document, "پرسش‌های مرور", fonts=resolved, level=1)
+        _add_heading(document, "پرسش‌های مرور", fonts=resolved, level=1, banner=False)
         _add_numbered_steps(document, notes.review_questions, fonts=resolved)
 
     # Gamas 2.0: a source-derived appendix. Speaker labels are the anonymous
@@ -2790,7 +2999,7 @@ def build_notes_docx(
     # timeline is paragraph timings. Neither is generated by the note model,
     # so a booklet never invents a speaker or a chapter that was not heard.
     if notes.speakers or notes.timeline:
-        _add_heading(document, "گویندگان و زمان\u200cبندی", fonts=resolved, level=1)
+        _add_heading(document, "گویندگان و زمان\u200cبندی", fonts=resolved, level=1, banner=False)
         if notes.speakers:
             _add_boxed_lines(
                 document,
@@ -2907,7 +3116,10 @@ def build_plain_docx(
     _configure_section(first_section)
     apply_page_border(first_section, style)
     if style.cover_enabled:
-        _add_cover_page(document, title, meta, fonts=resolved, design=style, mode_label=mode_label)
+        _add_cover_page(
+            document, title, meta, fonts=resolved, design=style,
+            mode_label=mode_label, subject=title,
+        )
         body_section = _add_body_section(document)
     else:
         body_section = first_section
@@ -2927,6 +3139,9 @@ def build_plain_docx(
     if toc_needed:
         # The skeleton owns its own page break so the page can be dropped whole.
         toc_table = _add_static_toc_skeleton(document, fonts=resolved)
+
+    _add_study_guide(document, fonts=resolved)
+    _add_at_a_glance(document, fonts=resolved, title=title, sections=[])
 
     for block in blocks:
         if block.kind == "heading":

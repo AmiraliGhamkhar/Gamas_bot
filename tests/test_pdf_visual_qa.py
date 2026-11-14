@@ -200,12 +200,21 @@ class PdfStructureTests(unittest.TestCase):
                 self.assertIn("خلاصه", text, f"{name}: summary heading missing")
                 for section in notes.sections[:3]:
                     words = [
-                        w for w in _normalize(section.heading).split() if len(w) > 2
+                        w.strip("؛،,.:;()[]")
+                        for w in _normalize(section.heading).split()
+                        if len(w) > 2
                     ]
-                    if words:
-                        self.assertIn(
-                            words[0], text, f"{name}: heading '{section.heading}' not found"
-                        )
+                    words = [w for w in words if len(w) > 2]
+                    # Text extraction follows *visual* order. A heading that
+                    # opens with a Latin term ("Metformin؛ خط اول درمان") is
+                    # drawn right-to-left, so its first logical word is
+                    # extracted last; a contiguous logical substring would fail
+                    # even though the heading is on the page. Check the words.
+                    missing = [w for w in words if w not in text]
+                    self.assertFalse(
+                        missing,
+                        f"{name}: heading '{section.heading}' missing from the PDF: {missing}",
+                    )
 
     def test_persian_text_is_present_not_replacement_glyphs(self):
         payload = render(stress_notes())

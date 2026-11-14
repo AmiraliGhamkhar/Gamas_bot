@@ -4,6 +4,19 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Gamas document design system for booklets.** DOCX and PDF booklets now share
+one art-directed identity instead of two unrelated templates: a central token
+layer (`gamas_bot/document/theme.py`), a semantic component vocabulary, and a
+manifest-backed artwork set with deterministic, topic-aware cover selection. The
+cover is cream paper with a navy frame, teal/cyan curves, an ECG trace and a
+layered academic illustration; all Persian text on it is drawn by the renderer,
+never baked into an image. Chapters get navy banners, front matter and closing
+material a lighter teal register, cards carry an RTL accent edge, tables size
+their columns from measured text and repeat a titled header, and the Word footer
+keeps a real page field. Rendering now has post-render QA (`inspect_pdf`,
+`inspect_docx`, `validate_assets`) plus three representative rendering tests;
+content generation, validation, billing, jobs and delivery are untouched.
+
 **Interactive HTML review sheet (third booklet output).** A completed AI booklet
 (verified or repaired; never the deterministic source fallback or a degraded
 booklet) can now also produce a self-contained, offline, Persian RTL HTML

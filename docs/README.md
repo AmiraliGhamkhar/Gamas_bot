@@ -35,6 +35,7 @@ examples assume you activated the virtualenv (`source .venv/bin/activate`).
 | --- | --- |
 | [Testing](TESTING.md) | Offline gates on Windows and cPanel/Linux, smoke checklist |
 | [Development](DEVELOPMENT.md) | Architecture, code map, migration and dependency rules |
+| [Booklet design](BOOKLET_DESIGN.md) | Design tokens, components, cover artwork, DOCX/PDF pipelines and visual QA |
 | [Changelog](CHANGELOG.md) | Latest release notes |
 
 Maintainers also read [AGENTS.md](../AGENTS.md). Settings are defined in
