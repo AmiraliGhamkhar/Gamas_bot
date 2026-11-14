@@ -104,6 +104,8 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("NOTE_STRUCTURED_OUTPUT", "note_structured_output", "bool"),
     ("NOTE_PROGRESSIVE_BOOKLET", "note_progressive_booklet", "bool"),
     ("NOTE_COMPLETENESS_FILL", "note_completeness_fill", "bool"),
+    ("NOTE_MAX_REPAIR_ATTEMPTS", "note_max_repair_attempts", "int"),
+    ("NOTE_ENABLE_DETERMINISTIC_FALLBACK", "note_enable_deterministic_fallback", "bool"),
     ("NOTE_COMPILE", "note_compile", "bool"),
     ("NOTE_STRICT_GROUNDING", "note_strict_grounding", "bool"),
     ("NOTE_QUALITY_GATE", "note_quality_gate", "str"),

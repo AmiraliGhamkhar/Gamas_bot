@@ -795,6 +795,12 @@ class Settings:
     #: production by default; tests use the dataclass default (``False``) so
     #: offline fixtures keep a fixed request count.
     note_completeness_fill: bool = False
+    #: Hard call cap for command-driven booklet repair. The implementation has
+    #: three ordered passes, but stops early and never exceeds this bound.
+    note_max_repair_attempts: int = 2
+    #: Construct a local source-preserving StructuredNotes artifact when every
+    #: eligible LLM route for a chunk (or the sole chunk) has failed.
+    note_enable_deterministic_fallback: bool = True
     #: Keep stereo when the source has useful channel separation (diarization).
     #: Default ``False`` preserves the mono 16 kHz STT upload.
     stt_preserve_stereo: bool = False
@@ -1477,6 +1483,12 @@ def from_env(env_file: str | None = None) -> Settings:
         note_structured_output=_env_bool("NOTE_STRUCTURED_OUTPUT", True),
         note_progressive_booklet=_env_bool("NOTE_PROGRESSIVE_BOOKLET", False),
         note_completeness_fill=_env_bool("NOTE_COMPLETENESS_FILL", False),
+        note_max_repair_attempts=_env_int(
+            "NOTE_MAX_REPAIR_ATTEMPTS", 2, minimum=0, maximum=3
+        ),
+        note_enable_deterministic_fallback=_env_bool(
+            "NOTE_ENABLE_DETERMINISTIC_FALLBACK", True
+        ),
         note_compile_provider=normalize_note_compile_provider(
             _env("NOTE_COMPILE_PROVIDER")
         ),

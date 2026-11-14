@@ -20,8 +20,6 @@ from gamas_bot.notes import (
     MAX_NOTE_REPAIR_ATTEMPTS,
     SENSITIVITY_STANDARD_EDUCATIONAL,
     SENSITIVITY_UNKNOWN,
-    NoteQualityError,
-    StructuringError,
     LectureContext,
     NoteSection,
     StructuredNotes,
@@ -166,7 +164,7 @@ class SensitivityPropagationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FinalAcceptanceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_a_booklet_that_keeps_an_unsupported_fact_is_rejected(self):
+    async def test_an_unrepairable_unsupported_fact_is_removed_and_delivered_degraded(self):
         source = "دوز شروع ۵۰۰ میلی‌گرم است و بیمار آن را با غذا مصرف می‌کند."
         fabricated = note_payload(
             "دوز شروع ۵۰۰ میلی‌گرم است و بیمار باید aspirin مصرف کند."
@@ -179,14 +177,10 @@ class FinalAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             note_strict_grounding=True, note_quality_gate="repair", note_compile=False
         )
         with mock.patch("gamas_bot.notes.complete_json", new=fake_complete_json):
-            with self.assertRaises(NoteQualityError) as ctx:
-                await structure_document(source, settings, object())
-        self.assertEqual(ctx.exception.reason, "unsupported_facts")
-        self.assertGreaterEqual(ctx.exception.fabricated, 1)
-        # The caller's contract is unchanged: this is a StructuringError, so the
-        # transcript is kept and the job is reported as partial, never as a
-        # delivered booklet.
-        self.assertIsInstance(ctx.exception, StructuringError)
+            notes = await structure_document(source, settings, object())
+        self.assertEqual(notes.quality_state, "RECOVERED")
+        self.assertNotIn("aspirin", notes.to_json().lower())
+        self.assertIn("۵۰۰", notes.to_json())
 
     async def test_warn_mode_observes_without_rejecting(self):
         source = "دوز شروع ۵۰۰ میلی‌گرم است."
@@ -230,7 +224,7 @@ class FinalAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             notes = await structure_document(source, settings, object())
         self.assertTrue(notes.has_content)
         self.assertLessEqual(repair_calls, MAX_NOTE_REPAIR_ATTEMPTS)
-        self.assertEqual(repair_calls, MAX_NOTE_REPAIR_ATTEMPTS)
+        self.assertEqual(repair_calls, settings.note_max_repair_attempts)
 
 
 class JobStageReportingTests(unittest.IsolatedAsyncioTestCase):
@@ -477,7 +471,7 @@ class ProseClaimGateTests(unittest.IsolatedAsyncioTestCase):
         "نفرون واحد عملکردی کلیه است و آب و نمک خون را تنظیم می‌کند."
     )
 
-    async def test_an_invented_persian_claim_rejects_the_booklet(self):
+    async def test_an_invented_persian_claim_is_removed_without_losing_valid_content(self):
         payload = {
             "title": "کلیه",
             "sections": [
@@ -499,9 +493,11 @@ class ProseClaimGateTests(unittest.IsolatedAsyncioTestCase):
             note_strict_grounding=True, note_quality_gate="repair", note_compile=False
         )
         with mock.patch("gamas_bot.notes.complete_json", new=fake_complete_json):
-            with self.assertRaises(NoteQualityError) as ctx:
-                await structure_document(self.SOURCE, settings, object())
-        self.assertEqual(ctx.exception.reason, "unsupported_claims")
+            notes = await structure_document(self.SOURCE, settings, object())
+        self.assertEqual(notes.quality_state, "DEGRADED")
+        body = " ".join(notes.sections[0].paragraphs)
+        self.assertIn("نفرون", body)
+        self.assertNotIn("اریتروپویتین", body)
 
 
 class IncompleteBookletTests(unittest.IsolatedAsyncioTestCase):

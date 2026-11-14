@@ -1080,8 +1080,14 @@ class JobPipelineMixin:
         # do not push an intermediate Word draft while a later editorial pass
         # may still change the same StructuredNotes model.
         del workdir, reference, meta
+        # Unit-level consumers sometimes supply a lightweight mock job without
+        # the real Job's mutable metadata dict. Quality metadata is operational
+        # observability, never a prerequisite for generating the booklet.
+        job_meta = getattr(job, "meta", None)
+        if not isinstance(job_meta, dict):
+            job_meta = None
         try:
-            return await self.deps.structure_transcript(
+            notes = await self.deps.structure_transcript(
                 document_text,
                 self.settings,
                 self._http_session(),  # type: ignore[attr-defined]
@@ -1090,8 +1096,17 @@ class JobPipelineMixin:
                 on_stage=self._note_stage_callback(job, progress),
                 on_incomplete=self._note_incomplete_callback(job),
             )
+            quality_state = getattr(notes, "quality_state", "VERIFIED")
+            if job_meta is not None:
+                job_meta["note_quality"] = quality_state
+            logger.info(
+                "note final job=%s quality=%s outcome=delivered",
+                job.submission_id, quality_state,
+            )
+            return notes
         except NoteQualityError as exc:
-            job.meta["note_failure"] = "quality"
+            if job_meta is not None:
+                job_meta["note_failure"] = "quality"
             logger.warning(
                 "note quality gate rejected the booklet submission=%s reason=%s fabricated=%d",
                 job.submission_id,
@@ -1105,7 +1120,8 @@ class JobPipelineMixin:
             )
             return None
         except Exception as exc:
-            job.meta["note_failure"] = "provider"
+            if job_meta is not None:
+                job_meta["note_failure"] = "provider"
             logger.warning(
                 "note generation failed; raw transcript remains available: %s",
                 type(exc).__name__,
@@ -1130,7 +1146,7 @@ class JobPipelineMixin:
         if not outline.strip() and not transcript_text.strip():
             return None
         try:
-            return await structure_presentation(
+            notes = await structure_presentation(
                 outline,
                 transcript_text,
                 self.settings,
@@ -1140,6 +1156,12 @@ class JobPipelineMixin:
                 on_stage=self._note_stage_callback(job, progress),
                 on_incomplete=self._note_incomplete_callback(job),
             )
+            job.meta["note_quality"] = getattr(notes, "quality_state", "VERIFIED")
+            logger.info(
+                "note final job=%s quality=%s outcome=delivered",
+                job.submission_id, job.meta["note_quality"],
+            )
+            return notes
         except NoteQualityError as exc:
             job.meta["note_failure"] = "quality"
             logger.warning(
@@ -1215,6 +1237,19 @@ class JobPipelineMixin:
         else:
             # Accepted, but still missing source facts the bounded repair could
             # not restore: deliver it and say so, instead of calling it verified.
+            quality = str(job.meta.get("note_quality") or getattr(notes, "quality_state", "VERIFIED"))
+            if quality == "RECOVERED":
+                notice = (
+                    "\n\nنکته: بخشی از جزوه با بازیابی محافظه‌کارانه و فقط از متن منبع "
+                    "ساخته شد؛ متن خام را نیز بررسی کنید."
+                )
+                notice_kind = "notes_recovered"
+            elif quality == "DEGRADED":
+                notice = (
+                    "\n\nنکته: ادعای بدون پشتوانه از جزوه حذف شد؛ برای جزئیات جاافتاده، "
+                    "متن خام را نیز بررسی کنید."
+                )
+                notice_kind = "notes_degraded"
             if job.meta.get("note_incomplete"):
                 notice = (
                     "\n\nنکته: بخشی از داده‌های عددی یا اصطلاحات متن درس در جزوه "
@@ -1355,6 +1390,7 @@ class JobPipelineMixin:
             has_booklet=pdf_ready,
             has_docx=docx_ready,
             has_keypoints=bool(getattr(notes, "key_points", ()) or ()),
+            notice=notice,
         )
 
     async def _send_telegram_file(
@@ -1480,6 +1516,7 @@ class JobPipelineMixin:
         has_keypoints: bool,
         has_docx: bool = False,
         progress: Any | None = None,
+        notice: str = "",
     ) -> None:
         """End the job with one message and a button per artifact.
 
@@ -1566,6 +1603,9 @@ class JobPipelineMixin:
             has_studio=bool(self.settings.mini_app_url and has_booklet),
             has_learning_item=item_id is not None,
         )
+        # Quality notices are a suffix to the single results message: do not
+        # create a competing Telegram interaction or expose any source text.
+        body += notice
         try:
             await self._reply(job, body, buttons=buttons)
         except Exception:

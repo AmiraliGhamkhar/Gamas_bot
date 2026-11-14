@@ -705,7 +705,7 @@ class RejectedBookletTests(BotPipelineTestCase):
             "note_quality_gate": "repair",
         }
 
-    async def test_rejected_booklet_keeps_transcript_and_settles_once(self):
+    async def test_unsupported_booklet_recovers_from_the_source_and_settles_once(self):
         event = self.media_event()
         # The source is two words; everything else in this answer is invention.
         answer = json.dumps(
@@ -735,15 +735,16 @@ class RejectedBookletTests(BotPipelineTestCase):
         kinds = await self.db.read_db.execute_fetchall(
             "SELECT error_kind FROM submissions WHERE submission_id=?", (submission,)
         )
-        self.assertEqual(kinds[0][0], "notes_quality")
-        # No unusable booklet is stored, and the transcript it came from stays
-        # fetchable exactly as recognised.
-        self.assertIsNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
-        self.assertIsNone(await self.db.binary_artifact(submission, USER_ID, "docx"))
+        self.assertEqual(kinds[0][0], "notes_recovered")
+        # A source-preserving fallback is useful even when the provider answer
+        # was entirely invented; the transcript remains fetchable exactly as
+        # recognised and the normal booklet artifacts are delivered.
+        self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
+        self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "docx"))
         self.assertIn("سلام دوستان", await self.fetch_transcript(submission))
         self.assertTrue(
-            any("تأیید نشد" in text for text in event.edits + event.replies),
-            "the user must be told the booklet was rejected, not that it was made",
+            any("بازیابی" in text for text in event.edits + event.replies),
+            f"the user must be told about the source-safe result: {event.edits + event.replies!r}",
         )
         # One charge for the work that was actually done, never a duplicate.
         debits = await self.db.db.execute_fetchall(

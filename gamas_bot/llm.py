@@ -162,6 +162,17 @@ _T = TypeVar("_T")
 _ACTUAL_USAGE_TOKENS: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "gamas_llm_actual_usage_tokens", default=None
 )
+#: Per-call sampling control. Context-local storage keeps concurrent map calls
+#: independent while allowing command-driven repair to be more deterministic
+#: than generation without creating a second provider client.
+_SAMPLING_TEMPERATURE: contextvars.ContextVar[float] = contextvars.ContextVar(
+    "gamas_llm_sampling_temperature", default=NOTE_TEMPERATURE
+)
+
+
+def _sampling_temperature() -> float:
+    """Return a bounded provider-safe sampling temperature for this request."""
+    return min(2.0, max(0.0, float(_SAMPLING_TEMPERATURE.get())))
 
 #: Loop- and session-scoped route cooldown map so concurrent requests sharing
 #: a client session immediately bypass a rate-limited/depleted primary without
@@ -837,7 +848,7 @@ class OpenAIDialect:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": NOTE_TEMPERATURE,
+            "temperature": _sampling_temperature(),
             "max_tokens": max_tokens,
         }
         response_format = profile.build_response_format(
@@ -1002,7 +1013,7 @@ class GeminiDialect:
             # Gemini 2.x retains the legacy request shape. The 3.x models
             # deprecate sampling parameters and recommend thinkingLevel, so
             # those are isolated above rather than retried on the hot path.
-            generation_config["temperature"] = NOTE_TEMPERATURE
+            generation_config["temperature"] = _sampling_temperature()
             generation_config["responseMimeType"] = "application/json"
             if schema is not None and bool(
                 getattr(settings, "note_structured_output", True)
@@ -2876,6 +2887,7 @@ async def complete_json(
     wait_for_capacity: bool = True,
     task: str = "",
     data_sensitivity: str = "UNKNOWN",
+    sampling_temperature: float | None = None,
 ) -> dict:
     """A completion parsed as strict JSON, with bounded per-provider recovery.
 
@@ -2929,11 +2941,18 @@ async def complete_json(
         int(settings.note_max_output_tokens),
         max(1, int(getattr(settings, "note_context_tokens", settings.note_max_output_tokens))),
     )
-    return await _dispatch_across_routes(
-        routes, session, settings, _call_json, hedge_route=_call_json,
-        pool_owner=pool_owner, wait_for_capacity=wait_for_capacity,
-        reservation_tokens=estimated_input + output_reserve,
-        task=task or "UNSPECIFIED",
-        estimated_input_tokens=estimated_input,
-        reserved_output_tokens=output_reserve,
-    )
+    token = None
+    if sampling_temperature is not None:
+        token = _SAMPLING_TEMPERATURE.set(min(2.0, max(0.0, float(sampling_temperature))))
+    try:
+        return await _dispatch_across_routes(
+            routes, session, settings, _call_json, hedge_route=_call_json,
+            pool_owner=pool_owner, wait_for_capacity=wait_for_capacity,
+            reservation_tokens=estimated_input + output_reserve,
+            task=task or "UNSPECIFIED",
+            estimated_input_tokens=estimated_input,
+            reserved_output_tokens=output_reserve,
+        )
+    finally:
+        if token is not None:
+            _SAMPLING_TEMPERATURE.reset(token)
