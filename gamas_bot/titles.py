@@ -78,7 +78,6 @@ _CONNECTORS = frozenset({"و", "یا", "از", "با", "به", "در", "بر", "
 
 #: Fallbacks per artifact kind; the first word also widens a one-word title.
 FALLBACK_BOOKLET = "جزوهٔ درسی"
-FALLBACK_TRANSCRIPT = "متن گفتار"
 FALLBACK_OFFICE = "سند آزاد"
 FALLBACK_DOCUMENT = "سند درسی"
 

@@ -26,10 +26,7 @@ from . import texts
 from .artifact_validation import validate_docx_artifact, validate_pdf_artifact
 from .billing import format_credit_duration, format_seconds_as_credits
 from .bot_deps import deps_for
-from .bot_ui import (
-    ACTIVE_LIMIT_MESSAGE,
-    TELEGRAM_CAPTION_LIMIT,
-)
+from .bot_ui import ACTIVE_LIMIT_MESSAGE
 from .db import InsufficientBalanceError, TooManyActiveJobsError
 from .docx_export import (
     DocumentMeta,
@@ -1472,35 +1469,6 @@ class JobPipelineMixin:
                 )
             finally:
                 await stream.aclose()
-
-    async def _send_file(
-        self, job: Job, path: Path, *, caption: str = ""
-    ) -> Message | None:
-        if job.message is None:
-            raise RuntimeError("پیام کاربر برای ارسال فایل در دسترس نیست.")
-        target = await job.message.get_input_chat()
-        caption_arg = caption[:TELEGRAM_CAPTION_LIMIT] or None
-        flood_err = deps_for(self).flood_wait_error
-        for attempt in range(2):
-            try:
-                return await self._send_telegram_file(
-                    target,
-                    path,
-                    caption=caption_arg,
-                    force_document=True,
-                    reply_to=job.message.id,
-                )
-            except flood_err as exc:
-                wait_seconds = float(getattr(exc, "seconds", 0) or 0)
-                if attempt == 0 and 0 < wait_seconds <= 15.0:
-                    logger.warning(
-                        "Telegram FloodWait %.1fs on send_file; retrying once",
-                        wait_seconds,
-                    )
-                    await asyncio.sleep(wait_seconds)
-                    continue
-                raise
-        return None
 
     @staticmethod
     def _speaker_metadata(document: Any) -> tuple[str | None, bool, int]:

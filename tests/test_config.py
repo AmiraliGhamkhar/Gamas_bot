@@ -153,14 +153,12 @@ class FromEnvTests(unittest.TestCase):
         }
         with mock.patch.dict(os.environ, env(**values), clear=False):
             settings = from_env(env_file="/nonexistent")
-        self.assertEqual(settings.plan_3_hours, 7)
-        self.assertEqual(settings.plan_3_original_price_toman, 180000)
-        self.assertEqual(settings.plan_3_price_toman, 99000)
         self.assertEqual(settings.plan_values["plan_3_hours"], 7)
         self.assertEqual(settings.tariff_values()["plan_3_original_price_toman"], 180000)
+        self.assertEqual(settings.tariff_values()["plan_3_price_toman"], 99000)
 
     def test_tariff_values_cover_every_plan_field(self):
-        # Every plan field on the dataclass appears in tariff_values().
+        # Every plan field parsed from the environment appears in tariff_values().
         with mock.patch.dict(os.environ, env(), clear=False):
             settings = from_env(env_file="/nonexistent")
         values = settings.tariff_values()

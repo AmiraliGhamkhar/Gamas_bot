@@ -564,7 +564,6 @@ def make_settings(**overrides) -> Settings:
         receipt_retention_days=90,
         max_payment_receipt_bytes=5_000_000,
         transcript_retention_days=0,
-        **_default_plan_settings(),
         max_concurrent_downloads=2,
         max_concurrent_uploads=2,
         office_job_concurrency=2,

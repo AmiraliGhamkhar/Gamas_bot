@@ -168,10 +168,6 @@ class ExtractedDoc:
         rendered = (section.render() for section in self.sections)
         return "\n\n".join(text for text in rendered if text.strip())
 
-    @property
-    def char_count(self) -> int:
-        return sum(len(section.text.strip()) for section in self.sections)
-
 
 def normalize_mime(mime_type: str | None) -> str:
     return (mime_type or "").split(";", 1)[0].strip().lower()

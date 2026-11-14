@@ -2714,13 +2714,6 @@ def _parse_json_object(text: str) -> dict:
     return payload
 
 
-#: Prepended to the retry request when a model answered with unparsable text.
-JSON_ONLY_REMINDER = (
-    "پاسخ قبلی قابل تجزیه نبود. فقط و فقط یک شیء JSON معتبر و کامل "
-    "بدون هیچ متن یا توضیح اضافه برگردانید.\n\n"
-)
-
-
 async def _complete_json_on_route(
     route: NoteRoute,
     session: aiohttp.ClientSession,

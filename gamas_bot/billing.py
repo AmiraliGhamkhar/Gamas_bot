@@ -213,14 +213,6 @@ class Plan:
     def included_hours(self) -> int:
         return int(round(self.included_seconds / SECONDS_PER_HOUR))
 
-    @property
-    def discount_percent(self) -> float:
-        """The explicit list-to-sale discount, or zero for plans without one."""
-        original = self.original_price_toman
-        if original is None or original <= 0 or self.price_toman <= 0:
-            return 0.0
-        return max(0.0, (original - self.price_toman) * 100 / original)
-
 
 def _resolved(values: Mapping[str, int] | None, key: str, default: int) -> int:
     """Read one integer override, ignoring invalid non-positive values."""

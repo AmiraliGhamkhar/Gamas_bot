@@ -106,7 +106,6 @@ class STTInvalidInputError(STTRequestError):
 # ---------------------------------------------------------------------------
 
 _COOLDOWN_REGISTRY = CooldownRegistry(clock=lambda: time.monotonic())
-_COOLDOWNS = _COOLDOWN_REGISTRY._deadlines
 
 #: How long a provider is skipped after an authentication failure.
 AUTH_COOLDOWN_SECONDS = 900.0

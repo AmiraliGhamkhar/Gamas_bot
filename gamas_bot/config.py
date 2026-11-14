@@ -645,31 +645,6 @@ class Settings:
     #: Days a finished transcription row is kept before the retention sweep
     #: deletes its text. 0 disables the sweep (rows are kept forever).
     transcript_retention_days: int
-    free_plan_hours: int
-    plan_3_hours: int
-    plan_3_original_price_toman: int
-    plan_3_price_toman: int
-    plan_3_validity_days: int
-    plan_6_hours: int
-    plan_6_original_price_toman: int
-    plan_6_price_toman: int
-    plan_6_validity_days: int
-    plan_10_hours: int
-    plan_10_original_price_toman: int
-    plan_10_price_toman: int
-    plan_10_validity_days: int
-    plan_20_hours: int
-    plan_20_original_price_toman: int
-    plan_20_price_toman: int
-    plan_20_validity_days: int
-    plan_26_hours: int
-    plan_26_original_price_toman: int
-    plan_26_price_toman: int
-    plan_26_validity_days: int
-    plan_30_hours: int
-    plan_30_original_price_toman: int
-    plan_30_price_toman: int
-    plan_30_validity_days: int
 
     # --- Stage concurrency, non-blocking provider capacity & deduplication ---
     max_concurrent_downloads: int = DEFAULT_MAX_CONCURRENT_DOWNLOADS
@@ -1558,7 +1533,6 @@ def from_env(env_file: str | None = None) -> Settings:
             "OFFICE_AI_CONCURRENCY", 3, minimum=1, maximum=16
         ),
         plan_values=plan_values,
-        **plan_values,
         max_concurrent_downloads=_env_int(
             "MAX_CONCURRENT_DOWNLOADS",
             DEFAULT_MAX_CONCURRENT_DOWNLOADS,

@@ -144,10 +144,6 @@ class BotDependencies:
         return float(time_mod.time())
 
     @property
-    def raw_fallback_max_pages(self) -> int:
-        return int(_bot_attr("RAW_FALLBACK_MAX_PAGES", 40))
-
-    @property
     def learning_progress_edit_timeout_seconds(self) -> float:
         return float(_bot_attr("LEARNING_PROGRESS_EDIT_TIMEOUT_SECONDS", 1.0))
 

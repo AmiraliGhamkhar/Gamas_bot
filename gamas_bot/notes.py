@@ -203,7 +203,6 @@ QUALITY_VERIFIED = "VERIFIED"
 QUALITY_REPAIRED = "REPAIRED"
 QUALITY_DEGRADED = "DEGRADED"
 QUALITY_RECOVERED = "RECOVERED"
-QUALITY_FAILED = "FAILED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2232,11 +2231,6 @@ def acceptance_failure(report: NoteQualityReport) -> str | None:
     return None
 
 
-ACCEPTANCE_COMPLETE = "COMPLETE"
-ACCEPTANCE_PARTIAL = "PARTIAL"
-ACCEPTANCE_REJECTED = "REJECTED"
-
-
 def structurally_valid_booklet(notes: StructuredNotes) -> bool:
     """Mandatory schema/content check shared by renderers and final acceptance."""
     if not notes.title.strip() or normalize_for_compare(notes.title) in _GENERIC_BOOKLET_TITLES:
@@ -2249,30 +2243,6 @@ def structurally_valid_booklet(notes: StructuredNotes) -> bool:
         if not section_plain_text(replace(section, heading="")).strip():
             return False
     return True
-
-
-def assess_booklet_acceptance(
-    notes: StructuredNotes,
-    report: NoteQualityReport,
-    *,
-    mode: str = "full",
-) -> str:
-    """Return COMPLETE, PARTIAL or REJECTED after local safety salvage.
-
-    REJECTED is reserved for malformed structure or unresolved unsafe claims.
-    Low lexical/sentence coverage and omitted source detail only downgrade the
-    result to PARTIAL, preserving a safe structured deliverable.
-    """
-    if not structurally_valid_booklet(notes) or acceptance_failure(report) is not None:
-        return ACCEPTANCE_REJECTED
-    if (
-        notes.quality_state in {QUALITY_DEGRADED, QUALITY_RECOVERED}
-        or report.audit.missing
-        or report.coverage.ratio < 0.75
-        or completeness_failure(report, mode=mode) is not None
-    ):
-        return ACCEPTANCE_PARTIAL
-    return ACCEPTANCE_COMPLETE
 
 
 def completeness_failure(report: NoteQualityReport, *, mode: str = "full") -> str | None:
