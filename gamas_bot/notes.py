@@ -1398,7 +1398,7 @@ def _merge_sections(
 _SENTENCE_SPAN = re.compile(r"(?:[!?؟…]+|؛|(?<!\d)\.(?!\d))[»)\]”\"']*")
 
 
-def _merge_summaries(notes: list[StructuredNotes], *, limit: int = 1200) -> str:
+def _merge_summaries(notes: list[StructuredNotes]) -> str:
     parts: list[str] = []
     seen: set[str] = set()
     for item in notes:
@@ -1421,7 +1421,10 @@ def _merge_summaries(notes: list[StructuredNotes], *, limit: int = 1200) -> str:
             if identity not in seen:
                 seen.add(identity)
                 parts.append(tail)
-    return " ".join(parts)[:limit].rstrip()
+    # Each map prompt bounds this to a short chunk-local summary. Do not cut the
+    # merged field at an arbitrary character offset: the last chunk's overview
+    # would disappear without a visible failure.
+    return " ".join(parts)
 
 
 def _dedupe_glossary(notes: list[StructuredNotes]) -> tuple[GlossaryEntry, ...]:
@@ -1571,13 +1574,17 @@ def build_context(chunks: list[str]) -> LectureContext:
     for chunk in chunks:
         topic = _chunk_topic_summary(chunk)
         if not topic:
+            # Keep one slot per input chunk: topic_for(index) is positional.
+            topics.append("")
             continue
         position = to_persian_digits(len(topics) + 1)
         rendered_topic = f"({position}) {topic}"
-        separator_chars = 2 if topics else 0  # the Persian comma and following space
+        separator_chars = 2 if used_chars else 0  # the Persian comma and following space
         addition_chars = separator_chars + len(rendered_topic)
         if used_chars + addition_chars > CONTEXT_DIGEST_MAX_CHARS:
-            break
+            # Preserve positional alignment even after the digest size cap.
+            topics.append("")
+            continue
         topics.append(topic)
         used_chars += addition_chars
     return LectureContext(title="", topics=tuple(topics))
@@ -1596,12 +1603,13 @@ def context_block_for(
     """
     total = len(documents)
     lines: list[str] = []
-    if context.topics:
-        listed = "، ".join(
-            f"({to_persian_digits(position)}) {topic}"
-            for position, topic in enumerate(context.topics, start=1)
-        )
-        lines.append("موضوع‌های درس به ترتیب: " + listed)
+    listed_topics = [
+        f"({to_persian_digits(position)}) {topic}"
+        for position, topic in enumerate(context.topics, start=1)
+        if topic
+    ]
+    if listed_topics:
+        lines.append("موضوع‌های درس به ترتیب: " + "، ".join(listed_topics))
     if index > 1:
         previous_tail = documents[index - 2].strip()[-NEIGHBOUR_CONTEXT_CHARS:].strip()
         if previous_tail:
@@ -1982,19 +1990,20 @@ def build_compile_document(context: LectureContext, notes: StructuredNotes) -> s
 
 
 def build_source_digest(context: LectureContext) -> str:
-    """The source side of the editorial request: the lesson's topic map.
+    """The editorial orientation map; it is not source evidence.
 
     The compile request does not re-send the whole transcript (it would blow
-    the budget); it sends the deterministic topic map of the lesson, which is
-    what the merged draft is edited *against*.
+    the budget); it sends the deterministic topic map for ordering only. The
+    editorial prompt explicitly forbids treating it as evidence for new facts.
     """
-    if not context.topics:
-        return "موضوع‌های درس به ترتیب در دسترس نیست."
-    listed = "، ".join(
+    listed_topics = [
         f"({to_persian_digits(position)}) {topic}"
         for position, topic in enumerate(context.topics, start=1)
-    )
-    return "موضوع‌های درس به ترتیب: " + listed
+        if topic
+    ]
+    if not listed_topics:
+        return "موضوع‌های درس به ترتیب در دسترس نیست."
+    return "موضوع‌های درس به ترتیب: " + "، ".join(listed_topics)
 
 
 def _notes_draft_json(notes: StructuredNotes) -> str:
@@ -4170,14 +4179,26 @@ async def _structure_booklet(
             chunk_outcomes.append(ChunkOutcome(index, "FAILED", None, type(outcome).__name__))
         else:
             chunk_outcomes.append(outcome)
+    missing_chunks = [outcome.index for outcome in chunk_outcomes if outcome.notes is None]
     chunk_notes = [outcome.notes for outcome in chunk_outcomes if outcome.notes is not None]
-    if not chunk_notes:
-        # The full source still exists, so one final local artifact is safer
-        # than turning an all-provider outage into a raw-text-only result.
+    if missing_chunks:
+        # A subset of mapped chunks is not a booklet: it silently omits source
+        # material. If per-chunk recovery could not cover every input, either
+        # preserve the entire source locally or fail the booklet as a whole.
         if getattr(settings, "note_enable_deterministic_fallback", True):
             merged = deterministic_fallback_notes(document)
+            logger.warning(
+                "note map incomplete chunks=%d outcome=source_preserving_fallback",
+                len(missing_chunks),
+            )
         else:
-            raise StructuringError("هیچ بخش قابل‌استفاده‌ای از جزوه ساخته نشد.")
+            raise StructuringError(
+                "یک یا چند بخش از جزوه ساخته نشد؛ برای جلوگیری از تحویل جزوهٔ ناقص، "
+                "کل جزوه کنار گذاشته شد."
+            )
+    elif not chunk_notes:
+        # Defensive: the missing-chunk branch above normally catches this.
+        raise StructuringError("هیچ بخش قابل‌استفاده‌ای از جزوه ساخته نشد.")
     else:
         merged = merge_structured_notes(list(chunk_notes))
         if any(outcome.status == "FALLBACK" for outcome in chunk_outcomes):

@@ -257,6 +257,46 @@ class MergeTests(unittest.TestCase):
         merged = merge_structured_notes([first, second])
         self.assertEqual(len(merged.sections), 2)
 
+    def test_local_metadata_from_chunks_is_aggregated_in_source_order(self):
+        first = StructuredNotes(
+            summary="خلاصهٔ بخش اول.",
+            sections=[one_section("موضوع اول", paragraphs=["الف."])],
+            key_points=["نکتهٔ اول"],
+            learning_objectives=["هدف اول"],
+            glossary=[GlossaryEntry("API", "رابط اول")],
+        )
+        second = StructuredNotes(
+            summary="خلاصهٔ بخش دوم.",
+            sections=[one_section("موضوع دوم", paragraphs=["ب."])],
+            key_points=["نکتهٔ دوم"],
+            learning_objectives=["هدف دوم"],
+            glossary=[GlossaryEntry("CPU", "رابط دوم")],
+        )
+
+        merged = merge_structured_notes([first, second])
+
+        self.assertEqual(merged.summary, "خلاصهٔ بخش اول. خلاصهٔ بخش دوم.")
+        self.assertEqual(merged.key_points, ("نکتهٔ اول", "نکتهٔ دوم"))
+        self.assertEqual(merged.learning_objectives, ("هدف اول", "هدف دوم"))
+        self.assertEqual([entry.term for entry in merged.glossary], ["API", "CPU"])
+
+    def test_chunk_summary_merge_does_not_silently_truncate_late_chunks(self):
+        first_summary = "الف" * 800 + "."
+        last_summary = "ب" * 800 + "."
+        first = StructuredNotes(
+            summary=first_summary,
+            sections=[one_section("موضوع اول", paragraphs=["متن اول"])],
+        )
+        second = StructuredNotes(
+            summary=last_summary,
+            sections=[one_section("موضوع دوم", paragraphs=["متن دوم"])],
+        )
+
+        merged = merge_structured_notes([first, second])
+
+        self.assertGreater(len(merged.summary), 1200)
+        self.assertTrue(merged.summary.endswith(last_summary))
+
     def test_glossary_dedup_keeps_longest_definition(self):
         first = StructuredNotes(
             sections=[one_section("s", paragraphs=["x"])],
@@ -315,7 +355,7 @@ class ContextTests(unittest.TestCase):
         block = context_block_for(context, chunks, 1)
         digest = block.splitlines()[0].partition(": ")[2]
         self.assertLessEqual(len(digest), CONTEXT_DIGEST_MAX_CHARS)
-        self.assertLess(len(context.topics), len(chunks))
+        self.assertLess(sum(bool(topic) for topic in context.topics), len(chunks))
 
 
 class PromptTests(unittest.TestCase):
@@ -369,7 +409,7 @@ class PromptTests(unittest.TestCase):
             "عامل تولید جزوهٔ گاماس",
             "گردآورندهٔ جزوهٔ درس",  # not a summariser
             "وفاداری به منبع",  # ۱-۱
-            "پوشش کامل",  # ۱-۲
+            "پوشش آموزشی",  # ۱-۲
             "انسجام ساختاری",  # ۱-۳
             "خروجی JSON مطلق",  # ۱-۴
             "فشرده‌سازی: در بیان، نه در محتوا",  # ۲
@@ -424,7 +464,12 @@ class PromptTests(unittest.TestCase):
     def test_the_chunk_rules_are_static_and_named_by_the_system_prompt(self):
         """Per-part behaviour is instructed once, in the static prompt."""
         prompt = notes_system_prompt()
-        for phrase in ("بخش i از n", "موضوع همین بخش", "ادامه", "عنوان بخش پیشین"):
+        for phrase in (
+            "بخش i از n", "موضوع همین بخش", "ادامه", "عنوان بخش پیشین",
+            "summary، key_points،", "فقط برای همین بخش", "وانمود نکنید",
+            "summary را در یک", "یا دو جمله نگه دارید",
+            "فقط متن خامِ", "منبع استخراج است", "پنجره‌های همسایه فقط برای جهت‌یابی‌اند",
+        ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, prompt)
 
@@ -717,11 +762,13 @@ class CacheStablePrefixTests(unittest.TestCase):
 
     def test_the_editorial_message_puts_the_source_before_the_draft(self):
         message = build_edit_message("موضوع‌های درس به ترتیب: انتقال فعال", '{"sections": []}')
-        self.assertTrue(message.startswith("متن منبع کامل:"))
-        self.assertLess(message.index("متن منبع کامل"), message.index("پیش‌نویس جزوه"))
+        self.assertTrue(message.startswith("نقشهٔ موضوعی منبع (راهنمای ترتیب، نه شاهد محتوا):"))
+        self.assertLess(message.index("نقشهٔ موضوعی منبع"), message.index("پیش‌نویس جزوه"))
         # The editor prompt may *name* its two inputs; what must not travel in
         # the static part is the source itself.
         self.assertNotIn("موضوع‌های درس به ترتیب: انتقال فعال", edit_system_prompt())
+        self.assertIn("نقشهٔ موضوعی فقط راهنمای ترتیب است، نه شاهد علمی", edit_system_prompt())
+        self.assertIn("از روی نقشهٔ موضوعی بازسازی نکنید", edit_system_prompt())
 
 
 class ConcurrencyBoundTests(unittest.TestCase):
@@ -1011,6 +1058,34 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         # Map calls only: the compile request was never built.
         self.assertEqual(len(session.calls), len(chunks))
 
+    async def test_missing_map_chunk_never_delivers_a_partial_booklet(self):
+        from gamas_bot.transcript import split_transcript
+
+        document = "\n\n".join(
+            f"موضوع {index}: " + "جملهٔ آموزشی برای تقسیم متن. " * 20
+            for index in range(4)
+        )
+        settings = make_settings(
+            note_chunk_chars=400,
+            note_enable_deterministic_fallback=False,
+            note_strict_grounding=False,
+            note_compile=False,
+        )
+        chunks = split_transcript(document, effective_chunk_chars(
+            settings, system_prompt=build_system_prompt("full"),
+            extra_reserve_chars=0,
+        ))
+        self.assertGreater(len(chunks), 1)
+
+        async def map_one(_session, _settings, chunk, **_kwargs):
+            if "موضوع 1:" in chunk:
+                raise StructuringError("test map failure")
+            return notes_from_dict(json.loads(sample_notes_json()))
+
+        with mock.patch("gamas_bot.notes._structure_piece", side_effect=map_one):
+            with self.assertRaisesRegex(StructuringError, "جزوهٔ ناقص"):
+                await structure_transcript(document, settings, FakeSession([]))
+
     async def test_provider_failure_uses_source_preserving_fallback(self):
         settings = make_settings(note_chunk_chars=100000)
         session = FakeSession([])
@@ -1143,6 +1218,24 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("ادامهٔ گفتار بدون نگاشت" in chunk for chunk in chunks[1:])
         )
+
+    def test_compile_topic_map_preserves_positions_and_is_not_mislabeled_as_source(self):
+        from gamas_bot.notes import LectureContext, build_source_digest
+
+        digest = build_source_digest(LectureContext(topics=("", "موضوع دوم")))
+
+        self.assertEqual(digest, "موضوع‌های درس به ترتیب: (۲) موضوع دوم")
+
+    def test_topic_digest_keeps_topics_aligned_when_a_chunk_has_no_heading(self):
+        chunks = ["", "متن بخش دوم با موضوع پردازش سیگنال آغاز می‌شود."]
+        context = build_context(chunks)
+
+        self.assertEqual(len(context.topics), 2)
+        self.assertEqual(context.topic_for(1, 2), "")
+        self.assertIn("بخش دوم", context.topic_for(2, 2))
+        rendered = context_block_for(context, chunks, 2)
+        self.assertIn("(۲)", rendered)
+        self.assertNotIn("(۱)", rendered)
 
     def test_presentation_context_lists_all_slides_in_each_chunk(self):
         chunks = [
@@ -1677,21 +1770,23 @@ class CompletenessValidatorTests(unittest.TestCase):
 
 
 class SkeletonPromptTests(unittest.TestCase):
-    def test_the_single_prompt_mandates_the_complete_skeleton(self):
-        """One prompt serves audio, slides and documents, so it carries every block.
+    def test_single_prompt_defines_the_semantic_skeleton_without_inventing_content(self):
+        """One prompt serves audio, slides and documents without forcing absent blocks.
 
-        The exporter renders the TOC, the end-of-booklet recap and the glossary
-        from these fields; a prompt that stopped naming them would ship a
-        booklet with empty blocks.
+        The exporter renders structural furniture deterministically; model-authored
+        fields stay optional unless their contents are grounded in the source.
         """
         prompt = build_system_prompt("full")
         for phrase in (
-            "هدف یادگیری", "جمع‌بندی", "واژه‌نامه", "پوشش کامل",
+            "هدف یادگیری", "جمع‌بندی", "واژه‌نامه", "پوشش آموزشی",
+            "اجزای جزوه (بدون ساختن محتوای بی‌پشتوانه)", "هر قالب را فقط وقتی به‌کار ببرید",
             "learning_objectives", "glossary", "definitions",
             "examples", "steps", "formulas", "tables", "callouts",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, prompt)
+        self.assertNotIn("هیچ بلوکی حذف نشود", prompt)
+        self.assertIn("این قالب‌ها اجباری نیستند", prompt)
         # Both source kinds are covered by the same static contract.
         self.assertIn("متن اسلاید", prompt)
         self.assertIn("یادداشت گوینده", prompt)
@@ -1699,15 +1794,16 @@ class SkeletonPromptTests(unittest.TestCase):
         self.assertIn("sections", COMPILE_SYSTEM_PROMPT)
         self.assertIn("حذف نکنید", COMPILE_SYSTEM_PROMPT)
 
-    def test_prompt_mandates_comparison_tables_callouts_and_tips(self):
-        """The booklet contract explicitly triggers tables, callouts and tips."""
+    def test_prompt_uses_semantic_blocks_only_when_the_source_supports_them(self):
+        """Tables, callouts and tips are not generated as decorative filler."""
         prompt = build_system_prompt("full")
         for phrase in (
             "جدول مقایسه‌ای (tables)",
-            "جعبه‌های راهنما (callouts)",
-            "نکته‌های کاربردی (practical_tips)",
+            "callouts را فقط برای نکته، هشدار یا یادآوری‌ای بسازید",
+            "practical_tips فقط توصیهٔ عملی یا",
             "فارسی معیار دانشگاهی",
-            "tables، callouts و practical_tipsِ همین بخش را کامل استخراج کنید",
+            "هرکدام را فقط برای همین بخش تهیه کنید",
+            "برای تزئین یا صرفِ وجود چند اصطلاح نسازید",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, prompt)

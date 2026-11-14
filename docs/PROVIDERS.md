@@ -120,7 +120,14 @@ real patient data in fixtures or smoke tests. See [Security](SECURITY.md).
 ### Booklet acceptance
 
 A rendered booklet must be **faithful and structurally valid**; only a booklet
-that also meets the completeness checks is announced as complete:
+that also meets the completeness checks is announced as complete. Long-source
+metadata is generated per chunk and merged in source order, so the optional
+`NOTE_COMPILE` pass is not required for a summary, key points or glossary. The
+editorial pass receives a topic map plus the draft, not the entire raw source;
+the map is for ordering only, never evidence for new content. If a map chunk
+cannot be recovered, the pipeline does not merge only the successful chunks: it
+uses a source-only fallback for the complete source when enabled, otherwise it
+withholds the booklet.
 
 | Outcome | Rule | Result |
 | --- | --- | --- |

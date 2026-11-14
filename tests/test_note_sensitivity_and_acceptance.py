@@ -450,7 +450,7 @@ class CompileSensitivityTests(unittest.IsolatedAsyncioTestCase):
         settings = make_settings(note_compile=True, note_strict_grounding=False)
         with (
             mock.patch.object(
-                notes_mod, "effective_compile_max_chars", return_value=200
+                notes_mod, "effective_compile_max_chars", return_value=300
             ),
             mock.patch.object(notes_mod, "_compile_in_groups", fake_groups),
             mock.patch.object(
