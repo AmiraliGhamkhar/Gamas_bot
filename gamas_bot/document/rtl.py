@@ -17,6 +17,7 @@ rules serve any canvas or font.
 from __future__ import annotations
 
 from collections.abc import Callable
+import re
 
 import arabic_reshaper
 from bidi.algorithm import get_display
@@ -105,6 +106,42 @@ def wrap_logical(text: str, measure: Measure, max_width: float) -> list[str]:
     return wrapped
 
 
+#: Inline professor-emphasis marker emitted by the scientific booklet agent:
+#: ``**مطلب تأکیدشده توسط استاد**``. Only non-empty spans without newlines match;
+#: unclosed ``**`` stays literal so formulas like ``2**3`` are untouched.
+_EMPHASIS_SPAN = re.compile(r"\*\*([^\n*](?:[^\n]*?[^\n*])?)\*\*")
+
+
+def parse_emphasis_spans(text: str) -> list[tuple[str, bool]]:
+    """Split ``text`` into ``(segment, is_emphasized)`` runs from ``**...**``.
+
+    Plain strings without matched ``**...**`` pairs return ``[(text, False)]``
+    (or ``[]`` for empty input). Renderers turn ``is_emphasized=True`` into
+    real bold/highlighted typography instead of leaking raw asterisks.
+    """
+    if not text:
+        return []
+    spans: list[tuple[str, bool]] = []
+    pos = 0
+    for match in _EMPHASIS_SPAN.finditer(text):
+        if match.start() > pos:
+            spans.append((text[pos : match.start()], False))
+        inner = match.group(1)
+        if inner:
+            spans.append((inner, True))
+        pos = match.end()
+    if pos < len(text):
+        spans.append((text[pos:], False))
+    return spans
+
+
+def strip_emphasis_markers(text: str) -> str:
+    """Return *text* with matched ``**...**`` emphasis wrappers removed."""
+    if not text or "**" not in text:
+        return text
+    return _EMPHASIS_SPAN.sub(r"\1", text)
+
+
 def visual_lines(lines: list[str]) -> list[str]:
     """Shape and reorder finished logical lines."""
     return [visual(line) for line in lines]
@@ -120,6 +157,8 @@ __all__ = [
     "Measure",
     "is_rtl_dominant",
     "label_kind",
+    "parse_emphasis_spans",
+    "strip_emphasis_markers",
     "visual",
     "visual_ltr",
     "visual_lines",

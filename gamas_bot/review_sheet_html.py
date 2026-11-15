@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Final
 
 from .config import PROJECT_DIR
+from .document.rtl import parse_emphasis_spans, strip_emphasis_markers
 from .docx_export import sanitize_filename_part
 from .notes import QUALITY_VERIFIED
 from .pdf_common import BOLD_FILE, REGULAR_FILE, find_font
@@ -184,22 +185,31 @@ def _persian(segment: str) -> str:
     return _esc(to_persian_digits(segment))
 
 
-def _inline(value: object) -> str:
-    """Escaped text: Latin runs in ``<e>`` (LTR isolate), digits in Persian outside it."""
-    raw = _clean(value)
+def _inline_plain(segment: str) -> str:
+    """Escape plain text, wrapping Latin runs in ``<e>`` and converting Persian digits."""
     parts: list[str] = []
     position = 0
-    for match in _LATIN_RUN.finditer(raw):
-        parts.append(_persian(raw[position : match.start()]))
+    for match in _LATIN_RUN.finditer(segment):
+        parts.append(_persian(segment[position : match.start()]))
         parts.append(f"<e>{_esc(match.group(0))}</e>")
         position = match.end()
-    parts.append(_persian(raw[position:]))
+    parts.append(_persian(segment[position:]))
     return "".join(parts)
+
+
+def _inline(value: object) -> str:
+    """Escaped text with ``**...**`` as ``<b>...</b>`` and Latin runs in ``<e>``."""
+    raw = _clean(value)
+    out: list[str] = []
+    for chunk, is_bold in parse_emphasis_spans(raw):
+        rendered = _inline_plain(chunk)
+        out.append(f"<b>{rendered}</b>" if is_bold else rendered)
+    return "".join(out)
 
 
 def _nav_label(value: object) -> str:
     """A short label safe for ``data-n`` and for the script's ``innerHTML`` chip."""
-    cleaned = " ".join(_NAV_FORBIDDEN.sub(" ", _clean(value)).split())[:24].rstrip()
+    cleaned = " ".join(_NAV_FORBIDDEN.sub(" ", _clean(strip_emphasis_markers(str(value)))).split())[:24].rstrip()
     return cleaned or "بخش"
 
 
@@ -250,8 +260,11 @@ def _section_components(section: ReviewSection) -> str:
         if unit.kind == "table" and unit.table:
             parts.append(_table_html(unit))
         elif unit.kind == "callout":
-            if unit.label.strip().lower() in {"warning", "caution"}:
+            label_norm = unit.label.strip().lower()
+            if label_norm in {"warning", "caution", "هشدار"}:
                 parts.append(f'<div class="trap"><b>{_LABEL_WARNING}</b>{_inline(unit.text)}</div>')
+            elif label_norm == "تأکید استاد":
+                parts.append(f'<div class="key"><b>تأکید استاد</b>{_inline(unit.text)}</div>')
             else:
                 parts.append(f'<div class="tip"><b>{_LABEL_TIP}</b>{_inline(unit.text)}</div>')
         elif unit.kind == "definition":

@@ -444,7 +444,8 @@ PALETTE_NOTES_JSON = (
     '["Metformin", "دوز 500 mg روزانه"], ["Insulin", "10 units nightly"], '
     '["Aspirin", "۸۰ میلی‌گرم"]]}, '
     '"callouts": [{"kind": "هشدار", "text": "در AKI قطع شود"}, '
-    '{"kind": "یادآوری", "text": "پایش HbA1c"}, {"kind": "نکته", "text": "مصرف با غذا"}]'
+    '{"kind": "یادآوری", "text": "پایش HbA1c"}, {"kind": "نکته", "text": "مصرف با غذا"}, '
+    '{"kind": "تأکید استاد", "text": "آستانه eGFR زیر ۳۰ حتماً امتحانی است"}]'
     "}], "
     '"glossary": [{"term": "HbA1c", "definition": "هموگلوبین گلیکوزیله"}, '
     '{"term": "AKI", "definition": "آسیب حاد کلیه"}, {"term": "CKD", "definition": "بیماری مزمن کلیه"}]}'
@@ -633,7 +634,7 @@ class BookletPaletteTests(unittest.TestCase):
             self.assertIn(fill, self.body)
             self.assertNotEqual(CALLOUT_BORDERS[kind], fill)
         fills = set(CALLOUT_SHADES.values())
-        self.assertEqual(len(fills), 3)  # «نکته» no longer shares «یادآوری»'s tint
+        self.assertEqual(len(fills), 4)  # four distinct tints: نکته، هشدار، یادآوری، تأکید استاد
 
     def test_palette_tints_are_present(self):
         for color in (

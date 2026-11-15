@@ -65,12 +65,14 @@ from lxml import etree
 from .bidi import TextRun, is_rtl_dominant, split_direction_runs
 from .config import PROJECT_DIR
 from .document import components as design
+from .document.components import LABELS as COMPONENT_LABELS
 from .document.assets import booklet_text, topic_for
 from .document.assets import optional as optional_asset
+from .document.rtl import parse_emphasis_spans, strip_emphasis_markers
 from .document.theme import THEME
 from .mdblocks import heading_level, parse_blocks
 from .progress import to_persian_digits
-from .notes import NoteSection, NoteTable, StructuredNotes
+from .notes import NoteSection, NoteTable, PracticeQuestion, StructuredNotes
 from .textnorm import normalize_display
 
 logger = logging.getLogger(__name__)
@@ -182,7 +184,12 @@ DEFINITION_STYLE = "Definition"
 EXAMPLE_STYLE = "Example"
 NOTE_STYLE = "Note"
 WARNING_STYLE = "Warning"
-CALLOUT_STYLE_BY_KIND = {"هشدار": WARNING_STYLE, "یادآوری": NOTE_STYLE, "نکته": NOTE_STYLE}
+CALLOUT_STYLE_BY_KIND = {
+    "هشدار": WARNING_STYLE,
+    "یادآوری": NOTE_STYLE,
+    "نکته": NOTE_STYLE,
+    "تأکید استاد": NOTE_STYLE,
+}
 
 #: Heading typography: level -> (size, space before, space after).
 HEADING_SIZES = {1: THEME.type.h1, 2: THEME.type.h2, 3: THEME.type.h3}
@@ -910,6 +917,18 @@ def _style_run(
         lang.attrib.pop(qn("w:bidi"), None)
 
 
+def _shade_run(run: Run, fill_hex: str) -> None:
+    """Apply subtle background highlight shading (``w:shd``) to one Word run."""
+    r_pr = run._r.get_or_add_rPr()
+    shd = r_pr.find(qn("w:shd"))
+    if shd is None:
+        shd = OxmlElement("w:shd")
+        _insert_rpr_child(r_pr, shd, "w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), fill_hex)
+
+
 def _add_directional_text(paragraph, text: str, *, fonts: DocumentFonts, size: float,
                           bold: bool = False, color: RGBColor | None = None,
                           italic: bool = False, rtl_bold: bool | None = None) -> None:
@@ -917,43 +936,61 @@ def _add_directional_text(paragraph, text: str, *, fonts: DocumentFonts, size: f
 
     This is the single funnel for every run in a document body, so the text is
     passed through :func:`xml_safe` here (XML-illegal characters removed,
-    Persian letter variants folded). Doing it here rather than in each caller
-    means a block added by a new code path cannot reintroduce mixed alphabets
-    or characters Word would reject.
+    Persian letter variants folded) and inline ``**...**`` emphasis spans are
+    parsed into bold + highlight runs. Doing it here rather than in each caller
+    means a block added by a new code path cannot reintroduce mixed alphabets,
+    raw ``**`` markers, or characters Word would reject.
     """
     text = xml_safe(text)
-    runs: list[TextRun] = split_direction_runs(text)
-    if not runs:
+    if not text:
+        return
+    plain_for_dir = strip_emphasis_markers(text)
+    if not plain_for_dir:
         return
     # The paragraph's base direction follows the runs it is given, because a
     # paragraph can be created empty and filled later (the cover title block):
     # any strong RTL character makes the whole paragraph RTL, while a
     # Latin-only line keeps Word's left-to-right default.
-    if is_rtl_dominant(text):
+    if is_rtl_dominant(plain_for_dir):
         _enable_bidi(paragraph, rtl=True)
         _set_paragraph_mark_direction(paragraph, rtl=True)
-    for run in runs:
-        styled = paragraph.add_run(run.text)
-        if run.rtl:
-            _style_run(
-                styled,
-                font=fonts.body,
-                size=size,
-                bold=bold if rtl_bold is None else rtl_bold,
-                color=color,
-                italic=italic,
-                rtl=True,
-            )
-        else:
-            _style_run(
-                styled,
-                font=fonts.latin,
-                size=size,
-                bold=bold,
-                color=color,
-                italic=italic,
-                rtl=False,
-            )
+
+    highlight_hex = THEME.ooxml(_PALETTE.highlight)
+    emphasis_navy = _rgb(_PALETTE.navy_900)
+
+    for chunk, is_emphasized in parse_emphasis_spans(text):
+        runs: list[TextRun] = split_direction_runs(chunk)
+        for run in runs:
+            styled = paragraph.add_run(run.text)
+            run_bold = True if is_emphasized else bold
+            run_rtl_bold = True if is_emphasized else (bold if rtl_bold is None else rtl_bold)
+            # Keep custom high-contrast text colors (e.g. white on navy banner);
+            # otherwise deepen emphasized runs to primary navy + highlight fill.
+            run_color = color
+            if is_emphasized and not bold and color is None:
+                run_color = emphasis_navy
+            if run.rtl:
+                _style_run(
+                    styled,
+                    font=fonts.body,
+                    size=size,
+                    bold=run_rtl_bold,
+                    color=run_color,
+                    italic=italic,
+                    rtl=True,
+                )
+            else:
+                _style_run(
+                    styled,
+                    font=fonts.latin,
+                    size=size,
+                    bold=run_bold,
+                    color=run_color,
+                    italic=italic,
+                    rtl=False,
+                )
+            if is_emphasized and not bold:
+                _shade_run(styled, highlight_hex)
 
 
 def _heading_fonts(fonts: DocumentFonts) -> DocumentFonts:
@@ -1883,6 +1920,7 @@ def _document_chars(notes) -> int:
     total += sum(len(value) for value in notes.key_points)
     total += sum(len(tip.kind) + len(tip.text) for tip in notes.practical_tips)
     total += sum(len(value) for value in notes.review_questions)
+    total += sum(len(qa.question) + len(qa.answer) for qa in notes.practice_questions)
     total += sum(len(entry.term) + len(entry.definition) for entry in notes.glossary)
     return total
 
@@ -2657,7 +2695,7 @@ def _add_numbered_steps(document, steps: tuple[str, ...], *, fonts: DocumentFont
 
 
 def _add_formulas(document, formulas: tuple[str, ...], *, fonts: DocumentFonts) -> None:
-    """Formula lines kept verbatim, centered and lightly emphasised."""
+    """Formula lines kept verbatim in a centered, bordered equation panel."""
     for formula in formulas:
         paragraph = _add_rtl_paragraph(
             document,
@@ -2666,9 +2704,68 @@ def _add_formulas(document, formulas: tuple[str, ...], *, fonts: DocumentFonts) 
             size=11.5,
             bold=True,
             align=WD_ALIGN_PARAGRAPH.CENTER,
-            space_after=4,
+            space_before=3,
+            space_after=5,
         )
         _shade_paragraph(paragraph, FORMULA_SHADE)
+        _paragraph_borders(paragraph, THEME.ooxml(design.FORMULA.border), size="6")
+        _keep_lines(paragraph)
+
+
+def _add_practice_questions(
+    document,
+    questions: tuple[PracticeQuestion, ...],
+    *,
+    fonts: DocumentFonts,
+) -> None:
+    """Render course practice/exam questions paired with concise answers."""
+    qa_fill = THEME.ooxml(design.PRACTICE_QA.fill)
+    qa_border = THEME.ooxml(design.PRACTICE_QA.border)
+    qa_accent = _rgb(design.PRACTICE_QA.accent)
+    for index, qa in enumerate(questions, start=1):
+        label = f"پرسش {to_persian_digits(index)}"
+        if qa.kind:
+            label = f"{label} ({qa.kind})"
+        q_para = _add_rtl_paragraph(
+            document,
+            "",
+            fonts=fonts,
+            size=THEME.type.body,
+            align=WD_ALIGN_PARAGRAPH.RIGHT,
+            space_before=4,
+            space_after=2 if qa.answer else 6,
+            line_spacing=1.35,
+        )
+        _add_directional_text(
+            q_para, f"{label}: ", fonts=fonts, size=10.5, bold=True, color=qa_accent
+        )
+        _add_directional_text(
+            q_para, qa.question, fonts=fonts, size=THEME.type.body, bold=True,
+            color=_rgb(_PALETTE.navy_900),
+        )
+        _shade_paragraph(q_para, qa_fill)
+        _paragraph_borders(q_para, qa_border, size="4")
+        _keep_lines(q_para)
+        if qa.answer:
+            _keep_with_next(q_para)
+            a_para = _add_rtl_paragraph(
+                document,
+                "",
+                fonts=fonts,
+                size=10.5,
+                align=WD_ALIGN_PARAGRAPH.RIGHT,
+                space_before=0,
+                space_after=6,
+                line_spacing=1.35,
+            )
+            a_para.paragraph_format.left_indent = Cm(0.35)
+            _add_directional_text(
+                a_para, "پاسخ: ", fonts=fonts, size=10.2, bold=True, color=qa_accent
+            )
+            _add_directional_text(
+                a_para, qa.answer, fonts=fonts, size=10.5, color=_rgb(_PALETTE.body)
+            )
+            _keep_lines(a_para)
 
 
 def _add_examples(document, examples: tuple[str, ...], *, fonts: DocumentFonts) -> None:
@@ -2948,6 +3045,16 @@ def build_notes_docx(
             fill=KEYPOINT_SHADE,
             border=KEYPOINT_BORDER,
         )
+
+    if notes.practice_questions:
+        _add_heading(
+            document,
+            COMPONENT_LABELS["practice_questions"],
+            fonts=resolved,
+            level=1,
+            banner=False,
+        )
+        _add_practice_questions(document, notes.practice_questions, fonts=resolved)
 
     if notes.review_questions:
         _add_heading(document, "پرسش‌های مرور", fonts=resolved, level=1, banner=False)

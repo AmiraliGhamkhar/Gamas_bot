@@ -424,12 +424,20 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(len(compact_text), len(full_text))
         for pdf_bytes in (full_pdf, compact_pdf):
             self.assertTrue(pdf_bytes.startswith(b"%PDF-"))
-            extracted = "\n".join(
-                page.extract_text() or "" for page in PdfReader(io.BytesIO(pdf_bytes)).pages
-            )
+            try:
+                import pymupdf
+            except ImportError:
+                extracted = "\n".join(
+                    page.extract_text() or "" for page in PdfReader(io.BytesIO(pdf_bytes)).pages
+                )
+            else:
+                with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+                    extracted = "\n".join(page.get_text("text") or "" for page in doc)
             self.assertIn(
                 "صفحه",
-                normalize_for_compare(unicodedata.normalize("NFKC", extracted)),
+                normalize_for_compare(
+                    unicodedata.normalize("NFKC", extracted.replace("\u0654", ""))
+                ),
             )
 
         stored = await self.db.document_get(self.user_id, doc_id)

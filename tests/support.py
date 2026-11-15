@@ -23,7 +23,6 @@ from gamas_bot.config import (
     DEFAULT_AVALAI_BASE_URL,
     DEFAULT_AVALAI_MODEL,
     DEFAULT_GEMINI_MODEL,
-    DEFAULT_GEMINI_THINKING_BUDGET,
     DEFAULT_GEMINI_THINKING_LEVEL,
     DEFAULT_OPENROUTER_MODEL,
     Settings,
@@ -520,9 +519,7 @@ def make_settings(**overrides) -> Settings:
         openrouter_rpm_limit=0,
         openrouter_tpm_limit=0,
         openrouter_rpd_limit=0,
-        # Zero by default, matching the shipped configuration: note requests
-        # must never wait on hidden reasoning tokens.
-        gemini_thinking_budget=DEFAULT_GEMINI_THINKING_BUDGET,
+        # Minimal by default for Gemini 3.5 Flash-Lite: fast structured extraction.
         gemini_thinking_level=DEFAULT_GEMINI_THINKING_LEVEL,
         note_context_tokens=131072,
         note_mode="full",

@@ -78,7 +78,6 @@ def deployment_env(**overrides):
         "NOTE_STRUCTURED_OUTPUT": "0",
         "NOTE_REASONING_EFFORT": "none",
         "NOTE_MAX_OUTPUT_TOKENS": "32768",
-        "NOTE_GEMINI_THINKING_BUDGET": "-1",
         "NOTE_GEMINI_THINKING_LEVEL": "minimal",
         "GEMINI_MODEL": GEMINI_MODEL,
         "OPENROUTER_MODEL": OPENROUTER_MODEL,
@@ -109,7 +108,6 @@ def deployed_settings(**overrides):
         "note_structured_output": False,
         "note_reasoning_effort": "none",
         "note_max_output_tokens": 32768,
-        "gemini_thinking_budget": -1,
         "gemini_thinking_level": "minimal",
         "note_ttfb_timeout": 0.0,
         "note_hedge_after": 0.0,
@@ -249,7 +247,6 @@ class ConfigurationTests(unittest.TestCase):
         settings = settings_from_env()
         self.assertFalse(settings.note_structured_output)
         self.assertEqual(settings.note_reasoning_effort, "none")
-        self.assertEqual(settings.gemini_thinking_budget, -1)
         self.assertEqual(settings.note_max_output_tokens, 32768)
         for route in note_routes(settings):
             _url, _headers, payload = _build_request_for(
@@ -267,23 +264,27 @@ class ConfigurationTests(unittest.TestCase):
                 )
                 for unsupported in ("responseSchema", "temperature", "topP", "topK", "candidateCount"):
                     self.assertNotIn(unsupported, generation)
+                self.assertNotIn("reasoning", payload)
                 self.assertNotIn("reasoning_effort", payload)
             else:
-                self.assertEqual(payload["reasoning_effort"], "none")
+                self.assertEqual(payload["reasoning"], {"enabled": False})
+                self.assertNotIn("reasoning_effort", payload)
 
     def test_reasoning_none_is_sent_only_where_it_is_supported(self):
-        """Among the approved providers, only OpenRouter documents the field."""
+        """Among the active models, only OpenRouter documents unified reasoning controls."""
         settings = deployed_settings(
             note_providers=("avalai", "openrouter", "gemini"),
             avalai_api_key="avalai-key",
         )
         by_slug = {route.slug: route for route in note_routes(settings)}
         payload = _build_request_for(by_slug["openrouter"], settings, "S", "U", schema=SCHEMA)[2]
-        self.assertEqual(payload["reasoning_effort"], "none")
+        self.assertEqual(payload["reasoning"], {"enabled": False})
+        self.assertNotIn("reasoning_effort", payload)
         for slug in ("avalai", "gemini"):
             _url, _headers, payload = _build_request_for(
                 by_slug[slug], settings, "S", "U", schema=SCHEMA
             )
+            self.assertNotIn("reasoning", payload, slug)
             self.assertNotIn("reasoning_effort", payload, slug)
 
     def test_note_route_summary_is_inspectable_and_contains_no_secrets(self):
@@ -293,7 +294,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("Structured output: disabled", summary)
         self.assertIn("Reasoning effort: none", summary)
         self.assertIn("Maximum output tokens: 32768", summary)
-        self.assertIn("Gemini legacy thinking budget: disabled", summary)
+        self.assertNotIn("Gemini legacy thinking budget", summary)
         self.assertIn("Gemini 3.x thinking level: minimal", summary)
         self.assertNotIn("g-key-not-a-secret", summary)
         self.assertNotIn("o-key-not-a-secret", summary)
@@ -444,7 +445,8 @@ class OpenRouterTests(unittest.IsolatedAsyncioTestCase):
         _url, headers, payload = _build_request_for(route, settings, "S", "U", schema=SCHEMA)
         self.assertEqual(payload["model"], OPENROUTER_MODEL)
         self.assertEqual(payload["max_tokens"], 32768)
-        self.assertEqual(payload["reasoning_effort"], "none")
+        self.assertEqual(payload["reasoning"], {"enabled": False})
+        self.assertNotIn("reasoning_effort", payload)
         self.assertNotIn("response_format", payload)
         self.assertEqual(headers["Authorization"], "Bearer o-key")
         self.assertEqual(llm.request_payload_output_tokens(payload), 32768)

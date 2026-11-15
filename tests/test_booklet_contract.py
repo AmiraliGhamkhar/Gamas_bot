@@ -165,13 +165,21 @@ class BookletRenderingContractTests(unittest.TestCase):
             self.assertNotIn(forbidden, docx)
 
         pdf = build_notes_pdf(notes, meta=meta, duration_seconds=3600, session_number=7)
-        pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(pdf)).pages)
-        # ReportLab stores shaped Persian glyphs; the extracted sequence below
-        # is the rendered «مرور نهایی» heading, while Latin terms stay direct.
-        self.assertIn("ﻣﺮﻭﺭ ﻧﻬﺎﯾﯽ", pdf_text)
-        self.assertIn("Metformin", pdf_text)
-        self.assertNotIn("گویندگان و زمان", pdf_text)
-        self.assertNotIn("جلسه", pdf_text)
+        try:
+            import pymupdf
+        except ImportError:
+            pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(pdf)).pages)
+        else:
+            with pymupdf.open(stream=pdf, filetype="pdf") as doc:
+                pdf_text = "\n".join(page.get_text("text") or "" for page in doc)
+        # Typst embeds logical Persian UTF-8 glyphs directly (and ReportLab
+        # fallback emits shaped presentation forms). Normalize NFKC so both pass.
+        import unicodedata
+        norm_pdf = unicodedata.normalize("NFKC", pdf_text)
+        self.assertIn("مرور نهایی", norm_pdf)
+        self.assertIn("Metformin", norm_pdf)
+        self.assertNotIn("گویندگان و زمان", norm_pdf)
+        self.assertNotIn("جلسه", norm_pdf)
         for forbidden in (b"lecture.mp3", b"GMS-42", b"speechmatics"):
             self.assertNotIn(forbidden, pdf)
 

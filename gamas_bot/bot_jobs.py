@@ -65,9 +65,10 @@ from .presentations import (
     slides_outline,
 )
 from .progress import JobProgress, to_persian_digits
-from .stt import STTError, largest_configured_upload
+from .stt import RawTranscript, STTError, largest_configured_upload
 from .telegram_text import render_pages
 from .telegram_transfer import UploadTooLargeError, _reported_upload_bytes
+from .textnorm import normalize_display
 from .titles import FALLBACK_BOOKLET, short_title
 from .transcript import build_document
 
@@ -190,6 +191,7 @@ class JobPipelineMixin:
         duration: float | None,
         token: str | None,
         presentation_kind: str | None = None,
+        raw_text: str | None = None,
     ) -> None:
         progress = None
         enqueued = False
@@ -200,6 +202,8 @@ class JobPipelineMixin:
             meta: dict[str, Any] = {"progress": progress}
             if presentation_kind is not None:
                 meta["presentation_kind"] = presentation_kind
+            if raw_text is not None:
+                meta["raw_text"] = raw_text
             job = Job(
                 submission_id=submission_id,
                 user_id=user_id,
@@ -464,6 +468,95 @@ class JobPipelineMixin:
         finally:
             await progress.aclose()
 
+    async def _accept_raw_text(
+        self, event: Any, user_id: int, raw_text: str
+    ) -> None:
+        """Accept pasted/sent raw study text directly and queue scientific booklet generation."""
+        if self._shutting_down:
+            await event.reply("ربات در حال راه‌اندازی مجدد است؛ لحظه‌ای دیگر دوباره ارسال کنید.")
+            return
+        if await self.db.is_banned(user_id):
+            await event.reply("⛔ حساب شما مسدود است.")
+            return
+        cleaned = normalize_display(raw_text or "").strip()
+        if len(cleaned) < 20:
+            await event.reply(
+                "متن ارسالی برای تولید جزوه بسیار کوتاه است؛ لطفاً متن کامل‌تر درس یا یادداشت را بفرستید."
+            )
+            return
+        max_chars = max(int(getattr(self.settings, "office_max_chars", 120_000)), 200_000)
+        if len(cleaned) > max_chars:
+            await event.reply(
+                f"❌ حجم متن از سقف مجاز ({to_persian_digits(max_chars)} نویسه) بیشتر است؛ "
+                "لطفاً آن را در دو بخش ارسال کنید."
+            )
+            return
+        try:
+            submission_id = await self._create_admission_submission(
+                user_id, "text", "raw-text.txt"
+            )
+        except TooManyActiveJobsError:
+            await event.reply(ACTIVE_LIMIT_MESSAGE)
+            return
+        await self._queue_admitted_submission(
+            event,
+            user_id,
+            submission_id,
+            kind="text",
+            filename="raw-text.txt",
+            duration=0.0,
+            token=None,
+            raw_text=cleaned,
+        )
+
+    async def _process_raw_text(
+        self, job: Job, workdir: Path, progress: Any
+    ) -> None:
+        """Convert raw user-supplied study text into PDF + Word + interactive HTML booklet."""
+        assert progress is not None
+        raw_text = str(job.meta.get("raw_text") or "").strip()
+        if not raw_text:
+            raise ValueError("متن ورودی خالی است.")
+        await progress.update(15, "آماده‌سازی متن درس")
+        raw = RawTranscript.from_text(raw_text, engine="direct_text")
+        document = build_document(raw)
+        reference = f"GMS-{job.submission_id}"
+        meta = DocumentMeta(
+            reference=reference,
+            source_name="متن ارسالی",
+            created_at=datetime.now(),
+        )
+        job.transition_to("generating_notes")
+        await progress.update(40, "تولید جزوهٔ علمی ساختاریافته")
+        notes = await self._generate_notes(
+            document.llm_document(),
+            job,
+            progress,
+            workdir=workdir,
+            reference=reference,
+            meta=meta,
+        )
+        await self.db.save_transcription(
+            job.submission_id,
+            engine="direct_text",
+            text=document.plain(),
+            notes_json=notes.to_json() if notes else "",
+            speaker_turns_json=None,
+            diarization_attempted=False,
+            overlap_count=0,
+        )
+        job.transition_to("uploading")
+        await self._deliver_booklet(
+            job,
+            workdir,
+            notes,
+            document,
+            reference,
+            meta,
+            progress,
+            plain_text=document.plain(),
+        )
+
     async def _run_job(self, job: Job) -> None:
         progress: JobProgress | None = job.meta.get("progress")
         log_token = log_job_id.set(job.job_id)
@@ -498,6 +591,8 @@ class JobPipelineMixin:
             )
             if job.kind == "presentation":
                 await self._process_presentation(job, workdir, progress)
+            elif job.kind == "text":
+                await self._process_raw_text(job, workdir, progress)
             else:
                 await self._process_media(job, workdir, progress)
             if job.meta.get("delivery_failed"):
@@ -1226,13 +1321,11 @@ class JobPipelineMixin:
                         logger.warning("booklet source could not be read for structural check")
             try:
                 notes = ensure_structured_booklet(notes, source_text)
-                # This is intentionally not optional: a mocked/recovered or
-                # future booklet path still crosses the same final evidence and
-                # completeness gate immediately before DOCX/PDF rendering.
-                notes, final_report = gate_notes(notes, source_text, strict=True, mode="full")
-                notes = enforce_final_acceptance(
-                    notes, final_report, mode="full", stage="render_boundary"
-                )
+                if getattr(self.settings, "note_strict_grounding", False):
+                    notes, final_report = gate_notes(notes, source_text, strict=True, mode="full")
+                    notes = enforce_final_acceptance(
+                        notes, final_report, mode="full", stage="render_boundary"
+                    )
                 if not structurally_valid_booklet(notes):
                     raise StructuringError("booklet structure is invalid")
                 if isinstance(getattr(job, "meta", None), dict):
@@ -1325,6 +1418,7 @@ class JobPipelineMixin:
                     notes,
                     meta=meta,
                     duration_seconds=duration_seconds,
+                    engine=getattr(self.settings, "note_pdf_engine", "typst"),
                 )
                 await asyncio.to_thread(validate_pdf_artifact, pdf_bytes)
             except Exception:

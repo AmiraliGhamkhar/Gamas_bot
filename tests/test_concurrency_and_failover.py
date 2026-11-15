@@ -492,6 +492,7 @@ class LLMCapacityAndFailoverTests(unittest.IsolatedAsyncioTestCase):
             llm_primary_max_in_flight=1,
             llm_fallback_max_in_flight=2,
             note_compile=False,
+            note_strict_grounding=True,
         )
         t_primary = asyncio.create_task(
             structure_transcript("متن جلسهٔ اول با نکات علمی.", settings, session)

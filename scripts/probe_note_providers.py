@@ -186,14 +186,20 @@ def _check_openrouter(route) -> bool:
         endpoints = data_obj.get("endpoints") or []
         arch = data_obj.get("architecture") if isinstance(data_obj.get("architecture"), dict) else {}
         for endpoint in endpoints:
+            params = endpoint.get("supported_parameters")
+            param_note = (
+                f" supported_parameters={','.join(str(p) for p in params)}"
+                if isinstance(params, list) and params
+                else ""
+            )
             print(
                 f"[PASS] openrouter endpoint {endpoint.get('provider_name')}: "
                 f"context_length={endpoint.get('context_length')} "
                 f"max_completion_tokens={endpoint.get('max_completion_tokens')} "
-                f"uptime_last_1d={endpoint.get('uptime_last_1d')}"
+                f"uptime_last_1d={endpoint.get('uptime_last_1d')}{param_note}"
             )
         if not endpoints:
-            if arch.get("tokenizer") == "Router" or route.model in ("openrouter/free", "openrouter/auto"):
+            if arch.get("tokenizer") == "Router":
                 print(
                     f"[WARN] openrouter model {route.model!r} is a dynamic router "
                     "(no pinned endpoint; served context window varies per request)"

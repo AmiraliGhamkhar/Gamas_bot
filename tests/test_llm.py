@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 import json
 import unittest
 from unittest import mock
@@ -191,42 +190,46 @@ class RequestBuildingTests(unittest.TestCase):
         self.assertEqual(payload["temperature"], llm.NOTE_TEMPERATURE)
         self.assertNotIn("max_completion_tokens", payload)
 
-    def test_reasoning_effort_sent_on_verified_gateways(self):
+    def test_reasoning_sent_on_openrouter_only_with_unified_object(self):
         settings = routed_settings(note_reasoning_effort="low")
         avalai_route, openrouter = note_routes(settings)
-        # Only OpenRouter's profile documents the field; every other approved
-        # route builds the identical request without it.
+        # AvalAI DeepSeek V4.1 Flash omits unverified reasoning controls;
+        # OpenRouter Nemotron 3.5 Super VL uses OpenRouter's unified reasoning object.
         avalai_payload = _build_request(settings, "S", "U", route=avalai_route)[2]
+        self.assertNotIn("reasoning", avalai_payload)
         self.assertNotIn("reasoning_effort", avalai_payload)
         or_payload = _build_request(settings, "S", "U", route=openrouter)[2]
-        self.assertEqual(or_payload["reasoning_effort"], "low")
+        self.assertEqual(or_payload["reasoning"], {"effort": "low", "exclude": True})
+        self.assertNotIn("reasoning_effort", or_payload)
 
-    def test_reasoning_effort_never_sent_to_a_generic_gateway(self):
-        """A generic gateway's model may reject the parameter outright."""
+    def test_reasoning_never_sent_to_avalai(self):
+        """AvalAI's DeepSeek V4.1 Flash contract omits unverified reasoning controls."""
         settings = make_settings(
             avalai_api_key="avalai-test-key", note_reasoning_effort="low"
         )
         _url, _headers, payload = _build_request(settings, "S", "U")
+        self.assertNotIn("reasoning", payload)
         self.assertNotIn("reasoning_effort", payload)
 
-    def test_reasoning_effort_sent_on_a_documented_route(self):
-        """OpenRouter documents ``reasoning_effort``; AvalAI does not (and its
-        hosted models' contract deliberately omits it)."""
+    def test_reasoning_sent_on_a_documented_route(self):
+        """OpenRouter documents the unified ``reasoning`` object; AvalAI omits it."""
         settings = routed_settings(
             note_providers=("avalai", "openrouter"),
             avalai_api_key="avalai-key",
             openrouter_api_key="or-key",
-            note_reasoning_effort="low",
+            note_reasoning_effort="none",
         )
         avalai_route, openrouter_route = note_routes(settings)
         avalai_url, avalai_headers, avalai_payload = _build_request(
             settings, "S", "U", route=avalai_route
         )
+        self.assertNotIn("reasoning", avalai_payload)
         self.assertNotIn("reasoning_effort", avalai_payload)
         _or_url, _or_headers, or_payload = _build_request(
             settings, "S", "U", route=openrouter_route
         )
-        self.assertEqual(or_payload["reasoning_effort"], "low")
+        self.assertEqual(or_payload["reasoning"], {"enabled": False})
+        self.assertNotIn("reasoning_effort", or_payload)
         self.assertEqual(avalai_payload["model"], avalai_route.model)
         self.assertTrue(avalai_url.endswith("/chat/completions"))
         self.assertEqual(avalai_headers["Authorization"], f"Bearer {avalai_route.api_key}")
@@ -249,23 +252,17 @@ class RequestBuildingTests(unittest.TestCase):
         )
         self.assertNotIn("temperature", generation)
 
-    def test_legacy_gemini_2_thinking_budget_remains_compatible(self):
+    def test_gemini_35_clamps_max_output_tokens_to_documented_limit(self):
         settings = make_settings(
             note_providers=("gemini",),
             note_provider="",
             note_api_key="",
             note_api_base_url="",
             gemini_api_key="g-key",
-            gemini_model="gemini-2.5-flash",
-            gemini_thinking_budget=-1,
+            note_max_output_tokens=100_000,
         )
         _url, _headers, payload = _build_request(settings, "S", "U")
-        self.assertNotIn("thinkingConfig", payload["generationConfig"])
-        settings = replace(settings, gemini_thinking_budget=24576)
-        _url, _headers, payload = _build_request(settings, "S", "U")
-        self.assertEqual(
-            payload["generationConfig"]["thinkingConfig"]["thinkingBudget"], 24576
-        )
+        self.assertEqual(payload["generationConfig"]["maxOutputTokens"], 65_536)
 
     def test_gemini_route_never_carries_reasoning_effort(self):
         settings = make_settings(
@@ -277,6 +274,7 @@ class RequestBuildingTests(unittest.TestCase):
             note_reasoning_effort="low",
         )
         _url, _headers, payload = _build_request(settings, "S", "U")
+        self.assertNotIn("reasoning", payload)
         self.assertNotIn("reasoning_effort", payload)
         self.assertNotIn("reasoning_effort", payload["generationConfig"])
 
@@ -286,6 +284,7 @@ class RequestBuildingTests(unittest.TestCase):
             note_reasoning_effort="low",
         )
         _url, _headers, payload = _build_request(settings, "S", "U")
+        self.assertNotIn("reasoning", payload)
         self.assertNotIn("reasoning_effort", payload)
         self.assertNotIn("reasoning_effort", payload["generationConfig"])
 
@@ -299,25 +298,26 @@ class RequestBuildingTests(unittest.TestCase):
     def test_gemini_native_json_and_key_header(self):
         settings = make_settings(
             note_provider="gemini", note_api_key="g-key", note_api_base_url="",
-            gemini_model="test-model",
+            gemini_model=DEFAULT_GEMINI_MODEL,
         )
         url, headers, payload = _build_request(settings, "SYS", "USER")
         self.assertIn(":generateContent", url)
-        self.assertIn("models/test-model", url)
+        self.assertIn(f"models/{DEFAULT_GEMINI_MODEL}", url)
         self.assertEqual(headers["x-goog-api-key"], "g-key")
-        self.assertEqual(payload["generationConfig"]["responseMimeType"], "application/json")
+        self.assertEqual(
+            payload["generationConfig"]["responseFormat"],
+            {"text": {"mimeType": "APPLICATION_JSON"}},
+        )
         self.assertEqual(
             payload["generationConfig"]["maxOutputTokens"], settings.note_max_output_tokens
         )
-        self.assertEqual(
-            payload["generationConfig"]["temperature"], llm.NOTE_TEMPERATURE
-        )
+        self.assertNotIn("temperature", payload["generationConfig"])
         self.assertEqual(payload["systemInstruction"]["parts"][0]["text"], "SYS")
 
     def test_gemini_models_prefix_not_doubled(self):
         settings = make_settings(
             note_provider="gemini", note_api_key="k",
-            note_model="models/gemini-2.5-flash",
+            note_model=f"models/{DEFAULT_GEMINI_MODEL}",
         )
         url, _headers, _payload = _build_request(settings, "S", "U")
         self.assertNotIn("models/models", url)
@@ -381,21 +381,26 @@ class UsageSummaryTests(unittest.TestCase):
         self.assertEqual(_usage_summary(payload, "openai"), ("served-model", 120, 30, 150))
 
     def test_partial_usage_stays_unknown(self):
-        payload = {"model": "google/gemma-4-31b-it:free", "usage": {"prompt_tokens": 5}}
+        payload = {"model": "nvidia/nemotron-3.5-super-vl:free", "usage": {"prompt_tokens": 5}}
         model, prompt, completion, total = _usage_summary(payload, "openai")
-        self.assertEqual(model, "google/gemma-4-31b-it:free")
+        self.assertEqual(model, "nvidia/nemotron-3.5-super-vl:free")
         self.assertEqual(prompt, 5)
         self.assertIsNone(completion)
         self.assertIsNone(total)
 
     def test_gemini_usage_metadata_and_model_version(self):
         payload = {
-            "modelVersion": "gemini-2.5-flash",
+            "modelVersion": "gemini-3.5-flash-lite",
             "usageMetadata": {
-                "promptTokenCount": 10, "candidatesTokenCount": 4, "totalTokenCount": 14,
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 4,
+                "totalTokenCount": 14,
+                "cachedContentTokenCount": 6,
+                "thoughtsTokenCount": 2,
             },
         }
-        self.assertEqual(_usage_summary(payload, "gemini"), ("gemini-2.5-flash", 10, 4, 14))
+        self.assertEqual(_usage_summary(payload, "gemini"), ("gemini-3.5-flash-lite", 10, 4, 14))
+        self.assertEqual(llm._usage_detail_counts(payload, "gemini"), (6, 2))
 
     def test_gemini_total_is_derived_from_usage_metadata(self):
         # The Gemini `usageMetadata` totals from the shipped production dialect.
@@ -643,14 +648,14 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
             note_api_key="",
             note_api_base_url="",
             gemini_api_key="gemini-key",
-            gemini_model="gemini-2.5-flash",
+            gemini_model=DEFAULT_GEMINI_MODEL,
         )
         session = FakeSession([
             FakeResponse(400, {"error": {
-                "message": "temperature is not supported for this model"
+                "message": "Unknown name \"thinkingConfig\": Cannot find field."
             }}),
             FakeResponse(400, {"error": {
-                "message": "response_mime_type application/json is not supported"
+                "message": "responseFormat is not supported for this model"
             }}),
             FakeResponse(200, {"candidates": [{
                 "content": {"parts": [{"text": '{"ok": true}'}]}
@@ -660,19 +665,19 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"ok": True})
         self.assertEqual(len(session.calls), 3)
         generation_config = session.calls[-1]["json"]["generationConfig"]
-        self.assertNotIn("temperature", generation_config)
-        self.assertNotIn("responseMimeType", generation_config)
+        self.assertNotIn("thinkingConfig", generation_config)
+        self.assertNotIn("responseFormat", generation_config)
         self.assertEqual(generation_config["maxOutputTokens"], 4096)
 
     async def test_rejected_thinking_config_is_dropped_and_retried_once(self):
-        """A model that predates ``thinkingConfig`` costs exactly one retry."""
+        """A gateway that rejects ``thinkingConfig`` costs exactly one retry."""
         settings = make_settings(
             note_providers=("gemini",),
             note_provider="",
             note_api_key="",
             note_api_base_url="",
             gemini_api_key="gemini-key",
-            gemini_model="gemini-2.5-flash",
+            gemini_model=DEFAULT_GEMINI_MODEL,
         )
         session = FakeSession([
             FakeResponse(400, {"error": {
@@ -690,15 +695,15 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("thinkingConfig", session.calls[1]["json"]["generationConfig"])
         # Everything else about the retried request is unchanged.
         self.assertEqual(
-            session.calls[1]["json"]["generationConfig"]["responseMimeType"],
-            "application/json",
+            session.calls[1]["json"]["generationConfig"]["responseFormat"],
+            {"text": {"mimeType": "APPLICATION_JSON"}},
         )
 
     def test_thinking_config_is_kept_without_a_rejection_marker(self):
         """Only an explicit rejection drops the field; a vague error keeps it."""
         payload = {"generationConfig": {
-            "responseMimeType": "application/json",
-            "thinkingConfig": {"thinkingBudget": 0},
+            "responseFormat": {"text": {"mimeType": "APPLICATION_JSON"}},
+            "thinkingConfig": {"thinkingLevel": "MINIMAL"},
         }}
         adjustment = llm._adjust_rejected_request_param(
             payload, "thinkingConfig backend hiccup"
@@ -706,13 +711,13 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(adjustment)
         self.assertIn("thinkingConfig", payload["generationConfig"])
 
-    def test_thinking_budget_error_variants_are_recognized(self):
+    def test_thinking_level_error_variants_are_recognized(self):
         for error_text in (
-            "Unsupported parameter: thinking_budget",
-            "Unknown field thinkingBudget",
+            "Unsupported parameter: thinking_level",
+            "Unknown field thinkingLevel",
             "thinking_config is not supported for this model",
         ):
-            payload = {"generationConfig": {"thinkingConfig": {"thinkingBudget": 0}}}
+            payload = {"generationConfig": {"thinkingConfig": {"thinkingLevel": "MINIMAL"}}}
             adjustment = llm._adjust_rejected_request_param(payload, error_text)
             self.assertEqual(adjustment, "generationConfig.thinkingConfig", error_text)
             self.assertNotIn("thinkingConfig", payload["generationConfig"])

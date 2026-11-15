@@ -30,14 +30,27 @@ skips that route. The models shipped with the code are Gemini
 These defaults do not establish live availability or account entitlement.
 
 The native Gemini 3.5 Flash-Lite GenerateContent request uses the documented
-`contents`, `systemInstruction`, `generationConfig.maxOutputTokens`,
-`generationConfig.responseFormat.text` JSON MIME type/schema, and
+`contents`, `systemInstruction`, `generationConfig.maxOutputTokens` (clamped
+to 65,536), `generationConfig.responseFormat.text` JSON MIME type/schema, and
 `generationConfig.thinkingConfig.thinkingLevel` fields. The request omits
-sampling parameters (`temperature`, `topP`, `topK`) and `candidateCount`; local
-JSON and domain validation remain authoritative if a provider rejects optional
-structured-output fields. `NOTE_GEMINI_THINKING_LEVEL` accepts `minimal`, `low`,
-`medium` or `high` for Gemini 3.x. The numeric
-`NOTE_GEMINI_THINKING_BUDGET` remains only for older Gemini models.
+deprecated sampling parameters (`temperature`, `topP`, `topK`), `candidateCount`,
+and prefilled `model` turns; local JSON and domain validation remain
+authoritative if a provider rejects optional structured-output fields.
+`NOTE_GEMINI_THINKING_LEVEL` accepts `minimal`, `low`, `medium` or `high`.
+The legacy `NOTE_GEMINI_THINKING_BUDGET` variable is ignored with a names-only
+deprecation warning if left in an old environment.
+
+AvalAI (`deepseek-v4.1-flash`) sends OpenAI-compatible `/v1/chat/completions`
+requests with `response_format` (`json_schema` with automatic downgrade to
+`json_object` and prompt-only fallback), output clamping at 393,216 tokens,
+and omits unverified reasoning-effort fields and `stream_options`.
+
+OpenRouter (`nvidia/nemotron-3.5-super-vl:free`) sends OpenAI-compatible
+`/api/v1/chat/completions` requests with output clamping at 131,072 tokens,
+`json_object` on `:free` endpoints (avoiding 404 endpoint filtering),
+`stream_options.include_usage`, optional `provider.sort="throughput"`, and
+OpenRouter's unified `reasoning` object when `NOTE_REASONING_EFFORT` is set
+(`{"enabled": false}` for `none`, or `{"effort": "<level>", "exclude": true}`).
 
 `NOTE_PROVIDERS=avalai,gemini,openrouter` controls available providers, not an
 escape from task policy: known tasks have fixed priorities and OpenRouter is
@@ -62,7 +75,8 @@ failure. Their keys are never lent to an approved provider.
 | `AVALAI_RPM_LIMIT` / `AVALAI_TPM_LIMIT` / `AVALAI_MAX_IN_FLIGHT` | 35 / 750000 / 3 |
 | `OPENROUTER_RPM_LIMIT` / `OPENROUTER_RPD_LIMIT` / `OPENROUTER_MAX_IN_FLIGHT` | 10 / 15 / 1 |
 | `GEMINI_RPM_LIMIT` / `GEMINI_TPM_LIMIT` / `GEMINI_RPD_LIMIT` / `GEMINI_MAX_IN_FLIGHT` | 0 / 0 / 0 / 1 |
-| `NOTE_STRUCTURED_OUTPUT` / `NOTE_STRICT_GROUNDING` / `NOTE_QUALITY_GATE` | 1 / true / repair |
+| `NOTE_STRUCTURED_OUTPUT` / `NOTE_STRICT_GROUNDING` / `NOTE_QUALITY_GATE` | 1 / false / repair |
+| `NOTE_PDF_ENGINE` | typst |
 | `NOTE_DATA_SENSITIVITY` | auto |
 | `NOTE_MAX_REPAIR_ATTEMPTS` / `NOTE_ENABLE_DETERMINISTIC_FALLBACK` | 2 / true |
 | `NOTE_COMPILE` / `NOTE_PROGRESSIVE_BOOKLET` | false / false |
@@ -75,12 +89,17 @@ primary/fallback-role caps. `LLM_TOKEN_ESTIMATION_CHARS_PER_TOKEN=1.5` controls
 conservative input estimation; the full requested output budget is reserved
 as well. Do not inflate operating budgets to match reference model windows.
 Compilation is optional and off by default; bounded map/merge, split/repair and
-grounding checks are retained. The final evidence, completeness and output-safety
-acceptance gate always runs; `NOTE_STRICT_GROUNDING=false` only skips earlier
-provider-assisted repair work. `NOTE_MAX_REPAIR_ATTEMPTS` caps the ordered
-claim-faithfulness, coverage, and structural repair passes (they stop early).
-When `NOTE_ENABLE_DETERMINISTIC_FALLBACK=true`, an exhausted eligible provider
-chain yields a local source-preserving booklet rather than discarding successful
+structural validation are retained. By default (`NOTE_STRICT_GROUNDING=false`),
+the bot operates in direct scientific booklet mode — preserving academic Persian
+rewriting, controlled clarifying completions, English scientific terms,
+comparative tables, professor emphasis and Q&A. Set `NOTE_STRICT_GROUNDING=true`
+to enable the full verbatim evidence, completeness and claim-rejection acceptance
+gate. `NOTE_PDF_ENGINE` chooses the primary graphical PDF renderer (`typst` by
+default, with automatic ReportLab fallback; set `reportlab` to force the legacy
+engine). `NOTE_MAX_REPAIR_ATTEMPTS` caps the ordered claim-faithfulness,
+coverage, and structural repair passes (they stop early). When
+`NOTE_ENABLE_DETERMINISTIC_FALLBACK=true`, an exhausted eligible provider chain
+yields a local source-preserving booklet rather than discarding successful
 chunks. `NOTE_COMPLETENESS_FILL` remains strictly source-grounded and may run
 while `NOTE_STRICT_GROUNDING=true`.
 

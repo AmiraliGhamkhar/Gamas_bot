@@ -252,6 +252,7 @@ class GamasBot(
         self._learning_tasks: dict[int, asyncio.Task[Any]] = {}
         self._admission_tasks: set[asyncio.Task[Any]] = set()
         self._intake_tasks: set[asyncio.Task[Any]] = set()
+        self._pending_raw_text: set[int] = set()
         self._shutting_down = False
         self._admin_action_times: dict[tuple[int, str], float] = {}
         self._broadcast_running: set[int] = set()
@@ -1686,10 +1687,30 @@ class GamasBot(
         if command == "/cancel":
             self._broadcast_previews.pop(user_id, None)
             self._broadcast_resume.pop(user_id, None)
+            self._pending_raw_text.discard(user_id)
             self.conversations.reset_on_cancel(user_id)
             self._office_sessions.pop(user_id, None)
             await event.reply(texts.ORDER_CANCELLED)
             return
+
+        if command in {"/booklet", "/text"}:
+            self._pending_raw_text.discard(user_id)
+            first_token = text.split(maxsplit=1)[0]
+            body = text[len(first_token):].strip()
+            if len(body) >= 20:
+                await self._accept_raw_text(event, user_id, body)
+                return
+            self._pending_raw_text.add(user_id)
+            await event.reply(texts.RAW_TEXT_BOOKLET_PROMPT)
+            return
+
+        if user_id in self._pending_raw_text:
+            if command:
+                self._pending_raw_text.discard(user_id)
+            elif text:
+                self._pending_raw_text.discard(user_id)
+                await self._accept_raw_text(event, user_id, text)
+                return
 
         if user_id in self._pending_flashcard:
             if command:
@@ -1763,10 +1784,19 @@ class GamasBot(
             await event.reply(texts.UNSUPPORTED_FILE)
             return
         if text:
+            if not command and self._looks_like_raw_study_text(text):
+                await self._accept_raw_text(event, user_id, text)
+                return
             await event.reply(
                 texts.UPLOAD_HINT,
                 buttons=self._user_menu(is_admin=self._is_admin(user_id)),
             )
+
+    @staticmethod
+    def _looks_like_raw_study_text(text: str) -> bool:
+        """Detect substantial raw lecture/study text pasted directly into chat."""
+        stripped = (text or "").strip()
+        return len(stripped) >= 120 and len(stripped.split()) >= 20
 
 
 __all__ = [

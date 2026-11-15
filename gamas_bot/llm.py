@@ -49,9 +49,9 @@ from .http_util import (
     sanitize_error_text as _sanitize_error_text,
 )
 from .llm_profiles import (
+    fold_system_into_user,
     get_provider_profile,
     to_gemini_response_format_schema,
-    to_gemini_schema,
 )
 from .metrics import METRICS
 from .llm_quota import ProviderBudget, QuotaUnavailable, finish as finish_quota, reserve as reserve_quota, estimate_tokens
@@ -747,25 +747,14 @@ def _gemini_model_id(model: str) -> str:
     return quote(raw.strip(), safe="")
 
 
-def _gemini_uses_v3_config(model: str) -> bool:
-    """Gemini 3+ uses responseFormat and thinkingLevel, not legacy fields."""
-    model_id = model.strip().lower().removeprefix("models/")
-    return bool(re.match(r"^gemini-[3-9](?:[.-])", model_id))
-
-
 def _openrouter_model_path(model: str) -> str:
     """Encode an OpenRouter ``author/slug[:variant]`` model id for URL paths."""
     parts = [part for part in model.strip().split("/") if part]
     return "/".join(quote(part, safe=":-._~") for part in parts)
 
 
-def _gemini_schema(node: object) -> object:
-    """Convert JSON Schema for Gemini's legacy ``responseSchema`` field."""
-    return to_gemini_schema(node)
-
-
 def _gemini_response_format_schema(node: object) -> object:
-    """Convert JSON Schema for Gemini 3's native ``responseFormat`` field."""
+    """Convert JSON Schema for Gemini 3.x native ``responseFormat.text.schema``."""
     return to_gemini_response_format_schema(node)
 
 
@@ -839,18 +828,38 @@ class OpenAIDialect:
         key = _clean_api_key(route.api_key)
         model = route.model.strip()
         profile = get_provider_profile(route.slug)
-        streaming = float(getattr(settings, "note_ttfb_timeout", 0.0) or 0.0) > 0
+        model_profile = profile.model_profile_for(route)
+        streaming = (
+            model_profile.supports_streaming
+            and float(getattr(settings, "note_ttfb_timeout", 0.0) or 0.0) > 0
+        )
         max_tokens = profile.clamp_output_tokens(route, settings.note_max_output_tokens)
-        headers = {"Authorization": f"Bearer {key}"} if key else {}
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": [
+        headers: dict[str, str] = {"Authorization": f"Bearer {key}"} if key else {}
+        for header_name, header_value in profile.extra_headers:
+            headers.setdefault(header_name, header_value)
+        use_system = (
+            bool(system.strip())
+            and profile.supports_system_prompt
+            and model_profile.supports_system_prompt
+        )
+        if use_system:
+            messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
-            ],
-            "temperature": _sampling_temperature(),
+            ]
+        elif system.strip():
+            messages = [
+                {"role": "user", "content": fold_system_into_user(system, user)},
+            ]
+        else:
+            messages = [{"role": "user", "content": user}]
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
             "max_tokens": max_tokens,
         }
+        if model_profile.send_sampling_params:
+            payload["temperature"] = _sampling_temperature()
         response_format = profile.build_response_format(
             route, settings, schema, streaming=streaming
         )
@@ -906,6 +915,9 @@ class OpenAIDialect:
                     val = message.get(key)
                     if isinstance(val, str) and val.strip():
                         return True
+                details_list = message.get("reasoning_details")
+                if isinstance(details_list, list) and len(details_list) > 0:
+                    return True
         except (AttributeError, KeyError, IndexError, TypeError):
             pass
         return False
@@ -994,41 +1006,52 @@ class GeminiDialect:
         key = _clean_api_key(route.api_key)
         if not key:
             raise LLMAuthError("کلید سرویس تولید جزوه تنظیم نشده است.")
+        profile = get_provider_profile(route.slug)
+        model_profile = profile.model_profile_for(route)
         model_id = _gemini_model_id(route.model.strip())
         url = _endpoint(route.base_url, f"models/{model_id}:generateContent")
+        headers: dict[str, str] = {"x-goog-api-key": key}
+        for header_name, header_value in profile.extra_headers:
+            headers.setdefault(header_name, header_value)
+        max_output_tokens = profile.clamp_output_tokens(
+            route, settings.note_max_output_tokens
+        )
         generation_config: dict[str, Any] = {
-            "maxOutputTokens": settings.note_max_output_tokens,
+            "maxOutputTokens": max_output_tokens,
         }
-        if _gemini_uses_v3_config(route.model):
+        if model_profile.send_sampling_params:
+            generation_config["temperature"] = _sampling_temperature()
+        if model_profile.gemini_response_format_style == "response_format":
             response_text: dict[str, Any] = {"mimeType": "APPLICATION_JSON"}
             if schema is not None and bool(
                 getattr(settings, "note_structured_output", True)
             ):
                 response_text["schema"] = _gemini_response_format_schema(schema)
             generation_config["responseFormat"] = {"text": response_text}
+        if model_profile.gemini_thinking_style == "thinking_level":
             generation_config["thinkingConfig"] = {
                 "thinkingLevel": settings.gemini_thinking_level.upper(),
             }
+        use_system = (
+            bool(system.strip())
+            and profile.supports_system_prompt
+            and model_profile.supports_system_prompt
+        )
+        if use_system:
+            payload: dict[str, Any] = {
+                "contents": [{"role": "user", "parts": [{"text": user}]}],
+                "systemInstruction": {"parts": [{"text": system}]},
+                "generationConfig": generation_config,
+            }
         else:
-            # Gemini 2.x retains the legacy request shape. The 3.x models
-            # deprecate sampling parameters and recommend thinkingLevel, so
-            # those are isolated above rather than retried on the hot path.
-            generation_config["temperature"] = _sampling_temperature()
-            generation_config["responseMimeType"] = "application/json"
-            if schema is not None and bool(
-                getattr(settings, "note_structured_output", True)
-            ):
-                generation_config["responseSchema"] = _gemini_schema(schema)
-            if settings.gemini_thinking_budget >= 0:
-                generation_config["thinkingConfig"] = {
-                    "thinkingBudget": settings.gemini_thinking_budget,
-                }
-        payload: dict[str, Any] = {
-            "contents": [{"role": "user", "parts": [{"text": user}]}],
-            "systemInstruction": {"parts": [{"text": system}]},
-            "generationConfig": generation_config,
-        }
-        return url, {"x-goog-api-key": key}, payload
+            combined_user = (
+                fold_system_into_user(system, user) if system.strip() else user
+            )
+            payload = {
+                "contents": [{"role": "user", "parts": [{"text": combined_user}]}],
+                "generationConfig": generation_config,
+            }
+        return url, headers, payload
 
     def build_get_request(
         self,
@@ -1258,6 +1281,29 @@ def _retry_delay_seconds(retry_after: float | None, attempt: int) -> float:
     return min(MAX_LLM_RETRY_AFTER_SECONDS, max(0.0, candidate))
 
 
+def _usage_detail_counts(payload: dict, style: str) -> tuple[int | None, int | None]:
+    """Extract optional ``(cached_tokens, reasoning_tokens)`` from a provider response."""
+    cached: int | None = None
+    reasoning: int | None = None
+    if style == "gemini":
+        usage = payload.get("usageMetadata")
+        if isinstance(usage, dict):
+            cached = _usage_count(usage.get("cachedContentTokenCount"))
+            reasoning = _usage_count(usage.get("thoughtsTokenCount"))
+        return cached, reasoning
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        prompt_details = usage.get("prompt_tokens_details")
+        if isinstance(prompt_details, dict):
+            cached = _usage_count(prompt_details.get("cached_tokens"))
+        if cached is None:
+            cached = _usage_count(usage.get("prompt_cache_hit_tokens"))
+        comp_details = usage.get("completion_tokens_details")
+        if isinstance(comp_details, dict):
+            reasoning = _usage_count(comp_details.get("reasoning_tokens"))
+    return cached, reasoning
+
+
 def _log_usage(
     route: NoteRoute,
     payload: dict,
@@ -1277,6 +1323,7 @@ def _log_usage(
     the completion content nor a credential is logged.
     """
     model, input_tokens, output_tokens, total_tokens = _usage_summary(payload, route.style)
+    cached_tokens, reasoning_tokens = _usage_detail_counts(payload, route.style)
     _ACTUAL_USAGE_TOKENS.set(total_tokens)
     request_id = _response_request_id(headers, payload=payload, api_key=route.api_key)
 
@@ -1285,7 +1332,8 @@ def _log_usage(
 
     logger.info(
         "note provider usage provider=%s request_id=%s model=%s requested_output_tokens=%s "
-        "input_tokens=%s output_tokens=%s total_tokens=%s ttfb_ms=%.0f elapsed_ms=%.0f",
+        "input_tokens=%s cached_tokens=%s output_tokens=%s reasoning_tokens=%s "
+        "total_tokens=%s ttfb_ms=%.0f elapsed_ms=%.0f",
         route.slug,
         request_id or "-",
         # The served-model string is provider-controlled: collapse any
@@ -1293,7 +1341,9 @@ def _log_usage(
         _sanitize_error_text(model or route.model, limit=80),
         shown(requested_output_tokens),
         shown(input_tokens),
+        shown(cached_tokens),
         shown(output_tokens),
+        shown(reasoning_tokens),
         shown(total_tokens),
         ttfb_ms,
         elapsed_ms,
@@ -1366,6 +1416,9 @@ def _adjust_rejected_request_param(
         if "provider" in payload:
             payload.pop("provider", None)
             return "provider"
+        if "reasoning" in payload:
+            payload.pop("reasoning", None)
+            return "reasoning"
         if "reasoning_effort" in payload:
             payload.pop("reasoning_effort", None)
             return "reasoning_effort"
@@ -1416,11 +1469,18 @@ def _adjust_rejected_request_param(
             payload.pop("response_format", None)
             return "response_format"
 
-    if "reasoning_format" in payload and any(
-        marker in lower for marker in ("reasoning_format", "reasoning format")
+    if "reasoning" in payload and any(
+        marker in lower
+        for marker in (
+            "reasoning",
+            "thinking_level",
+            "thinking_budget",
+            "reasoning is mandatory",
+            "reasoning is not supported",
+        )
     ):
-        payload.pop("reasoning_format", None)
-        return "reasoning_format"
+        payload.pop("reasoning", None)
+        return "reasoning"
 
     if "reasoning_effort" in payload and any(
         marker in lower
@@ -1475,42 +1535,6 @@ def _adjust_rejected_request_param(
             ):
                 text_config.pop("schema", None)
                 return "generationConfig.responseFormat.text.schema"
-        # The 2026-11-07 Gemini test failed with HTTP 400 INVALID_ARGUMENT when
-        # structured output was enabled and succeeded with it disabled. The
-        # exact rejected field was never isolated from the failing payload, so
-        # this is a deliberately narrow, single-shot compatibility retry: it is
-        # Gemini-only, needs a 400 INVALID_ARGUMENT, needs the original request
-        # to actually contain responseSchema, and removes only that field.
-        if (
-            provider_slug == "gemini"
-            and "responseSchema" in generation_config
-            and _is_gemini_invalid_argument(error_text)
-        ):
-            generation_config.pop("responseSchema", None)
-            return "generationConfig.responseSchema_invalid_argument"
-        if (
-            "responseSchema" in generation_config
-            and any(
-                marker in lower
-                for marker in ("responseschema", "response_schema", "schema")
-            )
-            and any(marker in lower for marker in rejected_markers)
-        ):
-            # A model (or a gateway in front of it) that does not implement
-            # structured output drops the schema; the JSON mime type and the
-            # prompt's own rules still apply, so the answer stays parseable.
-            generation_config.pop("responseSchema", None)
-            return "generationConfig.responseSchema"
-        if (
-            "responseMimeType" in generation_config
-            and any(
-                marker in lower
-                for marker in ("responsemimetype", "response_mime_type", "application/json")
-            )
-            and any(marker in lower for marker in rejected_markers)
-        ):
-            generation_config.pop("responseMimeType", None)
-            return "generationConfig.responseMimeType"
         if (
             "thinkingConfig" in generation_config
             and any(
@@ -1518,16 +1542,12 @@ def _adjust_rejected_request_param(
                 for marker in (
                     "thinkingconfig",
                     "thinking_config",
-                    "thinkingbudget",
-                    "thinking_budget",
                     "thinkinglevel",
                     "thinking_level",
                 )
             )
             and any(marker in lower for marker in rejected_markers)
         ):
-            # A model that predates ``thinkingConfig`` rejects the field
-            # instead of ignoring it; drop it and retry the same request once.
             generation_config.pop("thinkingConfig", None)
             return "generationConfig.thinkingConfig"
         if (
@@ -1578,6 +1598,57 @@ def _adjust_rejected_request_param(
     ):
         payload.pop("temperature", None)
         return "temperature"
+
+    system_rejection_markers = (
+        "developer instruction",
+        "systeminstruction",
+        "system_instruction",
+        "system role",
+        "role 'system'",
+        'role "system"',
+        "system prompt",
+        "system message",
+        "system instructions",
+        "does not support system",
+    )
+    if any(marker in lower for marker in system_rejection_markers):
+        if "systemInstruction" in payload:
+            sys_obj = payload.pop("systemInstruction")
+            sys_parts = (
+                sys_obj.get("parts") if isinstance(sys_obj, dict) else None
+            ) or []
+            sys_text = "\n".join(
+                str(part.get("text", ""))
+                for part in sys_parts
+                if isinstance(part, dict) and part.get("text")
+            )
+            contents = payload.get("contents")
+            if isinstance(contents, list) and contents:
+                first_turn = contents[0]
+                if isinstance(first_turn, dict):
+                    parts = first_turn.get("parts")
+                    if isinstance(parts, list) and parts and isinstance(parts[0], dict):
+                        user_text = str(parts[0].get("text", ""))
+                        parts[0]["text"] = fold_system_into_user(sys_text, user_text)
+                        return "systemInstruction.folded_into_user"
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            sys_chunks: list[str] = []
+            remaining: list[dict[str, Any]] = []
+            for msg in messages:
+                if isinstance(msg, dict) and msg.get("role") == "system":
+                    sys_chunks.append(str(msg.get("content", "")))
+                elif isinstance(msg, dict):
+                    remaining.append(msg)
+            if sys_chunks and remaining:
+                sys_text = "\n\n".join(chunk for chunk in sys_chunks if chunk.strip())
+                for msg in remaining:
+                    if msg.get("role") == "user":
+                        msg["content"] = fold_system_into_user(
+                            sys_text, str(msg.get("content", ""))
+                        )
+                        payload["messages"] = remaining
+                        return "messages.system_folded_into_user"
     return None
 
 
@@ -1831,6 +1902,9 @@ async def _complete_streaming_on_route(
                         r_val = delta.get(r_key)
                         if isinstance(r_val, str) and r_val.strip():
                             saw_reasoning = True
+                    r_details = delta.get("reasoning_details")
+                    if isinstance(r_details, list) and len(r_details) > 0:
+                        saw_reasoning = True
                     refusal_val = delta.get("refusal")
                     if isinstance(refusal_val, str) and refusal_val:
                         refusal_parts.append(refusal_val)
@@ -1842,6 +1916,9 @@ async def _complete_streaming_on_route(
                         r_val = msg_dict.get(r_key)
                         if isinstance(r_val, str) and r_val.strip():
                             saw_reasoning = True
+                    r_details = msg_dict.get("reasoning_details")
+                    if isinstance(r_details, list) and len(r_details) > 0:
+                        saw_reasoning = True
                     refusal_val = msg_dict.get("refusal")
                     if isinstance(refusal_val, str) and refusal_val:
                         refusal_parts.append(refusal_val)
@@ -2000,7 +2077,8 @@ async def _complete_on_route(
     """
     url, headers, payload = _build_request_for(route, settings, system, user, schema=schema)
     profile = get_provider_profile(route.slug)
-    allow_streaming = True
+    model_profile = profile.model_profile_for(route)
+    allow_streaming = model_profile.supports_streaming
     include_stream_options = profile.supports_stream_options(route)
     timeout_seconds = float(settings.note_request_timeout or 0) or (
         LLM_REQUEST_TIMEOUT_SECONDS

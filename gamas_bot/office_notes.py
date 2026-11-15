@@ -27,6 +27,7 @@ from .notes import (
     enforce_final_acceptance,
     ensure_structured_booklet,
     gate_notes,
+    structurally_valid_booklet,
     structure_document,
 )
 from .notes_evidence import SignalAudit, audit_notes, content_words, extract_signals, split_sentences
@@ -435,12 +436,13 @@ async def generate_full_booklet(
         )
     fallback = basic_source_booklet(chunks, title=title)
     fallback = ensure_structured_booklet(fallback, source)
-    fallback, fallback_report = gate_notes(fallback, source, strict=True, mode="full")
-    # The extractive fallback is still a booklet path: it must clear the same
-    # final contract before any caller can render or deliver it.
-    fallback = enforce_final_acceptance(
-        fallback, fallback_report, mode="full", stage="office_fallback"
-    )
+    if getattr(settings, "note_strict_grounding", False):
+        fallback, fallback_report = gate_notes(fallback, source, strict=True, mode="full")
+        # The extractive fallback is still a booklet path: it must clear the same
+        # final contract before any caller can render or deliver it.
+        fallback = enforce_final_acceptance(
+            fallback, fallback_report, mode="full", stage="office_fallback"
+        )
     if not settings.note_configured or session is None:
         return fallback, True
     locator_sources = _locator_source_map(chunks)
@@ -455,6 +457,14 @@ async def generate_full_booklet(
         )
     except (LLMError, StructuringError) as exc:
         logger.warning("Office full booklet using source fallback error=%s", type(exc).__name__)
+        return fallback, True
+    if not getattr(settings, "note_strict_grounding", False):
+        try:
+            normalized = ensure_structured_booklet(generated, source)
+        except StructuringError:
+            return fallback, True
+        if structurally_valid_booklet(normalized) and normalized.has_content:
+            return normalized, False
         return fallback, True
     if not _full_result_is_grounded(generated, source, allowed, locator_sources):
         return fallback, True

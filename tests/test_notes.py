@@ -622,11 +622,10 @@ class ContextOverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             " ".join((first + " " + second).split()), " ".join(document.split())
         )
-        # The scripted answers are intentionally unsupported. The canonical
-        # final gate therefore replaces them with a source-preserving booklet
-        # instead of delivering their invented headings.
-        self.assertEqual(notes.quality_state, "RECOVERED")
-        self.assertIn("موضوع 0", notes.to_markdown())
+        # Under direct scientific mode (note_strict_grounding=False default),
+        # the merged answers from both halves are preserved directly.
+        self.assertEqual(notes.title, "نیمهٔ نخست")
+        self.assertTrue(notes.sections)
 
     async def test_a_413_oversized_body_splits_too(self):
         """NaraRouter signals an oversized input with HTTP 413, not 400.
@@ -650,8 +649,8 @@ class ContextOverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             " ".join((first + " " + second).split()), " ".join(document.split())
         )
-        self.assertEqual(notes.quality_state, "RECOVERED")
-        self.assertIn("موضوع 0", notes.to_markdown())
+        self.assertEqual(notes.title, "نیمهٔ نخست")
+        self.assertTrue(notes.sections)
 
     async def test_an_unchanged_oversized_request_recovers_with_bounded_source_fallback(self):
         settings = make_settings(note_chunk_chars=100_000)
@@ -836,9 +835,8 @@ class ProgressiveBookletTests(unittest.IsolatedAsyncioTestCase):
         notes = await structure_transcript(
             document, settings, session, on_merged=on_merged
         )
-        # The compile call still occurs, but this deliberately unsupported
-        # editorial fixture cannot cross the final source-grounding gate.
-        self.assertEqual(notes.quality_state, "RECOVERED")
+        # Under direct scientific mode, the compiled booklet is delivered cleanly.
+        self.assertEqual(notes.title, "جزوهٔ نهایی")
         self.assertEqual(len(seen), 1)
         self.assertTrue(seen[0][0].startswith("جزوهٔ "))
         self.assertEqual(seen[0][1], len(chunks))
@@ -947,8 +945,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         settings = make_settings(note_chunk_chars=100000)
         session = FakeSession([sample_notes_json("جزوهٔ تک‌بخشی")])
         notes = await structure_transcript("یک متن کوتاه است.", settings, session)
-        self.assertEqual(notes.quality_state, "RECOVERED")
-        self.assertIn("یک متن کوتاه است", notes.to_markdown())
+        self.assertEqual(notes.title, "جزوهٔ تک‌بخشی")
+        self.assertTrue(notes.sections)
         self.assertEqual(len(session.calls), 1)
 
     async def test_multi_chunk_map_reduce(self):
@@ -979,11 +977,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             + [json.dumps(compile_answer, ensure_ascii=False)]
         )
         notes = await structure_transcript(document, settings, session)
-        # map calls + exactly one compile call; unsafe fixture output is then
-        # replaced by the source-preserving final fallback.
+        # map calls + exactly one compile call.
         self.assertEqual(len(session.calls), len(chunks) + 1)
-        self.assertEqual(notes.quality_state, "RECOVERED")
-        self.assertIn("موضوع 0", notes.to_markdown())
+        self.assertEqual(notes.title, "جزوهٔ نهایی")
+        self.assertTrue(notes.sections)
 
     async def test_compile_runs_above_the_former_fixed_bound(self):
         """A merged booklet over the old 48,000-char bound still gets compiled.
@@ -1013,11 +1010,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         notes = await structure_transcript(document, settings, session)
         # Map calls + exactly one compile call, despite the merged booklet
-        # being far above the former fixed 48,000-char bound. The fixture's
-        # invented compile prose is blocked at final acceptance.
+        # being far above the former fixed 48,000-char bound.
         self.assertEqual(len(session.calls), len(chunks) + 1)
-        self.assertEqual(notes.quality_state, "RECOVERED")
-        self.assertIn("موضوع 0", notes.to_markdown())
+        self.assertEqual(notes.title, "جزوهٔ نهایی بزرگ")
+        self.assertTrue(notes.sections)
 
     async def test_compile_failure_falls_back_to_merge(self):
         from gamas_bot.transcript import split_transcript
@@ -1770,7 +1766,7 @@ class CompletenessValidatorTests(unittest.TestCase):
         for phrase in ("زیرحالت «پرکردن جاافتاده»", "متن منبع", "sections", "عدد"):
             self.assertIn(phrase, COVERAGE_FILL_SYSTEM_PROMPT)
         self.assertIn("از دانش بیرونی نیاورید", COVERAGE_FILL_SYSTEM_PROMPT)
-        self.assertIn("پشتوانهٔ لفظی در متن", COVERAGE_FILL_SYSTEM_PROMPT)
+        self.assertIn("ممنوعیت‌های مطلق", COVERAGE_FILL_SYSTEM_PROMPT)
         doc = build_fill_document(["یک جملهٔ منبع"], StructuredNotes())
         self.assertIn("یک جملهٔ منبع", doc)  # source unit passed through verbatim
         self.assertIn("متن منبع", doc)
@@ -1803,15 +1799,18 @@ class SkeletonPromptTests(unittest.TestCase):
         self.assertIn("حذف نکنید", COMPILE_SYSTEM_PROMPT)
 
     def test_prompt_uses_semantic_blocks_only_when_the_source_supports_them(self):
-        """Tables, callouts and tips are not generated as decorative filler."""
+        """Tables, callouts, emphasis and tips are used meaningfully for study."""
         prompt = build_system_prompt("full")
         for phrase in (
-            "جدول مقایسه‌ای (tables)",
-            "callouts را فقط برای نکته، هشدار یا یادآوری‌ای بسازید",
+            "جدول‌های مقایسه‌ای برای مرور سریع (tables)",
+            "callouts را فقط برای نکته، هشدار، یادآوری یا تأکید استاد مرتبط با درس",
             "practical_tips فقط توصیهٔ عملی یا",
             "فارسی معیار دانشگاهی",
             "هرکدام را فقط برای همین بخش تهیه کنید",
-            "برای تزئین یا صرفِ وجود چند اصطلاح نسازید",
+            "برای تزئین",
+            "تأکید استاد",
+            "practice_questions",
+            "term_en",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, prompt)
@@ -1939,13 +1938,9 @@ class CoverageFillTests(unittest.IsolatedAsyncioTestCase):
                                  note_strict_grounding=False, note_completeness_fill=True)
         session = FakeSession([self.DRAFT, self.FILL])
         notes = await structure_transcript(self.SOURCE, settings, session)
-        # All detected coverage gaps are combined into exactly one repair call.
+        # All detected coverage gaps are combined into exactly one fill call.
         self.assertEqual(len(session.calls), 2)
-        # The tiny fill fixture cannot cover all six critical numbered units,
-        # so final acceptance keeps the source faithfully rather than shipping
-        # a partial two-section draft.
-        self.assertEqual(notes.quality_state, "RECOVERED")
-        self.assertIn("شمارهٔ 5", notes.to_markdown())
+        self.assertIn("ترمودینامیک", notes.to_markdown())
         fill_call = session.calls[1]["json"]["messages"]
         system = fill_call[0]["content"]
         user = fill_call[1]["content"]
@@ -1956,9 +1951,9 @@ class CoverageFillTests(unittest.IsolatedAsyncioTestCase):
         settings = make_settings(note_chunk_chars=100_000, note_compile=False,
                                  note_strict_grounding=False, note_completeness_fill=True)
         # only the map answer is available; the fill request raises and must be
-        # swallowed so the audited draft is still delivered (never a refunded job).
+        # swallowed so the draft is still delivered (never a refunded job).
         session = FakeSession([self.DRAFT])
         notes = await structure_transcript(self.SOURCE, settings, session)
         self.assertEqual(len(session.calls), 2)  # map + one failing fill
-        self.assertEqual(notes.quality_state, "RECOVERED")
-        self.assertIn("جملهٔ مستقل شمارهٔ 5", notes.to_markdown())
+        self.assertEqual(notes.title, "ترمودینامیک")
+        self.assertTrue(notes.sections)

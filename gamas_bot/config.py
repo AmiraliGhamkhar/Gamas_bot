@@ -79,30 +79,23 @@ NOTE_HOST_PROVIDERS = (
     ("avalai.ir", "avalai"),
 )
 
-#: Documented API defaults per provider. The OpenRouter default is one *pinned*
-#: free model, not the ``openrouter/free`` router: the router picks a model per
-#: request, so the window that actually serves a request is unknown when the
-#: bot sizes it, while the pinned model's endpoint serves a documented context
-#: and completion cap (https://openrouter.ai/api/v1/models). Both are
-#: overridable, and no model is called free without this evidence.
+#: Documented API defaults per provider. Each default pins one active model
+#: whose endpoint limits and wire contract are explicitly registered in
+#: :mod:`gamas_bot.llm_profiles` (overridable via environment variables).
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3.5-super-vl:free"
-#: Google AI Studio's default note model. ``flash-lite`` answers note
-#: extraction/organisation requests several times faster than the thinking
-#: models while staying inside the free tier.
+#: Google AI Studio's active Gemini 3.5 Flash-Lite model: 1M context, 65,536
+#: max output tokens, native ``responseFormat.text`` JSON output, and
+#: ``thinkingLevel`` control (``minimal`` default).
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
-#: AvalAI is a hosted OpenAI-compatible gateway (documented base URL
-#: ``https://api.avalai.ir/v1``) that re-serves the upstream vendors' models
-#: under its own ids (https://docs.avalai.ir/en/api-reference/chat). Its
-#: DeepSeek entry is ``deepseek-v4.1-flash``: 1M-token input, documented JSON
-#: output *and* ``json_schema`` structured output, and implicit prompt caching
-#: (https://docs.avalai.ir/en/providers/deepseek).
+#: AvalAI OpenAI-compatible gateway (``https://api.avalai.ir/v1``) serving
+#: ``deepseek-v4.1-flash`` (base ``DeepSeek-V4.1-Flash-1017``): 1M input,
+#: 393,216 (384K) max output tokens, documented JSON / ``json_schema`` output,
+#: and prompt caching (https://docs.avalai.ir/en/providers/deepseek).
 DEFAULT_AVALAI_BASE_URL = "https://api.avalai.ir/v1"
 DEFAULT_AVALAI_MODEL = "deepseek-v4.1-flash"
-#: Legacy Gemini 2.x thinking budget. Gemini 3.x models use the documented
-#: ``thinkingLevel`` enum instead; the default model's ``minimal`` default keeps
-#: extraction fast without sending a deprecated numeric budget.
-DEFAULT_GEMINI_THINKING_BUDGET = 0
+#: Gemini 3.5 Flash-Lite ``generationConfig.thinkingConfig.thinkingLevel``
+#: enum (``minimal`` is Google's default for high-throughput extraction).
 DEFAULT_GEMINI_THINKING_LEVEL = "minimal"
 GEMINI_THINKING_LEVELS = ("minimal", "low", "medium", "high")
 NOTE_BASE_URL_DEFAULTS = {
@@ -158,9 +151,10 @@ DEFAULT_NOTE_REQUEST_TIMEOUT_SECONDS = 900.0
 #: budget cannot be produced inside the request deadline — the warning is
 #: advisory, because a fast or paid gateway easily beats this estimate.
 MIN_NOTE_OUTPUT_TOKENS_PER_SECOND = 20.0
-#: ``reasoning_effort`` levels accepted on the OpenAI-compatible note routes
-#: whose gateway documents the field (OpenRouter). ``ultra`` is accepted as a
-#: documented alias of ``max``.
+#: Reasoning-effort levels accepted for OpenRouter's unified ``reasoning``
+#: object (``none`` disables thinking via ``{"enabled": False}``; all other
+#: levels send ``{"effort": level, "exclude": True}``). ``ultra`` is accepted
+#: as an alias of ``max``.
 NOTE_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 #: A request needs at least this much room for the transcript itself.
 MIN_NOTE_INPUT_TOKENS = 4096
@@ -364,6 +358,15 @@ def _env_bool(name: str, default: bool) -> bool:
 NOTE_QUALITY_GATES = ("repair", "warn")
 
 
+NOTE_PDF_ENGINES = ("typst", "reportlab")
+
+
+def resolve_note_pdf_engine(value: str | None) -> str:
+    """Resolve ``NOTE_PDF_ENGINE``; an unknown value defaults to ``typst``."""
+    resolved = (value or "").strip().lower()
+    return resolved if resolved in NOTE_PDF_ENGINES else "typst"
+
+
 def resolve_note_quality_gate(value: str | None) -> str:
     """Resolve ``NOTE_QUALITY_GATE``; an unknown value means ``repair``."""
     resolved = (value or "").strip().lower()
@@ -563,9 +566,8 @@ class Settings:
     avalai_api_key: str
     avalai_base_url: str
     avalai_model: str
-    #: ``0`` disables Gemini thinking, a positive value caps it, ``-1`` sends no
-    #: ``thinkingConfig`` field at all (see ``DEFAULT_GEMINI_THINKING_BUDGET``).
-    gemini_thinking_budget: int
+    #: Gemini 3.5 Flash-Lite ``thinkingConfig.thinkingLevel`` enum
+    #: (``minimal``, ``low``, ``medium``, ``high``).
     gemini_thinking_level: str
     note_context_tokens: int
     note_mode: str
@@ -741,6 +743,8 @@ class Settings:
     #: Construct a local source-preserving StructuredNotes artifact when every
     #: eligible LLM route for a chunk (or the sole chunk) has failed.
     note_enable_deterministic_fallback: bool = True
+    #: Primary booklet PDF rendering engine (``typst`` or ``reportlab``).
+    note_pdf_engine: str = "typst"
     #: Keep stereo when the source has useful channel separation (diarization).
     #: Default ``False`` preserves the mono 16 kHz STT upload.
     stt_preserve_stereo: bool = False
@@ -1099,13 +1103,6 @@ def note_route_summary(settings: Settings) -> list[str]:
     print from ``--check`` or an operator probe.
     """
     routes = note_routes(settings)
-    thinking = settings.gemini_thinking_budget
-    if thinking < 0:
-        thinking_text = "disabled (no thinkingConfig)"
-    elif thinking == 0:
-        thinking_text = "off (thinkingBudget=0)"
-    else:
-        thinking_text = f"capped at {thinking}"
     lines = [
         f"Provider order: {', '.join(route.slug for route in routes) or '(none)'}",
         f"Declared NOTE_PROVIDERS: {', '.join(settings.note_providers) or '(none)'}",
@@ -1114,7 +1111,6 @@ def note_route_summary(settings: Settings) -> list[str]:
         f"Structured output: {'enabled' if settings.note_structured_output else 'disabled'}",
         f"Reasoning effort: {settings.note_reasoning_effort or '(provider default)'}",
         f"Maximum output tokens: {settings.note_max_output_tokens}",
-        f"Gemini legacy thinking budget: {thinking_text}",
         f"Gemini 3.x thinking level: {settings.gemini_thinking_level}",
         "Active providers:",
     ]
@@ -1162,6 +1158,7 @@ _LEGACY_LLM_ENV_VARS = (
     "CEREBRAS_API_KEY", "CEREBRAS_BASE_URL", "CEREBRAS_MODEL",
     "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
     "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
+    "NOTE_GEMINI_THINKING_BUDGET",
 )
 
 
@@ -1380,12 +1377,6 @@ def from_env(env_file: str | None = None) -> Settings:
             _env("AVALAI_BASE_URL", DEFAULT_AVALAI_BASE_URL), "avalai"
         ),
         avalai_model=_env("AVALAI_MODEL", DEFAULT_AVALAI_MODEL),
-        gemini_thinking_budget=_env_int(
-            "NOTE_GEMINI_THINKING_BUDGET",
-            DEFAULT_GEMINI_THINKING_BUDGET,
-            minimum=-1,
-            maximum=32768,
-        ),
         gemini_thinking_level=resolve_gemini_thinking_level(
             _env("NOTE_GEMINI_THINKING_LEVEL", DEFAULT_GEMINI_THINKING_LEVEL)
         ),
@@ -1414,7 +1405,7 @@ def from_env(env_file: str | None = None) -> Settings:
             "NOTE_COMPILE_MAX_CHARS", 0, minimum=0, maximum=2_000_000
         ),
         note_reasoning_effort=resolve_note_reasoning_effort(_env("NOTE_REASONING_EFFORT")),
-        note_strict_grounding=_env_bool("NOTE_STRICT_GROUNDING", True),
+        note_strict_grounding=_env_bool("NOTE_STRICT_GROUNDING", False),
         note_quality_gate=resolve_note_quality_gate(_env("NOTE_QUALITY_GATE")),
         note_data_sensitivity=resolve_note_data_sensitivity(
             _env("NOTE_DATA_SENSITIVITY")
@@ -1429,6 +1420,7 @@ def from_env(env_file: str | None = None) -> Settings:
         note_enable_deterministic_fallback=_env_bool(
             "NOTE_ENABLE_DETERMINISTIC_FALLBACK", True
         ),
+        note_pdf_engine=resolve_note_pdf_engine(_env("NOTE_PDF_ENGINE")),
         note_compile_provider=normalize_note_compile_provider(
             _env("NOTE_COMPILE_PROVIDER")
         ),

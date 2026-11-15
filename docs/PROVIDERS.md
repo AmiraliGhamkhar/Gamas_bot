@@ -34,24 +34,53 @@ Ordinary unclassified calls exclude OpenRouter even when it has a key.
 
 ### Structured output and model capabilities
 
-Gemini uses its native schema dialect (upper-case types, preserved `required`,
-unsupported keywords removed). AvalAI uses a non-strict `json_schema` envelope
-with a bounded JSON-object/no-format compatibility ladder. OpenRouter Free
-starts with `json_object` to avoid filtering out endpoints that do not advertise
-schema support; other OpenRouter models can use a schema envelope. Streaming,
-usage parsing, finish-reason/truncation checks and bounded local JSON/domain
-validation remain in place. A malformed or truncated answer is never silently
-accepted or delivered as a partial booklet. Healthy requests are not hedged,
-even if the legacy hedge setting is nonzero.
+Per-model and per-provider wire contracts live in `gamas_bot/llm_profiles.py`
+(`MODEL_PROFILES` and `PROVIDER_PROFILES`), so new models or providers can be
+added via `register_model_profile`, `register_provider_profile`, and
+`register_llm_dialect` without rewriting the transport loop.
+
+- **Gemini (`gemini-3.5-flash-lite`)**: Native `generateContent` /
+  `streamGenerateContent?alt=sse` with `x-goog-api-key` auth, `systemInstruction`,
+  `generationConfig.maxOutputTokens` clamped to `65536`,
+  `generationConfig.responseFormat.text` (`mimeType: "APPLICATION_JSON"` plus
+  optional lowercase JSON Schema with unsupported keywords stripped), and
+  `generationConfig.thinkingConfig.thinkingLevel` (`MINIMAL` default, `LOW`,
+  `MEDIUM`, `HIGH`). Deprecated sampling parameters (`temperature`, `topP`,
+  `topK`), `candidateCount`, and prefilled `model` turns are never sent.
+- **AvalAI (`deepseek-v4.1-flash`)**: OpenAI-compatible
+  `POST /v1/chat/completions` (`Authorization: Bearer ...`) with output clamped
+  to `393216`, portable non-strict `response_format.json_schema` and a bounded
+  fallback ladder (`json_schema` → `json_object` → prompt-only), implicit
+  prompt-cache usage logging (`cached_tokens` + `avalai-request-id`), and
+  `reasoning_content` exhaustion detection. Unverified `reasoning_effort` and
+  `stream_options` fields are omitted per AvalAI's DeepSeek V4.1 Flash
+  documentation.
+- **OpenRouter (`nvidia/nemotron-3.5-super-vl:free`)**: OpenAI-compatible
+  `POST /api/v1/chat/completions` with output clamped to `131072`,
+  `stream_options.include_usage`, optional `provider.sort="throughput"`,
+  `response_format: {"type": "json_object"}` on `:free` endpoints (preventing
+  HTTP 404 endpoint filtering while still enforcing valid JSON), and
+  OpenRouter's unified `reasoning` object when `NOTE_REASONING_EFFORT` is set
+  (`{"enabled": false}` for `none`, or `{"effort": "<level>", "exclude": true}`
+  for `minimal`/`low`/`medium`/`high`/`xhigh`/`max`). Response parsing inspects
+  `reasoning`, `reasoning_content`, `reasoning_details`, and
+  `completion_tokens_details.reasoning_tokens` to detect output-budget
+  exhaustion.
+
+Streaming, usage parsing (including `cached_tokens` and `reasoning_tokens`),
+finish-reason/truncation checks, and bounded local JSON/domain validation remain
+in place. A malformed or truncated answer is never silently accepted or
+delivered as a partial booklet. Healthy requests are not hedged, even if the
+legacy hedge setting is nonzero.
 
 The checked-in reference profiles distinguish model context, input and output
 caps from application budgets:
 
-| Profile | Reference context / input tokens | Reference output cap |
-| --- | --- | --- |
-| Gemini | 1048576 / 1048576 | 65536 |
-| AvalAI | 1000000 / 1000000 | 393216 |
-| OpenRouter | 1000000 / 1000000 | 131072 |
+| Profile | Reference model | Reference context / input tokens | Reference output cap |
+| --- | --- | --- | --- |
+| Gemini | `gemini-3.5-flash-lite` | 1048576 / 1048576 | 65536 |
+| AvalAI | `deepseek-v4.1-flash` | 1000000 / 1000000 | 393216 |
+| OpenRouter | `nvidia/nemotron-3.5-super-vl:free` | 1000000 / 1000000 | 131072 |
 
 These are repository metadata, **not** current provider/account guarantees.
 Operating defaults remain **131072 context / 64000 chunk characters / 16384
