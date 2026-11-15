@@ -2,6 +2,9 @@
 
 ## Approved text-generation routes
 
+For the results-screen and billing behavior after transcription, see
+[Features](FEATURES.md#audio-and-video) and [Billing](BILLING.md#transcription-charges).
+
 Only **Gemini**, **AvalAI** and **OpenRouter** are routable. Shared
 OpenAI-compatible HTTP/schema code serves AvalAI and OpenRouter; it does not
 register a fourth provider. Speech-to-text is a separate pipeline below.

@@ -4,6 +4,11 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Documentation alignment.** Clarified that a transcript is stored and its
+charge settled before optional note generation, with downloads offered on the
+final results screen. Corrected SQLite artifact storage, test dependencies,
+import guidance and historical audit-evidence availability.
+
 **Leaderboard and remaining Mini App/Studio schema remnants removed.** The
 user leaderboard (`board` / «لیدربورد»), post-quiz rank display, admin top-users
 ranking and leaderboard-gift screens (`adm:board`, `adm:bg:*`, `adm:bgok:*`),

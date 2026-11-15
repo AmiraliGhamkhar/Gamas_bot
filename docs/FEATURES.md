@@ -121,9 +121,10 @@ configured AI calls still cost the operator money.
 
 ## Library and learning
 
-- **Library** keeps the newest `LIBRARY_MAX_ITEMS` (50) Telegram file references
-  per user; files themselves stay in Telegram. Pruning a reference does not
-  delete cached extracted text.
+- **Library** keeps up to `LIBRARY_MAX_ITEMS` (50) delivered-file references per
+  user. Telegram receives files when requested; media-submission booklet PDF,
+  DOCX and review HTML bytes are also persisted in SQLite. Pruning a library
+  reference does not delete cached extracted text.
 - **Learning**: quizzes and flashcards generated from a saved booklet or
   document, previewed before saving. Costs are in [Billing](BILLING.md). Every
   study workflow stays inside the chat.

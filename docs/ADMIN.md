@@ -120,6 +120,8 @@ is not stored.
   is not a successful PDF booklet. A partial audio, video or presentation
   submission (or a failed one whose base output was already delivered) with no
   persisted PDF counts as a booklet-finalization failure.
+- The results screen offers downloads after processing; storing a transcript or
+  PDF is not evidence that a user has downloaded it.
 - PDF download attempts count user button requests, including retries. Send
   successes mean Telegram's send call returned without raising, not proof that
   the recipient opened or received the file. Attempts left unresolved by a crash

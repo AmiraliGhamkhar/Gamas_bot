@@ -74,10 +74,10 @@ or deployment compatibility is implied by offline tests. See
 
 | Input or menu | Result |
 | --- | --- |
-| Audio, video, voice note | Transcript first, then an RTL Word/PDF booklet and an offline interactive HTML review sheet when a note provider is configured |
+| Audio, video, voice note | Transcript saved before optional note generation; one results screen offers the transcript and any generated Word/PDF booklet and offline HTML review sheet |
 | PDF, DOCX, PowerPoint | Extracted text, source-based notes, exports and per-slide mapping |
 | Free Office / آفیس رایگان | Text, TXT, Markdown, CSV or TSV to Word, Excel, PowerPoint or PDF |
-| Library | Saved Telegram file references |
+| Library | References to delivered Telegram files |
 | Wallet | Credit, plans and manually reviewed receipts |
 | Support | Persistent support tickets |
 

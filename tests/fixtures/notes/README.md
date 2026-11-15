@@ -3,6 +3,7 @@
 `corpus.json` indexes six curated/synthetic Persian and mixed-language transcript/
 reference pairs. Tests check numbers, terms, tables, tips and unsupported claims
 without provider calls. Keep each pair together; references must not add facts.
+The corpus is synthetic/curated test material, not a live-provider quality claim.
 
 Run from the repository root:
 

@@ -18,7 +18,7 @@ tail -n 80 data/logs/launcher.err
 | Symptom | Fix |
 | --- | --- |
 | `py`/`python` not found | Install Python 3.11–3.13, reopen the shell; on cPanel use the host's interpreter path |
-| PowerShell blocks activation | Call `.\\.venv\\Scripts\\python.exe` directly — no policy change needed |
+| PowerShell blocks activation | Call `.\.venv\Scripts\python.exe` directly — no policy change needed |
 | Missing packages | Reinstall `requirements.txt` with the **same** interpreter |
 | `pip install` fails on `av`/`lxml` | 64-bit Python 3.11–3.13; old cPanel Linux needs CloudLinux/AlmaLinux 8+ |
 | `--check` prints `FAIL` | Fill Telegram credentials, numeric `ADMIN_IDS`, one STT key |
@@ -38,7 +38,7 @@ tail -n 80 data/logs/launcher.err
 | Membership prompt loops | Bot must be a channel **admin**; verify a non-admin account; `SUBSCRIPTION_CHANNEL` must resolve |
 | Members blocked wrongly | Infrastructure errors fail open and alert admins — check those alerts and the bot's admin role |
 | Upload refused | Over `MAX_FILE_SIZE`/`MAX_MEDIA_DURATION_SECONDS`; unmeasurable audio is refused before charging |
-| Transcript arrives, no booklet | No note provider key, or provider/quality failure — the transcription stays charged by design |
+| Results screen offers a transcript but no booklet | No note provider key, or provider/quality failure — the stored transcription stays charged by design |
 ## Providers
 
 | Symptom | Fix |
@@ -59,7 +59,7 @@ tail -n 80 data/logs/launcher.err
 | `error_kind=notes_structure` or only the raw transcript is offered | The final structure did not pass mandatory checks and no safe renderable outline was available. Check whether the source transcript is non-empty and inspect structure-fallback counts |
 | Booklet succeeds but a number is missing | Recall is a repair/completeness signal, not a safety rejection. The safe booklet is delivered as `partial`; inspect the missing-number notice and `note repair` counts |
 | A configured provider was never called | Search `LLM route policy`; `openrouter:blocked_by_unknown` means the source was not classified as shareable, and `blocked_by_sensitivity` means its opt-in flag is false |
-| Provider error has no useful reason | Each failure line ends with `detail=`: HTTP status, error code and request id, reduced to printable ASCII. Provider wording that is not ASCII is dropped on purpose, because it may be echoed lecture text. The user-facing text intentionally keeps class names only |
+| Provider error has no useful reason | Failure lines can include `detail=`: HTTP status, error code and request id, reduced to printable ASCII. Provider wording that is not ASCII is dropped on purpose, because it may be echoed lecture text. The user-facing text intentionally keeps class names only |
 | Job appears stuck in `validating_notes` / `compiling_notes` | Those are real stages, not queue stalls: the note pipeline reports them while it audits evidence and runs the editorial compile. Repair is bounded to two attempts, then the gate decides. `compiling_notes` is only reported when the compile will actually run, so `NOTE_COMPILE=false` never shows it |
 | Speechmatics 403 | Two different causes now read differently: «دسترسی حساب … مجاز نیست» means subscription/permission, «اعتبارنامه را نپذیرفت» means the key itself. Both put the provider on cooldown and fail over to the next `STT_PROVIDERS` entry |
 | Long provider timeouts on a slow free tier | Keep the conservative output budget; adjust `NOTE_REQUEST_TIMEOUT_SECONDS` only with evidence. Dispatch never hedges, even with a stale nonzero hedge setting |

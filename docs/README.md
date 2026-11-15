@@ -38,6 +38,14 @@ examples assume you activated the virtualenv (`source .venv/bin/activate`).
 | [Booklet design](BOOKLET_DESIGN.md) | Design tokens, components, cover artwork, DOCX/PDF pipelines and visual QA |
 | [Changelog](CHANGELOG.md) | Latest release notes |
 
+## Other documentation
+
+- [Audit report](../AUDIT/REPORT.md), [architecture](../AUDIT/architecture.md)
+  and [working notes](../AUDIT/notes.md) are a historical audit, not a current
+  security certification. Its generated evidence logs are not tracked.
+- [Test fixtures](../tests/fixtures/README.md) describes the synthetic corpus
+  and private-audio guidance.
+
 Maintainers also read [AGENTS.md](../AGENTS.md). Settings are defined in
 [`config.py`](../gamas_bot/config.py) and shown with defaults in
 [`.env.example`](../.env.example).

@@ -4,7 +4,9 @@ Copy [`.env.example`](../.env.example) to `.env`; never commit credentials.
 Process variables override the file. Restart after edits: settings load at
 startup. Use `python -m gamas_bot --check` for offline configuration diagnostics.
 See [Providers](PROVIDERS.md) for routing and [Operations](OPERATIONS.md) for
-paths, retention and host sizing.
+paths, retention and host sizing. The default database is `data/gamas_v3.db`;
+set `DB_PATH` if an intentionally different database is required, and include
+that path in backups.
 
 ## Subscription plans
 

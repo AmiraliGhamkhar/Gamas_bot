@@ -7,4 +7,5 @@ Synthetic/curated inputs only; no production files or credentials.
 - [stt/](stt/README.md): private local audio guidance; no committed recordings.
 
 Keep fixtures small and redistributable. Offline tests use fake providers.
-See [test commands](../../docs/TESTING.md) for PowerShell and cPanel/Linux.
+See [test commands](../../docs/TESTING.md) for dependencies and PowerShell and
+cPanel/Linux commands. Run tests from the repository root.
