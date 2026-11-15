@@ -20,7 +20,11 @@ import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
+
+if TYPE_CHECKING:
+    from gamas_bot.config import Settings
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -166,7 +170,53 @@ def check_directory(name: str, directory: Path) -> Result:
     return Result("PASS", name, f"{directory} ({free / 1024**3:.1f} GB free)")
 
 
-def check_settings() -> tuple[list[Result], object | None]:
+def check_temp_download_capacity(
+    settings: Settings, *, free_bytes: int | None = None
+) -> Result:
+    """Reject an upload profile that cannot fit its admitted concurrent downloads.
+
+    The production download path reserves two working copies of the reported
+    input (source plus prepared media) and a free-space floor *per admitted
+    download*; see ``gamas_bot.bot_jobs._download_telegram_media``.  A simple
+    point-in-time ``disk_usage`` check has no cross-task reservation, so preflight
+    deliberately budgets every configured download slot before the bot starts.
+    """
+    largest_upload = max(int(settings.max_file_size), int(settings.doc_max_bytes))
+    slots = max(1, int(settings.max_concurrent_downloads))
+    reserve = max(0, int(settings.temp_min_free_bytes))
+    per_download = largest_upload * 2 + reserve
+    required = slots * per_download
+    try:
+        free = (
+            int(free_bytes)
+            if free_bytes is not None
+            else int(shutil.disk_usage(settings.temp_dir).free)
+        )
+    except OSError as exc:
+        return Result(
+            "FAIL", "Temp download capacity",
+            f"cannot inspect {settings.temp_dir}: {exc}",
+        )
+    if free < required:
+        return Result(
+            "FAIL",
+            "Temp download capacity",
+            f"{settings.temp_dir} has {free / 1024**3:.2f} GiB free but the configured "
+            f"{slots} concurrent download slot(s) require {required / 1024**3:.2f} GiB "
+            f"({largest_upload / 1024**2:.0f} MiB maximum input × two working copies "
+            f"+ {reserve / 1024**2:.0f} MiB reserve per slot). Lower MAX_FILE_SIZE, "
+            "DOC_MAX_BYTES, MAX_CONCURRENT_DOWNLOADS, or TEMP_MIN_FREE_BYTES, or provide "
+            "more free space.",
+        )
+    return Result(
+        "PASS",
+        "Temp download capacity",
+        f"{settings.temp_dir}: {free / 1024**3:.2f} GiB free covers {slots} concurrent "
+        f"download slot(s) requiring {required / 1024**3:.2f} GiB.",
+    )
+
+
+def check_settings() -> tuple[list[Result], Settings | None]:
     from gamas_bot.config import from_env
 
     env_file = ROOT / ".env"
@@ -298,6 +348,7 @@ def run_all(*, network: bool = True) -> list[Result]:
     if settings is not None:
         results.append(check_directory("Data directory", settings.session_path.parent))
         results.append(check_directory("Temp directory", settings.temp_dir))
+        results.append(check_temp_download_capacity(settings))
         results.append(check_private_receipt_directory(settings.receipt_dir))
         results.append(check_lock_support(settings.session_path.parent))
     if network:

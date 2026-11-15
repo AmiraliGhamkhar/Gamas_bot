@@ -83,9 +83,13 @@ converted in-process; `.doc` is not supported — save as `.docx` first.
   exports, the original download and learning actions. Page/section/slide
   locators stay attached.
 - Identical uploads reuse the same user's extraction; caches are owner-scoped.
-- Limits: `DOC_MAX_BYTES=1073741824` (1 GiB), `DOC_UNPACKED_MAX_BYTES=1073741824`
-  expanded archive, 5 000 000 extracted characters, 250 000 characters per
-  note/export source.
+- The code-default ceilings are `DOC_MAX_BYTES=1073741824` (1 GiB) and
+  `DOC_UNPACKED_MAX_BYTES=1073741824`, with 5 000 000 extracted characters and
+  250 000 characters per note/export source. On shared cPanel, deployment must
+  pass `python -m scripts.cpanel_preflight`: the 1 GiB default with two download
+  slots needs 4.125 GiB of *free* temporary space. The documented 1 GiB cPanel
+  profile uses 128 MiB document/input ceilings instead; see
+  [cPanel deployment](CPANEL.md#2-validate).
 - PowerPoint audio is **not** processed on upload. The deck's source card has
   **🎧 پردازش صدای ارائه**; only that button starts narration. Slide text,
   speaker notes and linked clips are supported, and words are mapped to slides
