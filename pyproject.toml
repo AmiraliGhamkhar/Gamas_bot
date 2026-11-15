@@ -42,7 +42,7 @@ dependencies = [
     # stack as python-docx and python-pptx; no office suite is required).
     "openpyxl>=3.1,<4.0",
     # Bounded image decoding and canonical re-encoding for uploaded receipts.
-    "Pillow>=10.0,<13.0",
+    "Pillow>=13.0,<14.0",
     # XML rewriting of OOXML parts.
     "lxml>=6.1,<7.0",
     # PDF text extraction for uploaded study documents (pure Python, no poppler
