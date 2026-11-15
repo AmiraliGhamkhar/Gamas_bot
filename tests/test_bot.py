@@ -768,21 +768,21 @@ class NoteGenerationDeliveryTests(BotPipelineTestCase):
         docx = await self.db.binary_artifact(submission, USER_ID, "docx")
         assert pdf is not None and docx is not None
         self.assertTrue(bytes(pdf["content"]).startswith(b"%PDF-"))
-        # The unsupported fixture title is replaced at final acceptance, while
-        # its source-preserving booklet is still rendered and persisted.
-        self.assertIn("جزوهٔ سلام دوستان", docx_text(bytes(docx["content"])))
+        # Under direct scientific mode (note_strict_grounding=False default),
+        # the LLM's structured title and content are preserved directly.
+        self.assertIn("جزوهٔ آزمون", docx_text(bytes(docx["content"])))
         # The transcript button replays the recognised speech, and the key-point
         # button reads the persisted notes — no model call for either.
         self.assertIn(
             "سلام دوستان. امروز درس شبکه است.", await self.fetch_transcript(submission)
         )
         keypoints = await self.bot.db.transcription(submission)
-        self.assertIn("سلام دوستان", str((keypoints or {}).get("notes_json")))
+        self.assertIn("جزوهٔ آزمون", str((keypoints or {}).get("notes_json")))
         self.assertTrue(any("/chat/completions" in call["url"] for call in session.llm_calls))
 
         row = await self.db.submission(submission)
         assert row is not None
-        self.assertEqual(row.status, "partial")
+        self.assertEqual(row.status, "done")
         rows = await self.db.db.execute_fetchall(
             "SELECT COALESCE(SUM(seconds), 0), COUNT(*) FROM ledger "
             "WHERE user_id = ? AND kind = 'debit'",
@@ -1084,7 +1084,7 @@ class PresentationPromptTests(BotPipelineTestCase):
         self.assertIn("امروز درباره", user_content)
         row = await self.db.submission(submission)
         assert row is not None
-        self.assertEqual(row.status, "partial")
+        self.assertEqual(row.status, "done")
         self.assertAlmostEqual(row.duration_seconds, 10.0, delta=0.01)
         charges = await self.db.db.execute_fetchall(
             "SELECT seconds FROM ledger WHERE user_id = ? AND kind = 'debit' AND note = ?",

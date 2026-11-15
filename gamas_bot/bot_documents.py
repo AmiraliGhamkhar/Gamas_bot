@@ -55,6 +55,7 @@ from .docx_export import (
     DocumentMeta,
     build_notes_docx,
     build_plain_docx,
+    notes_docx_filename,
     resolve_design,
     resolve_fonts,
 )
@@ -64,6 +65,7 @@ from .jobs import Job
 from .learning import MAX_MODEL_INPUT_CHARS, SIZE_PRESETS, bound_content_text, preset_cards
 from .media import MediaToolError, convert_to_pptx
 from .notes import StructuringError
+from .notes_pdf import build_notes_pdf, notes_pdf_filename
 from .review_sheet import generate_review_sheet
 from .office import (
     FORMAT_LABELS,
@@ -82,6 +84,7 @@ from .office import (
 from .office_ai import MAX_DECK_CHUNK_CHARS, infer_table, plan_deck
 from .office_notes import (
     MAX_OFFICE_NOTE_SOURCE_CHARS,
+    OfficeSourceChunk,
     generate_compact_notes,
     generate_full_booklet,
     office_source_chunks,
@@ -378,6 +381,12 @@ class DocumentOfficeWorkflowMixin:
     @staticmethod
     def _office_format_keyboard() -> list[list]:
         return [
+            [
+                Button.inline(
+                    "🎓 جزوهٔ علمی کامل (PDF + Word + HTML)",
+                    b"office:fmt:booklet",
+                )
+            ],
             [
                 Button.inline("📝 Word", b"office:fmt:word"),
                 Button.inline("📊 Excel", b"office:fmt:excel"),
@@ -1178,19 +1187,27 @@ class DocumentOfficeWorkflowMixin:
             await progress.update(
                 self.OFFICE_BUILD_PERCENT - 10,
                 "ساخت فایل‌های Word و PDF",
-                "خروجی‌ها با همان مکان‌یاب‌های سند ساخته می‌شوند…",
+                "خروجی‌های گرافیکی جزوه آماده می‌شوند…",
             )
-            pdf_document = await run_file_io(
-                build_office_document,
-                markdown,
-                title=title,
-            )
-            pdf_payload = await run_file_io(
-                build_office_pdf,
-                pdf_document,
-                meta=meta,
-                mode_label=mode_label,
-            )
+            if mode == "full" and full_notes is not None:
+                pdf_payload = await run_file_io(
+                    build_notes_pdf,
+                    full_notes,
+                    meta=meta,
+                    engine=getattr(self.settings, "note_pdf_engine", "typst"),
+                )
+            else:
+                pdf_document = await run_file_io(
+                    build_office_document,
+                    markdown,
+                    title=title,
+                )
+                pdf_payload = await run_file_io(
+                    build_office_pdf,
+                    pdf_document,
+                    meta=meta,
+                    mode_label=mode_label,
+                )
             # The interactive review sheet is only derived from a completed AI
             # booklet. The deterministic source fallback is never planned again,
             # and a failure here must not cost the Word and PDF files above.
@@ -1748,6 +1765,114 @@ class DocumentOfficeWorkflowMixin:
                 exc_info=True,
             )
 
+    async def _run_office_session_booklet(
+        self, event: Any, user_id: int
+    ) -> None:
+        """Build a full scientific booklet (PDF + Word + HTML) from a Free Office text session."""
+        session = self._office_get_session(user_id)
+        if session is None or not session.text.strip():
+            await self._ack(  # type: ignore[attr-defined]
+                event, "ابتدا متن یا یک فایل متنی به آفیس رایگان بفرستید.", alert=True
+            )
+            return
+        raw_text = session.text.strip()
+        title = (session.title or "").strip() or short_title(
+            raw_text.splitlines()[0], fallback=FALLBACK_BOOKLET
+        )
+        reference = f"OFF-BK-{secrets.token_hex(3).upper()}"
+        meta = DocumentMeta(
+            reference=reference,
+            source_name=session.filename or title,
+            created_at=datetime.now(),
+        )
+        chunks = [OfficeSourceChunk(text=raw_text, locators=())]
+
+        async def build(_workdir: Path, progress: WorkProgress) -> list[Any]:
+            await progress.update(
+                20,
+                "تحلیل و ساختاردهی علمی متن",
+                "تبدیل متن خام به جزوهٔ علمی دسته‌بندی‌شده…",
+            )
+            notes, fallback_used = await generate_full_booklet(
+                chunks,
+                title=title,
+                settings=self.settings,
+                session=(
+                    self._http_session()  # type: ignore[attr-defined]
+                    if self.settings.note_configured
+                    else None
+                ),
+            )
+            resolved_title = notes.display_title or title
+            await progress.update(
+                self.OFFICE_BUILD_PERCENT - 12,
+                "ساخت فایل‌های گرافیکی PDF و Word",
+            )
+            pdf_payload = await run_file_io(
+                build_notes_pdf,
+                notes,
+                meta=meta,
+                engine=getattr(self.settings, "note_pdf_engine", "typst"),
+            )
+            word_payload = await run_file_io(
+                build_notes_docx,
+                notes,
+                fonts=resolve_fonts(),
+                design=resolve_design(),
+                meta=meta,
+            )
+            review_output: tuple[str, bytes, str, str] | None = None
+            if not fallback_used:
+                try:
+                    review_file = await generate_review_sheet(
+                        notes,
+                        self.settings,
+                        self._http_session() if self.settings.note_configured else None,  # type: ignore[attr-defined]
+                        reference=reference,
+                        announce=lambda label: progress.update(
+                            self.OFFICE_BUILD_PERCENT - 5, label
+                        ),
+                    )
+                except Exception:
+                    review_file = None
+                    logger.exception("office booklet review HTML failed")
+                if review_file is not None:
+                    review_output = (
+                        review_file.filename,
+                        review_file.content,
+                        f"🌐 مرور تعاملی — HTML | {resolved_title}",
+                        f"{short_title(resolved_title, fallback=FALLBACK_BOOKLET, max_words=2)} — مرور HTML",
+                    )
+            base_title = short_title(resolved_title, fallback=FALLBACK_BOOKLET, max_words=2)
+            outputs: list[Any] = [
+                (
+                    notes_pdf_filename(notes, reference),
+                    pdf_payload,
+                    f"📕 جزوهٔ علمی کامل — PDF | {resolved_title}",
+                    f"{base_title} — جزوه PDF",
+                ),
+                (
+                    notes_docx_filename(notes, reference),
+                    word_payload,
+                    f"📘 جزوهٔ علمی کامل — Word | {resolved_title}",
+                    f"{base_title} — جزوه Word",
+                ),
+            ]
+            if review_output is not None:
+                outputs.append(review_output)
+            return outputs
+
+        await self._office_run_operation(
+            event,
+            user_id,
+            stage="تبدیل متن خام به جزوهٔ علمی کامل (PDF + Word + HTML)",
+            success_text=(
+                "✅ جزوهٔ علمی کامل شما ساخته شد و فایل‌های آن در کتابخانه ذخیره شدند."
+            ),
+            buttons=self._office_format_keyboard(),
+            operation=build,
+        )
+
     async def _route_office_callback(
         self, event: Any, user_id: int, data: str
     ) -> None:
@@ -1789,6 +1914,9 @@ class DocumentOfficeWorkflowMixin:
                 "پیش‌نویس آفیس رایگان پاک شد. فایل‌های خروجیِ قبلی در کتابخانه می‌مانند.",
                 self._user_menu(is_admin=self._is_admin(user_id)),  # type: ignore[attr-defined]
             )
+            return
+        if action == "fmt" and len(parts) == 3 and parts[2] == "booklet":
+            await self._run_office_session_booklet(event, user_id)
             return
         if action == "fmt" and len(parts) == 3 and parts[2] in OFFICE_FORMATS:
             await self._run_office_session_export(event, user_id, parts[2])

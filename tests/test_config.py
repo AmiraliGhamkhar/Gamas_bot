@@ -10,7 +10,6 @@ from gamas_bot.config import (
     DEEPGRAM_PERSIAN_MODELS,
     DEFAULT_DEEPGRAM_MODEL,
     DEFAULT_GEMINI_MODEL,
-    DEFAULT_GEMINI_THINKING_BUDGET,
     DEFAULT_GEMINI_THINKING_LEVEL,
     DEFAULT_NOTE_CHUNK_CHARS,
     DEFAULT_NOTE_CONTEXT_TOKENS,
@@ -471,20 +470,20 @@ class GeminiConfigurationTests(unittest.TestCase):
     def test_model_and_thinking_settings_remain_configurable(self):
         default = self.settings(GEMINI_API_KEY="g")
         self.assertEqual(default.gemini_model, DEFAULT_GEMINI_MODEL)
-        self.assertEqual(default.gemini_thinking_budget, DEFAULT_GEMINI_THINKING_BUDGET)
         self.assertEqual(default.gemini_thinking_level, DEFAULT_GEMINI_THINKING_LEVEL)
-        self.assertEqual(DEFAULT_GEMINI_THINKING_BUDGET, 0)
+        self.assertFalse(hasattr(default, "gemini_thinking_budget"))
         settings = self.settings(
             GEMINI_API_KEY="g", GEMINI_MODEL="synthetic-gemini-model",
-            NOTE_GEMINI_THINKING_BUDGET="24576",
+            NOTE_GEMINI_THINKING_LEVEL="high",
         )
-        self.assertEqual(settings.gemini_thinking_budget, 24576)
+        self.assertEqual(settings.gemini_thinking_level, "high")
         self.assertEqual(note_slot_credentials(settings, "gemini"), ("g", "", "synthetic-gemini-model"))
 
-    def test_thinking_budget_accepts_minus_one_and_stays_bounded(self):
-        for raw, expected in (("-1", -1), ("-5", -1), ("999999", 32768)):
-            with self.subTest(raw=raw):
-                self.assertEqual(self.settings(NOTE_GEMINI_THINKING_BUDGET=raw).gemini_thinking_budget, expected)
+    def test_legacy_thinking_budget_env_is_ignored_with_warning(self):
+        with self.assertLogs("gamas_bot.config", level="WARNING") as logs:
+            settings = self.settings(GEMINI_API_KEY="g", NOTE_GEMINI_THINKING_BUDGET="24576")
+        self.assertEqual(settings.gemini_thinking_level, DEFAULT_GEMINI_THINKING_LEVEL)
+        self.assertTrue(any("NOTE_GEMINI_THINKING_BUDGET" in line for line in logs.output))
 
     def test_gemini_3_thinking_level_is_enum_validated(self):
         self.assertEqual(

@@ -66,19 +66,30 @@ def normalize(text: str) -> str:
 
     folded = unicodedata.normalize("NFKC", text)
     dropped = "\u200c\u0640" + "".join(chr(cp) for cp in range(0x064B, 0x0660))
-    return folded.translate(str.maketrans(dict.fromkeys(dropped)))
+    # PyMuPDF reverses the HarfBuzz lam-alef (لا) GSUB ligature on RTL
+    # extraction (e.g. «خلاصه» -> «خالصه»); fold both sides identically.
+    return folded.translate(str.maketrans(dict.fromkeys(dropped))).replace("لا", "ال")
+
+
+def _extract_pages(payload: bytes) -> list[str]:
+    try:
+        import pymupdf
+
+        document = pymupdf.open(stream=payload, filetype="pdf")
+        try:
+            return [document.load_page(i).get_text() for i in range(document.page_count)]
+        finally:
+            document.close()
+    except ImportError:
+        return [page.extract_text() or "" for page in PdfReader(io.BytesIO(payload)).pages]
 
 
 def pdf_text(payload: bytes) -> str:
-    pages = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(payload)).pages)
-    return normalize(pages)
+    return normalize("\n".join(_extract_pages(payload)))
 
 
 def pdf_pages(payload: bytes) -> list[str]:
-    return [
-        normalize(page.extract_text() or "")
-        for page in PdfReader(io.BytesIO(payload)).pages
-    ]
+    return [normalize(page) for page in _extract_pages(payload)]
 
 
 def case_a() -> StructuredNotes:
@@ -267,8 +278,8 @@ class BookletRenderingTests(unittest.TestCase):
         docx, pdf, text, quality = self.assert_clean(case_a(), "A")
         self.assertGreaterEqual(quality.pages, 2)
         self.assertLessEqual(quality.pages, 5)
-        self.assertIn("خلاصه", text)
-        self.assertIn("فشار خون", text)
+        self.assertIn(normalize("خلاصه"), text)
+        self.assertIn(normalize("فشار خون"), text)
         self.assertGreaterEqual(inspect_docx(docx).media, 2, "cover artwork missing")
         self.assertIn("صفحه", text)
 

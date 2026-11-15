@@ -301,6 +301,12 @@ def build_review_planning_document(
             heading = notes.sections[current - 1].heading
             lines.append(f"## بخش {current}: {' '.join(heading.split())}")
         lines.append(f"{unit.ref} | {unit.text}")
+    if notes.practice_questions:
+        lines.append("")
+        lines.append("پرسش‌ها و پاسخ‌های پیشنهادی درس:")
+        for idx, qa in enumerate(notes.practice_questions[:MAX_SELF_TEST_QUESTIONS], start=1):
+            answer_part = f" | پاسخ: {qa.answer}" if qa.answer else ""
+            lines.append(f"Q{idx}: {qa.question}{answer_part}")
     return "\n".join(lines)
 
 
@@ -585,6 +591,17 @@ def parse_review_plan(
             questions.append(ReviewQuestion(question, answer, evidence))
         else:
             capacity_dropped += 1
+    if len(questions) < MIN_SELF_TEST_QUESTIONS and notes.practice_questions and catalog:
+        fallback_ref = next(iter(catalog))
+        existing_qs = {q.question for q in questions}
+        for qa in notes.practice_questions:
+            if len(questions) >= MAX_SELF_TEST_QUESTIONS:
+                break
+            q_text = _bounded(qa.question, _ITEM_TEXT_LIMITS["question"])
+            a_text = _bounded(qa.answer, _ITEM_TEXT_LIMITS["answer"])
+            if q_text and a_text and q_text not in existing_qs:
+                existing_qs.add(q_text)
+                questions.append(ReviewQuestion(q_text, a_text, (fallback_ref,)))
     if len(questions) < MIN_SELF_TEST_QUESTIONS:
         return None
 

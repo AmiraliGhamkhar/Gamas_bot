@@ -55,7 +55,7 @@ from .document import components as design
 from .document.assets import booklet_text, topic_for
 from .document.assets import optional as optional_asset
 from .document.layout import pdf_frame
-from .document.rtl import visual, visual_ltr, wrap_logical
+from .document.rtl import strip_emphasis_markers, visual, visual_ltr, wrap_logical
 from .document.theme import THEME
 from .docx_export import DocumentMeta
 from .notes import NoteSection, NoteTable, StructuredNotes
@@ -125,7 +125,8 @@ def _rtl(
     would place a leading bullet at the visual left edge, because BiDi treats
     it as a neutral character and the paragraph is RTL.
     """
-    lines = wrap_logical(text or "", _measure(style.fontName, style.fontSize), width)
+    cleaned = strip_emphasis_markers(text or "")
+    lines = wrap_logical(cleaned, _measure(style.fontName, style.fontSize), width)
     shaped = []
     for line in lines:
         rendered = _xml_escape(visual(line))
@@ -135,14 +136,16 @@ def _rtl(
 
 def _ltr(text: str, style: ParagraphStyle, width: float) -> Paragraph:
     """A left-to-right paragraph (formulas, Latin-only technical lines)."""
-    lines = wrap_logical(text or "", _measure(style.fontName, style.fontSize), width)
+    cleaned = strip_emphasis_markers(text or "")
+    lines = wrap_logical(cleaned, _measure(style.fontName, style.fontSize), width)
     body = "<br/>".join(_xml_escape(visual_ltr(line)) for line in lines) or " "
     return Paragraph(body, style)
 
 
 def _mixed(text: str, style: ParagraphStyle, width: float) -> Paragraph:
     """Shape Persian, keep pure-Latin lines LTR (used for glossary terms)."""
-    lines = wrap_logical(text or "", _measure(style.fontName, style.fontSize), width)
+    cleaned = strip_emphasis_markers(text or "")
+    lines = wrap_logical(cleaned, _measure(style.fontName, style.fontSize), width)
     shaped = []
     for line in lines:
         latin_only = all(ord(char) < 0x0590 for char in line)
@@ -754,6 +757,24 @@ def _body_flowables(notes: StructuredNotes, styles) -> list[Flowable]:
             out.append(Spacer(1, 5))
             out.append(_tip_card(tip.kind, tip.text, styles))
 
+    if notes.practice_questions:
+        out.append(KeepTogether([
+            Spacer(1, SPACE.section),
+            *_display_heading(design.LABELS["practice_questions"], styles),
+        ]))
+        for index, qa in enumerate(notes.practice_questions, start=1):
+            label = f"پرسش {to_persian_digits(index)}"
+            if qa.kind:
+                label = f"{label} ({qa.kind})"
+            rows = [
+                _rtl(label, styles["card_label"], _FRAME_W - 26),
+                _rtl(qa.question, styles["card_term"], _FRAME_W - 26),
+            ]
+            if qa.answer:
+                rows.append(_rtl(f"پاسخ: {qa.answer}", styles["card_body"], _FRAME_W - 26))
+            out.append(Spacer(1, 5))
+            out.append(_card(design.PRACTICE_QA, rows, width=_FRAME_W))
+
     if notes.review_questions:
         out.append(KeepTogether([Spacer(1, SPACE.section),
                                  *_display_heading(design.LABELS["review"], styles)]))
@@ -785,7 +806,7 @@ def _body_flowables(notes: StructuredNotes, styles) -> list[Flowable]:
 
 
 def _cover_flowables(
-    notes: StructuredNotes, meta: DocumentMeta, styles, *,
+    notes: StructuredNotes, meta: DocumentMeta | None, styles, *,
     duration_seconds: int | None, session_number: int | None,
 ) -> list[Flowable]:
     # Audio duration and session/job labels remain operational data. They are
@@ -850,7 +871,7 @@ def _cover_flowables(
 QUOTE_TEXT = "دانش اگر در ثریا باشد مردمی از سرزمین پارس به آن دست خواهند یافت"
 
 
-def _final_flowables(meta: DocumentMeta, styles) -> list[Flowable]:
+def _final_flowables(meta: DocumentMeta | None, styles) -> list[Flowable]:
     """No processing appendix: the educational final review is the booklet ending."""
     _ = (meta, styles)
     return []
@@ -958,18 +979,14 @@ def _page_furniture(title: str):
 # ---------------------------------------------------------------------------
 
 
-def build_notes_pdf(
+def _build_notes_pdf_reportlab(
     notes: StructuredNotes,
     *,
-    meta: DocumentMeta,
+    meta: DocumentMeta | None = None,
     duration_seconds: int | None = None,
     session_number: int | None = None,
 ) -> bytes:
-    """Render validated structured notes as the Gamas PDF booklet.
-
-    Deterministic: invariant canvas, no wall clock beyond ``meta.created_at``,
-    and the same notes always yield the same bytes.
-    """
+    """Render validated structured notes via the legacy ReportLab backend."""
     styles = _styles()
     title = notes.display_title or "جزوهٔ کلاس"
     register_fonts()
@@ -995,6 +1012,49 @@ def build_notes_pdf(
     document.addPageTemplates([template])
     document.build(story, canvasmaker=_InvariantCanvas)
     return buffer.getvalue()
+
+
+def build_notes_pdf(
+    notes: StructuredNotes,
+    *,
+    meta: DocumentMeta | None = None,
+    duration_seconds: int | None = None,
+    session_number: int | None = None,
+    engine: str = "typst",
+) -> bytes:
+    """Render validated structured notes as the Gamas PDF booklet.
+
+    Uses the modern self-contained ``typst`` engine by default (native HarfBuzz
+    RTL shaping, clickable page-numbered Table of Contents, highlighted
+    professor emphasis, multi-page comparative tables) and automatically falls
+    back to ReportLab if ``engine="reportlab"`` or if Typst is unavailable or
+    raises an error.
+
+    Deterministic: the same notes always yield identical bytes.
+    """
+    resolved_engine = (engine or "typst").strip().lower()
+    if resolved_engine == "typst":
+        from .notes_typst import build_notes_pdf_typst, typst_available
+
+        if typst_available():
+            try:
+                return build_notes_pdf_typst(
+                    notes,
+                    meta=meta,
+                    duration_seconds=duration_seconds,
+                    session_number=session_number,
+                )
+            except Exception:  # noqa: BLE001 - graceful automatic fallback
+                logger.warning(
+                    "Typst PDF rendering failed; falling back to ReportLab",
+                    exc_info=True,
+                )
+    return _build_notes_pdf_reportlab(
+        notes,
+        meta=meta,
+        duration_seconds=duration_seconds,
+        session_number=session_number,
+    )
 
 
 def notes_pdf_filename(notes: StructuredNotes, reference: str) -> str:

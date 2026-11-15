@@ -26,8 +26,12 @@ from gamas_bot.learning import (
 )
 from gamas_bot.llm import extract_json_object
 from gamas_bot.llm_profiles import (
+    MODEL_PROFILES,
+    ModelCapabilityProfile,
+    get_model_profile,
+    normalize_model_id,
+    register_model_profile,
     to_gemini_response_format_schema,
-    to_gemini_schema,
     to_strict_openai_json_schema,
 )
 from gamas_bot.notes import (
@@ -239,7 +243,70 @@ class ApprovedRoutingEntryPointTests(unittest.IsolatedAsyncioTestCase):
 class ProviderDialectContractTests(unittest.TestCase):
     """Approved Gemini, AvalAI and OpenRouter contracts; all HTTP is scripted."""
 
-    def test_gemini_schema_preserves_required_strips_additional_properties_and_handles_nullable(self) -> None:
+    def test_model_profiles_registry_contains_strictly_the_three_active_models(self) -> None:
+        self.assertEqual(
+            set(MODEL_PROFILES.keys()),
+            {
+                "gemini-3.5-flash-lite",
+                "deepseek-v4.1-flash",
+                "nvidia/nemotron-3.5-super-vl:free",
+            },
+        )
+        gem = get_model_profile("gemini-3.5-flash-lite", provider_slug="gemini")
+        self.assertEqual((gem.context_window, gem.max_output_tokens), (1_048_576, 65_536))
+        self.assertFalse(gem.send_sampling_params)
+        self.assertEqual(gem.gemini_response_format_style, "response_format")
+        self.assertEqual(gem.gemini_thinking_style, "thinking_level")
+
+        av = get_model_profile("deepseek-v4.1-flash", provider_slug="avalai")
+        self.assertEqual((av.context_window, av.max_output_tokens), (1_000_000, 393_216))
+        self.assertEqual(av.reasoning_param_style, "none")
+        self.assertEqual(av.structured_output_mode, "json_schema")
+        self.assertTrue(av.supports_prompt_caching)
+
+        or_m = get_model_profile("nvidia/nemotron-3.5-super-vl:free", provider_slug="openrouter")
+        self.assertEqual((or_m.context_window, or_m.max_output_tokens), (1_000_000, 131_072))
+        self.assertEqual(or_m.reasoning_param_style, "openrouter_reasoning")
+        self.assertEqual(or_m.structured_output_mode, "json_object")
+
+    def test_register_model_profile_extends_wire_behavior_without_editing_llm(self) -> None:
+        custom_id = "vendor/future-reasoning-model"
+        try:
+            register_model_profile(
+                ModelCapabilityProfile(
+                    model_id=custom_id,
+                    provider_slug="avalai",
+                    context_window=256_000,
+                    max_output_tokens=8_192,
+                    supports_system_prompt=False,
+                    send_sampling_params=False,
+                    reasoning_param_style="reasoning_effort",
+                    structured_output_mode="json_object",
+                )
+            )
+            settings = make_settings(
+                note_providers=("avalai",),
+                avalai_api_key="av-test",
+                avalai_model=custom_id,
+                note_max_output_tokens=32_768,
+                note_reasoning_effort="medium",
+                note_structured_output=True,
+            )
+            route = note_routes(settings)[0]
+            _url, _headers, payload = llm._build_request_for(
+                route, settings, "SYS", "USER", schema=QUIZ_SCHEMA
+            )
+            self.assertEqual(payload["max_tokens"], 8_192)
+            self.assertNotIn("temperature", payload)
+            self.assertEqual(payload["reasoning_effort"], "medium")
+            self.assertEqual(payload["response_format"], {"type": "json_object"})
+            self.assertEqual(len(payload["messages"]), 1)
+            self.assertEqual(payload["messages"][0]["role"], "user")
+            self.assertIn("SYS", payload["messages"][0]["content"])
+        finally:
+            MODEL_PROFILES.pop(normalize_model_id(custom_id), None)
+
+    def test_gemini_response_format_schema_keeps_json_schema_type_dialect(self) -> None:
         raw = {
             "type": "object",
             "properties": {
@@ -250,25 +317,6 @@ class ProviderDialectContractTests(unittest.TestCase):
                     "maxItems": 8,
                     "items": {"type": "string"},
                 },
-            },
-            "required": ["title", "nonexistent"],
-            "additionalProperties": False,
-        }
-        converted = to_gemini_schema(raw)
-        self.assertEqual(converted["type"], "OBJECT")
-        self.assertNotIn("additionalProperties", converted)
-        self.assertEqual(converted["required"], ["title"])
-        self.assertEqual(converted["properties"]["title"]["type"], "STRING")
-        self.assertTrue(converted["properties"]["title"]["nullable"])
-        self.assertNotIn("pattern", converted["properties"]["title"])
-        self.assertNotIn("minItems", converted["properties"]["items"])
-        self.assertNotIn("maxItems", converted["properties"]["items"])
-
-    def test_gemini_response_format_schema_keeps_json_schema_type_dialect(self) -> None:
-        raw = {
-            "type": "object",
-            "properties": {
-                "title": {"type": ["string", "null"]},
                 "ignored": {"type": "boolean"},
             },
             "required": ["title", "missing"],
@@ -277,6 +325,9 @@ class ProviderDialectContractTests(unittest.TestCase):
         converted = to_gemini_response_format_schema(raw)
         self.assertEqual(converted["type"], "object")
         self.assertEqual(converted["properties"]["title"]["type"], ["string", "null"])
+        self.assertNotIn("pattern", converted["properties"]["title"])
+        self.assertNotIn("minItems", converted["properties"]["items"])
+        self.assertNotIn("maxItems", converted["properties"]["items"])
         self.assertEqual(converted["required"], ["title"])
         self.assertNotIn("additionalProperties", converted)
 
@@ -358,19 +409,31 @@ class ProviderDialectContractTests(unittest.TestCase):
         free_settings = make_settings(
             note_providers=("openrouter",),
             openrouter_api_key="or-key",
-            openrouter_model="google/gemma-4-31b-it:free",
+            openrouter_model="nvidia/nemotron-3.5-super-vl:free",
             note_structured_output=True,
+            note_reasoning_effort="low",
         )
         free_route = note_routes(free_settings)[0]
         _u, _h, free_payload = llm._build_request_for(
             free_route, free_settings, "S", "U", schema=QUIZ_SCHEMA
         )
         self.assertEqual(free_payload["response_format"], {"type": "json_object"})
+        self.assertEqual(free_payload["reasoning"], {"effort": "low", "exclude": True})
+
+        # Rejection of unified ``reasoning`` (e.g. mandatory reasoning or 404 filter)
+        # removes only ``reasoning`` cleanly.
+        mandatory_payload = copy.deepcopy(free_payload)
+        adj_mandatory = llm._adjust_rejected_request_param(
+            mandatory_payload,
+            "HTTP 400: Reasoning is mandatory for this endpoint and cannot be disabled.",
+        )
+        self.assertEqual(adj_mandatory, "reasoning")
+        self.assertNotIn("reasoning", mandatory_payload)
 
         paid_settings = make_settings(
             note_providers=("openrouter",),
             openrouter_api_key="or-key",
-            openrouter_model="google/gemini-2.5-flash",
+            openrouter_model="nvidia/nemotron-3.5-super-vl",
             note_structured_output=True,
         )
         paid_route = note_routes(paid_settings)[0]
@@ -384,6 +447,39 @@ class ProviderDialectContractTests(unittest.TestCase):
         )
         self.assertEqual(adj1, "response_format.json_schema_to_json_object")
         self.assertEqual(paid_payload["response_format"], {"type": "json_object"})
+
+    def test_openrouter_reasoning_details_and_cached_usage_are_detected(self) -> None:
+        exhausted = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_details": [{"type": "reasoning.text", "text": "thinking..."}],
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 500,
+                "prompt_tokens_details": {"cached_tokens": 300},
+                "completion_tokens": 200,
+                "completion_tokens_details": {"reasoning_tokens": 200},
+                "total_tokens": 700,
+            },
+        }
+        with self.assertRaises(llm.LLMOutputBudgetError):
+            llm._parse_response(exhausted, "openai")
+        self.assertEqual(llm._usage_detail_counts(exhausted, "openai"), (300, 200))
+
+        avalai_cached = {
+            "usage": {
+                "prompt_tokens": 1000,
+                "prompt_cache_hit_tokens": 800,
+                "completion_tokens": 100,
+                "total_tokens": 1100,
+            }
+        }
+        self.assertEqual(llm._usage_detail_counts(avalai_cached, "openai"), (800, None))
 
     def test_explicit_numeric_output_cap_error_clamps_budget(self) -> None:
         payload = {"model": "x", "max_tokens": 16_384}

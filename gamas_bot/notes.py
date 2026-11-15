@@ -107,7 +107,8 @@ logger = logging.getLogger(__name__)
 MAX_TITLE_CHARS = 200
 MAX_TEXT_CHARS = 20000
 MAX_SOURCE_LOCATORS_PER_SECTION = 100
-VALID_CALLOUT_KINDS = ("نکته", "هشدار", "یادآوری")
+VALID_CALLOUT_KINDS = ("نکته", "هشدار", "یادآوری", "تأکید استاد")
+PRACTICE_QUESTION_KINDS = ("مفهومی", "آزمونی", "تشریحی", "محاسباتی")
 
 # These fields belong to transcription/operational records, never to the
 # educational booklet contract.  Keeping the deny-list next to the canonical
@@ -674,6 +675,31 @@ class GlossaryEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class PracticeQuestion:
+    """A course-related study question paired with a concise scientific answer."""
+
+    question: str
+    answer: str = ""
+    kind: str = ""
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "PracticeQuestion | None":
+        if isinstance(payload, str):
+            text = _bounded_text(payload)
+            return cls(text) if text else None
+        if not isinstance(payload, dict):
+            return None
+        question = _bounded_text(payload.get("question") or payload.get("q"))
+        if not question:
+            return None
+        answer = _bounded_text(payload.get("answer") or payload.get("a"))
+        kind = _bounded_text(payload.get("kind"), 24)
+        if kind and kind not in PRACTICE_QUESTION_KINDS:
+            kind = ""
+        return cls(question=question, answer=answer, kind=kind)
+
+
+@dataclass(frozen=True, slots=True)
 class StructuredNotes:
     """The validated note structure the LLM must produce as strict JSON."""
 
@@ -686,6 +712,8 @@ class StructuredNotes:
     note_mode: str = "full"
     learning_objectives: tuple[str, ...] = ()
     review_questions: tuple[str, ...] = ()
+    #: Course-related practice/exam questions paired with concise answers.
+    practice_questions: tuple[PracticeQuestion, ...] = ()
     #: The lecturer's own practical advice, surfaced with its source basis.
     practical_tips: tuple[PracticalTip, ...] = ()
     #: Only source-supported pitfalls belong here; this is never a generic
@@ -712,6 +740,7 @@ class StructuredNotes:
             or self.glossary
             or self.learning_objectives
             or self.review_questions
+            or self.practice_questions
             or self.practical_tips
             or self.common_mistakes
             or self.final_review
@@ -764,6 +793,10 @@ class StructuredNotes:
                 for tip in self.practical_tips
             ],
             "key_points": list(self.key_points),
+            "practice_questions": [
+                {"question": item.question, "answer": item.answer, "kind": item.kind}
+                for item in self.practice_questions
+            ],
             "review_questions": list(self.review_questions),
             "common_mistakes": list(self.common_mistakes),
             "final_review": list(self.final_review),
@@ -835,6 +868,13 @@ class StructuredNotes:
         if self.practical_tips:
             parts.append("## نکته‌های کاربردی")
             parts.extend(f"- **{tip.kind}:** {tip.text}" for tip in self.practical_tips)
+        if self.practice_questions:
+            parts.append("## پرسش‌ها و تمرین‌های درس")
+            for index, qa in enumerate(self.practice_questions, start=1):
+                prefix = f" ({qa.kind})" if qa.kind else ""
+                parts.append(f"{index}.{prefix} {qa.question}")
+                if qa.answer:
+                    parts.append(f"پاسخ: {qa.answer}")
         if self.review_questions:
             parts.append("## پرسش‌های مرور")
             parts.extend(
@@ -898,6 +938,24 @@ class StructuredNotes:
                 ),
             )
         )
+        raw_practice = payload.get("practice_questions")
+        practice_list: list[PracticeQuestion] = [
+            parsed
+            for item in (raw_practice if isinstance(raw_practice, (list, tuple)) else [])
+            if (parsed := PracticeQuestion.from_payload(item)) is not None
+        ]
+        raw_review = payload.get("review_questions")
+        review_list: list[str] = []
+        if isinstance(raw_review, (list, tuple)):
+            for item in raw_review:
+                if isinstance(item, dict):
+                    parsed_q = PracticeQuestion.from_payload(item)
+                    if parsed_q is not None:
+                        practice_list.append(parsed_q)
+                else:
+                    cleaned = _bounded_text(item)
+                    if cleaned:
+                        review_list.append(cleaned)
         notes = cls(
             title=_bounded_text(payload.get("title"), MAX_TITLE_CHARS),
             subtitle=_bounded_text(payload.get("subtitle"), MAX_TITLE_CHARS),
@@ -907,7 +965,8 @@ class StructuredNotes:
             glossary=glossary,
             note_mode=note_mode,
             learning_objectives=tuple(_string_list(payload.get("learning_objectives"))),
-            review_questions=tuple(_string_list(payload.get("review_questions"))),
+            review_questions=tuple(review_list),
+            practice_questions=tuple(practice_list),
             practical_tips=practical_tips,
             common_mistakes=tuple(_string_list(payload.get("common_mistakes"))),
             final_review=tuple(_string_list(payload.get("final_review"))),
@@ -1213,6 +1272,18 @@ def notes_response_schema() -> dict:
                 },
             },
             "key_points": text_array,
+            "practice_questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string"},
+                        "answer": {"type": "string"},
+                        "kind": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
             "review_questions": text_array,
             "common_mistakes": text_array,
             "final_review": text_array,
@@ -1467,8 +1538,33 @@ def _dedupe_glossary(notes: list[StructuredNotes]) -> tuple[GlossaryEntry, ...]:
                 by_term[key] = entry
                 term_order.append(key)
             elif len(entry.definition) > len(by_term[key].definition):
-                by_term[key] = GlossaryEntry(entry.term, entry.definition)
+                by_term[key] = GlossaryEntry(
+                    entry.term, entry.definition, entry.term_en or by_term[key].term_en
+                )
+            elif entry.term_en and not by_term[key].term_en:
+                by_term[key] = GlossaryEntry(
+                    by_term[key].term, by_term[key].definition, entry.term_en
+                )
     return tuple(by_term[term] for term in term_order)
+
+
+def _dedupe_practice_questions(
+    questions: Sequence[PracticeQuestion],
+) -> tuple[PracticeQuestion, ...]:
+    by_q: dict[str, PracticeQuestion] = {}
+    order: list[str] = []
+    for item in questions:
+        key = _compare_key(item.question)
+        if not key:
+            continue
+        if key not in by_q:
+            by_q[key] = item
+            order.append(key)
+        elif len(item.answer) > len(by_q[key].answer):
+            by_q[key] = PracticeQuestion(
+                item.question, item.answer, item.kind or by_q[key].kind
+            )
+    return tuple(by_q[k] for k in order)
 
 
 def _dedupe_tips(tips: Sequence[PracticalTip]) -> tuple[PracticalTip, ...]:
@@ -1517,6 +1613,9 @@ def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
         ),
         review_questions=_dedupe_by_key(
             [item for note in notes for item in note.review_questions], _compare_key
+        ),
+        practice_questions=_dedupe_practice_questions(
+            [item for note in notes for item in note.practice_questions]
         ),
         practical_tips=_dedupe_tips([tip for note in notes for tip in note.practical_tips]),
         common_mistakes=_dedupe_by_key(
@@ -1774,6 +1873,7 @@ def _drafted_text(notes: StructuredNotes) -> str:
     parts.extend(notes.learning_objectives)
     parts.extend(notes.key_points)
     parts.extend(notes.review_questions)
+    parts.extend(f"{qa.question} {qa.answer}" for qa in notes.practice_questions)
     parts.extend(notes.common_mistakes)
     parts.extend(notes.final_review)
     parts.extend(f"{tip.text} {tip.basis}" for tip in notes.practical_tips)
@@ -2040,6 +2140,11 @@ def compact_notes_payload(notes: StructuredNotes) -> dict:
     payload["sections"] = sections
     if notes.key_points:
         payload["key_points"] = list(notes.key_points)
+    if notes.practice_questions:
+        payload["practice_questions"] = [
+            {"question": qa.question, "answer": qa.answer, "kind": qa.kind}
+            for qa in notes.practice_questions
+        ]
     if notes.review_questions:
         payload["review_questions"] = list(notes.review_questions)
     if notes.common_mistakes:
@@ -2053,7 +2158,10 @@ def compact_notes_payload(notes: StructuredNotes) -> dict:
         ]
     if notes.glossary:
         payload["glossary"] = [
-            {"term": e.term, "definition": e.definition} for e in notes.glossary
+            {"term": e.term, "term_en": e.term_en, "definition": e.definition}
+            if e.term_en
+            else {"term": e.term, "definition": e.definition}
+            for e in notes.glossary
         ]
     return payload
 
@@ -2104,6 +2212,7 @@ def _notes_structured_item_count(notes: StructuredNotes) -> int:
             for section in notes.sections
         )
         + len(notes.practical_tips)
+        + len(notes.practice_questions)
     )
 
 
@@ -2122,6 +2231,7 @@ def _notes_body_chars(notes: StructuredNotes) -> int:
             total += sum(len(h) for h in table.headers)
             total += sum(len(cell) for row in table.rows for cell in row)
     total += sum(len(tip.text) + len(tip.basis) for tip in notes.practical_tips)
+    total += sum(len(qa.question) + len(qa.answer) for qa in notes.practice_questions)
     return total
 
 
@@ -3000,6 +3110,12 @@ def scrub_unsupported_content(
                 )
             )
     glossary = tuple(glossary_list)
+    practice_list: list[PracticeQuestion] = []
+    for qa in notes.practice_questions:
+        cleaned_q = scrub(qa.question)
+        cleaned_a = scrub(qa.answer)
+        if cleaned_q.strip():
+            practice_list.append(replace(qa, question=cleaned_q, answer=cleaned_a))
     scrubbed = replace(
         notes,
         title=scrub(notes.title),
@@ -3009,6 +3125,7 @@ def scrub_unsupported_content(
         key_points=scrub_tuple(notes.key_points),
         learning_objectives=scrub_tuple(notes.learning_objectives),
         review_questions=scrub_tuple(notes.review_questions),
+        practice_questions=tuple(practice_list),
         common_mistakes=scrub_tuple(notes.common_mistakes),
         final_review=scrub_tuple(notes.final_review),
         practical_tips=tips,
@@ -4178,7 +4295,34 @@ async def _structure_booklet(
     semaphore = _note_semaphore(settings, len(chunks))
 
     async def finalize(result: StructuredNotes) -> StructuredNotes:
-        """Apply the one canonical acceptance gate to every delivery path."""
+        """Finalize the structured booklet according to the configured grounding mode.
+
+        In direct scientific mode (``note_strict_grounding=False``, the default),
+        the model's spelling/grammar polish, controlled clarifying completions,
+        English scientific terms, comparative tables, professor emphases and Q&A
+        are preserved as-is after structural validation — never scrubbed or
+        rejected by verbatim-only evidence gates.
+
+        When ``note_strict_grounding=True``, the full verbatim evidence audit,
+        completeness fill and strict final acceptance gate run unchanged.
+        """
+        if not settings.note_strict_grounding:
+            if getattr(settings, "note_completeness_fill", False):
+                result = await fill_coverage_gaps(
+                    session, settings, document, result, semaphore=semaphore,
+                    data_sensitivity=data_sensitivity,
+                )
+            preserved_quality = result.quality_state
+            result = ensure_structured_booklet(result, document)
+            if preserved_quality == QUALITY_RECOVERED:
+                result = replace(result, quality_state=QUALITY_RECOVERED)
+            if structurally_valid_booklet(result):
+                return result
+            if not getattr(settings, "note_enable_deterministic_fallback", True):
+                raise StructuringError("جزوهٔ تولیدشده ساختار لازم برای رندر نداشت.")
+            fallback = deterministic_fallback_notes(document)
+            return replace(fallback, quality_state=QUALITY_RECOVERED)
+
         # Reject fabricated or unsupported provider prose before asking the
         # model to fill omissions. Completeness work itself must run before the
         # final coverage gate, even when strict early repair is enabled.
@@ -4193,8 +4337,6 @@ async def _structure_booklet(
                     data_sensitivity=data_sensitivity,
                 )
         result = ensure_structured_booklet(result, document)
-        # NOTE_STRICT_GROUNDING controls earlier repair work, not whether a
-        # user-facing booklet may bypass the final safety/completeness gate.
         gated, report = gate_notes(result, document, strict=True, mode=resolved_mode)
         try:
             return enforce_final_acceptance(gated, report, mode=resolved_mode, stage="final")

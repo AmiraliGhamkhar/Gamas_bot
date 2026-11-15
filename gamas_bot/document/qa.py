@@ -137,24 +137,29 @@ def _frame_issues(page, number: int, tolerance: float = 6.0) -> tuple[int, int]:
         if y0 < frame_top - tolerance or y1 > frame_bottom + tolerance:
             outside += 1
 
-    boxes = []
-    for block in page.get_text("dict")["blocks"]:
-        for line in block.get("lines", []):
+    boxes: list[tuple[int, int, float, float, float, float]] = []
+    for block_idx, block in enumerate(page.get_text("dict")["blocks"]):
+        for line_idx, line in enumerate(block.get("lines", [])):
             for span in line["spans"]:
                 if not (span.get("text") or "").strip():
                     continue
                 sx0, sy0, sx1, sy1 = span["bbox"]
                 slack = max(0.0, (sy1 - sy0) - span["size"]) / 2.0
-                boxes.append((sx0, sy0 + slack, sx1, sy1 - slack))
+                boxes.append((block_idx, line_idx, sx0, sy0 + slack, sx1, sy1 - slack))
     overlaps = 0
     for index, first in enumerate(boxes):
         for second in boxes[index + 1 :]:
-            overlap_w = min(first[2], second[2]) - max(first[0], second[0])
-            overlap_h = min(first[3], second[3]) - max(first[1], second[1])
+            # HarfBuzz CID/Type0 RTL lines can emit overlapping ToUnicode/ActualText
+            # sub-spans inside a single PyMuPDF line; genuine layout collisions occur
+            # across distinct lines or blocks.
+            if first[0] == second[0] and first[1] == second[1]:
+                continue
+            overlap_w = min(first[4], second[4]) - max(first[2], second[2])
+            overlap_h = min(first[5], second[5]) - max(first[3], second[3])
             if overlap_w <= 0 or overlap_h <= 0:
                 continue
-            area_first = (first[2] - first[0]) * (first[3] - first[1])
-            area_second = (second[2] - second[0]) * (second[3] - second[1])
+            area_first = (first[4] - first[2]) * (first[5] - first[3])
+            area_second = (second[4] - second[2]) * (second[5] - second[3])
             if overlap_w * overlap_h / max(1.0, min(area_first, area_second)) > 0.2:
                 overlaps += 1
     return outside, overlaps

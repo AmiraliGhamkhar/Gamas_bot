@@ -58,11 +58,12 @@ HEADINGS: dict[int, HeadingStyle] = {
     3: HeadingStyle(color=_P.navy_700, accent=_P.line),
 }
 
-#: The three model-authored callout kinds. Red stays reserved for «هشدار».
+#: The four model-authored callout kinds. Red stays reserved for «هشدار».
 CALLOUTS: dict[str, BlockStyle] = {
     "نکته": BlockStyle(_P.note_fill, _P.note_border, "نکته", _P.teal_700, _P.ink),
     "هشدار": BlockStyle(_P.warn_fill, _P.warn_border, "هشدار", _P.danger, _P.ink),
     "یادآوری": BlockStyle(_P.tip_fill, _P.tip_border, "یادآوری", _P.warning, _P.ink),
+    "تأکید استاد": BlockStyle(_P.highlight, _P.tip_border, "تأکید استاد", _P.navy_900, _P.ink),
 }
 
 #: Practical tips are the lecturer's own advice (``PracticalTip``), which is
@@ -85,6 +86,7 @@ HIGH_YIELD = BlockStyle(_P.navy_900, _P.teal_500, "نکات پرتکرار", _P.
 GUIDE = BlockStyle(_P.cream_100, _P.line, "راهنمای استفاده", _P.teal_700, _P.ink)
 GLANCE = BlockStyle(_P.cream_50, _P.line, "در یک نگاه", _P.navy_800, _P.ink)
 SOURCE = BlockStyle(_P.cream_50, _P.line, "منبع", _P.muted, _P.muted)
+PRACTICE_QA = BlockStyle(_P.cream_50, _P.border, "پرسش و پاسخ درس", _P.teal_700, _P.ink)
 
 TABLES = TableStyle(
     header_fill=_P.navy_900,
@@ -122,6 +124,7 @@ LABELS: dict[str, str] = {
     "key_points": "نکته‌های کلیدی",
     "tips": "نکته‌های کاربردی",
     "review": "پرسش‌های مرور",
+    "practice_questions": "پرسش‌ها و تمرین‌های درس",
     "common_mistakes": "خطاها و دام‌های رایج",
     "glossary": "واژه‌نامهٔ اصطلاح‌ها",
     "final_review": "مرور نهایی",
@@ -141,6 +144,7 @@ __all__ = [
     "HIGH_YIELD",
     "KEY_POINTS",
     "LABELS",
+    "PRACTICE_QA",
     "QUOTE",
     "SOURCE",
     "SUMMARY",

@@ -74,7 +74,7 @@ def _normalize(text: str) -> str:
     folded = unicodedata.normalize("NFKC", text)
     dropped = "\u200c\u0640"  # ZWNJ, tatweel
     dropped += "".join(chr(cp) for cp in range(0x064B, 0x0660))  # Arabic marks
-    return folded.translate(str.maketrans(dict.fromkeys(dropped)))
+    return folded.translate(str.maketrans(dict.fromkeys(dropped))).replace("لا", "ال")
 
 try:
     import pymupdf  # noqa: F401
@@ -193,11 +193,18 @@ class PdfStructureTests(unittest.TestCase):
         for name, notes in self._documents():
             with self.subTest(document=name):
                 payload = render(notes)
-                text = "\n".join(
-                    page.extract_text() or "" for page in PdfReader(io.BytesIO(payload)).pages
-                )
-                text = _normalize(text or "")
-                self.assertIn("خلاصه", text, f"{name}: summary heading missing")
+                if HAVE_PYMUPDF:
+                    doc = pymupdf.open(stream=payload, filetype="pdf")
+                    try:
+                        raw_text = "\n".join(doc.load_page(i).get_text() for i in range(doc.page_count))
+                    finally:
+                        doc.close()
+                else:
+                    raw_text = "\n".join(
+                        page.extract_text() or "" for page in PdfReader(io.BytesIO(payload)).pages
+                    )
+                text = _normalize(raw_text or "")
+                self.assertIn(_normalize("خلاصه"), text, f"{name}: summary heading missing")
                 for section in notes.sections[:3]:
                     words = [
                         w.strip("؛،,.:;()[]")
@@ -236,9 +243,12 @@ class PdfStructureTests(unittest.TestCase):
             for font in (resources.get("/Font") or {}).values():
                 obj = font.get_object()
                 fonts.add((str(obj.get("/BaseFont") or ""), str(obj.get("/Subtype") or "")))
-        # reportlab subsets the TrueType faces (AAAAAA+Vazirmatn-…).
+        # Typst embeds CID TrueType (/Type0); ReportLab embeds /TrueType.
         self.assertTrue(
-            any("Vazirmatn" in name and subtype == "/TrueType" for name, subtype in fonts),
+            any(
+                "Vazirmatn" in name and subtype in {"/TrueType", "/Type0"}
+                for name, subtype in fonts
+            ),
             f"fonts found: {fonts}",
         )
 
@@ -351,14 +361,14 @@ class PdfRasterizedTests(unittest.TestCase):
         completely, wrapped paragraphs no longer false-positive.
         """
         boxes = []
-        for block in page.get_text("dict")["blocks"]:
-            for line in block.get("lines", []):
+        for block_idx, block in enumerate(page.get_text("dict")["blocks"]):
+            for line_idx, line in enumerate(block.get("lines", [])):
                 for span in line["spans"]:
                     if not (span.get("text") or "").strip():
                         continue
                     x0, y0, x1, y1 = span["bbox"]
                     slack = max(0.0, (y1 - y0) - span["size"] * 1.0) / 2.0
-                    boxes.append((x0, y0 + slack, x1, y1 - slack))
+                    boxes.append((block_idx, line_idx, x0, y0 + slack, x1, y1 - slack))
         return boxes
 
     def test_text_blocks_do_not_significantly_overlap(self):
@@ -370,12 +380,14 @@ class PdfRasterizedTests(unittest.TestCase):
                     for i in range(len(boxes)):
                         for j in range(i + 1, len(boxes)):
                             a, b = boxes[i], boxes[j]
-                            overlap_w = min(a[2], b[2]) - max(a[0], b[0])
-                            overlap_h = min(a[3], b[3]) - max(a[1], b[1])
+                            if a[0] == b[0] and a[1] == b[1]:
+                                continue
+                            overlap_w = min(a[4], b[4]) - max(a[2], b[2])
+                            overlap_h = min(a[5], b[5]) - max(a[3], b[3])
                             if overlap_w <= 0 or overlap_h <= 0:
                                 continue
-                            area_a = (a[2] - a[0]) * (a[3] - a[1])
-                            area_b = (b[2] - b[0]) * (b[3] - b[1])
+                            area_a = (a[4] - a[2]) * (a[5] - a[3])
+                            area_b = (b[4] - b[2]) * (b[5] - b[3])
                             overlap = overlap_w * overlap_h
                             self.assertLess(
                                 overlap / max(1, min(area_a, area_b)),

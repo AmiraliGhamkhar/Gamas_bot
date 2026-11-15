@@ -48,8 +48,11 @@ dependencies = [
     # PDF text extraction for uploaded study documents (pure Python, no poppler
     # and no system libraries).
     "pypdf>=5.0,<7.0",
-    # The standalone PDF exporter uses reportlab (pure Python, no office
-    # suite/system libraries); Persian text is shaped before rendering.
+    # Primary modern publication PDF engine (in-process Rust/HarfBuzz with
+    # native Persian RTL shaping, math formulas and precompiled wheels — zero
+    # system libraries required, compatible with cPanel and Windows).
+    "typst>=0.15,<1.0",
+    # Fallback/Office standalone PDF exporter uses reportlab (pure Python).
     "reportlab>=4.0,<5.0",
     "arabic-reshaper>=3.0,<4.0",
     "python-bidi>=0.4,<1.0",
@@ -150,6 +153,8 @@ files = [
     "gamas_bot/media_worker.py",
     "gamas_bot/_prompt_block.py",
     "gamas_bot/notes.py",
+    "gamas_bot/notes_pdf.py",
+    "gamas_bot/notes_typst.py",
     "gamas_bot/presentations.py",
     "gamas_bot/progress.py",
     "gamas_bot/protocols.py",
