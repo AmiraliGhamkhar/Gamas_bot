@@ -165,6 +165,7 @@ from . import texts
 from .telegram_transfer import (
     TELEGRAM_DOWNLOAD_CHUNK_BYTES,
     DiskSpaceError,
+    DownloadReservationLedger,
     DownloadStalledError,
     UploadTooLargeError,
     _download_media_limited,
@@ -210,6 +211,7 @@ class GamasBot(
             worker=self._run_job,
         )
         self._download_semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
+        self._download_reservations = DownloadReservationLedger()
         self._media_semaphore = asyncio.Semaphore(settings.media_worker_concurrency)
         # Bound memory-heavy PDF/Office parsing separately from media workers.
         self._document_semaphore = asyncio.Semaphore(settings.media_worker_concurrency)

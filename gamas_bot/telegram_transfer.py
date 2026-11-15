@@ -15,8 +15,9 @@ from pathlib import Path
 import shutil
 import stat
 import sys
+import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from .fileio import AsyncFileWriter, run_file_io, run_file_io_resource
 
@@ -52,6 +53,85 @@ class DownloadStalledError(ValueError):
 
 class DiskSpaceError(ValueError):
     """The temporary filesystem cannot hold the job's files."""
+
+
+class DownloadDiskReservation:
+    """One idempotent claim against a :class:`DownloadReservationLedger`."""
+
+    def __init__(
+        self, ledger: "DownloadReservationLedger", filesystem: int | str, bytes_reserved: int
+    ) -> None:
+        self._ledger = ledger
+        self._filesystem = filesystem
+        self._bytes_reserved = bytes_reserved
+        self._released = False
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def release(self) -> int:
+        """Release this claim once and return the bytes released (or zero)."""
+        if self._released:
+            return 0
+        self._released = True
+        self._ledger._release(self._filesystem, self._bytes_reserved)
+        return self._bytes_reserved
+
+
+class DownloadReservationLedger:
+    """Process-local temporary-disk reservations shared by download slots.
+
+    ``shutil.disk_usage`` is a point-in-time value.  It cannot see another
+    download that passed its free-space check one event-loop turn earlier, so
+    each active transfer reserves its two-working-copy budget until the
+    transfer reaches a terminal path.  A lock also covers calls dispatched to
+    the bounded file-I/O thread pool.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._reserved: dict[int | str, int] = {}
+
+    @staticmethod
+    def _filesystem_key(directory: Path) -> int | str:
+        try:
+            return int(directory.stat().st_dev)
+        except OSError:
+            # The caller normally creates the directory first.  Keep a stable
+            # fallback for tests and for a filesystem disappearing mid-start.
+            return str(directory.resolve(strict=False))
+
+    def reserve(
+        self,
+        directory: Path,
+        required_bytes: int,
+        *,
+        reserve_bytes: int = 0,
+        ensure_headroom: Callable[..., None] | None = None,
+    ) -> DownloadDiskReservation:
+        """Atomically check and reserve one download's working-copy budget."""
+        if required_bytes <= 0:
+            raise ValueError("download reservation must be positive")
+        checker = ensure_headroom or _ensure_disk_headroom
+        filesystem = self._filesystem_key(directory)
+        with self._lock:
+            already_reserved = self._reserved.get(filesystem, 0)
+            checker(
+                directory,
+                already_reserved + required_bytes,
+                reserve_bytes=reserve_bytes,
+            )
+            self._reserved[filesystem] = already_reserved + required_bytes
+        return DownloadDiskReservation(self, filesystem, required_bytes)
+
+    def _release(self, filesystem: int | str, released_bytes: int) -> None:
+        with self._lock:
+            remaining = self._reserved.get(filesystem, 0) - released_bytes
+            if remaining > 0:
+                self._reserved[filesystem] = remaining
+            else:
+                self._reserved.pop(filesystem, None)
 
 
 TELEGRAM_DOWNLOAD_CHUNK_BYTES = 512 * 1024
@@ -227,6 +307,10 @@ async def _download_media_limited(
     declared_size = _message_file_size(message)
     if declared_size is not None and declared_size > limit_bytes:
         raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
+    # Telegram's declared size is an independent transport bound.  A malicious
+    # or faulty transport must not turn a small declared upload into a larger
+    # on-disk write merely because the generic bot ceiling is higher.
+    stream_limit = min(limit_bytes, declared_size) if declared_size is not None else limit_bytes
 
     supports_async_download = client is not None and callable(
         getattr(client, "iter_download", None)
@@ -263,10 +347,10 @@ async def _download_media_limited(
 
     def _guard(received: int, total: int) -> None:
         last_progress[0] = _monotonic()
-        if total and total > limit_bytes:
-            raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
-        if received > limit_bytes:
-            raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
+        if total and total > stream_limit:
+            raise UploadTooLargeError(f"file exceeds limit ({stream_limit} bytes)")
+        if received > stream_limit:
+            raise UploadTooLargeError(f"file exceeds limit ({stream_limit} bytes)")
 
     writer = await AsyncFileWriter.open(target) if supports_async_download else None
     file_target: Any = writer if writer is not None else str(target)
@@ -297,8 +381,12 @@ async def _download_media_limited(
             raise RuntimeError("download did not produce a file") from exc
         if not downloaded or not stat.S_ISREG(file_stat.st_mode):
             raise RuntimeError("download did not produce a file")
-        if file_stat.st_size > limit_bytes:
-            raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
+        if file_stat.st_size > stream_limit:
+            raise UploadTooLargeError(f"file exceeds limit ({stream_limit} bytes)")
+        if declared_size is not None and file_stat.st_size != declared_size:
+            raise RuntimeError(
+                f"download produced {file_stat.st_size} of declared {declared_size} bytes"
+            )
         return target
     except BaseException:
         if task is not None and not task.done():
