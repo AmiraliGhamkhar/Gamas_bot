@@ -9,12 +9,29 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from gamas_bot.bot import GamasBot
-from gamas_bot.telegram_transfer import DiskSpaceError, DownloadReservationLedger
+from gamas_bot.telegram_transfer import (
+    DiskSpaceError,
+    DownloadReservationLedger,
+    UploadTooLargeError,
+    _download_media_limited,
+)
 
 
 class _Message:
     def __init__(self, size: int) -> None:
         self.file = SimpleNamespace(size=size)
+
+
+class _OversizedStreamMessage:
+    def __init__(self, declared_size: int, payload: bytes) -> None:
+        self.file = SimpleNamespace(size=declared_size)
+        self.payload = payload
+
+    async def download_media(self, *, file, progress_callback=None):
+        Path(file).write_bytes(self.payload)
+        if progress_callback is not None:
+            progress_callback(len(self.payload), self.file.size)
+        return str(file)
 
 
 class DownloadReservationTests(unittest.IsolatedAsyncioTestCase):
@@ -101,3 +118,17 @@ class DownloadReservationTests(unittest.IsolatedAsyncioTestCase):
             self.root, 100, reserve_bytes=10, ensure_headroom=self.stub.deps.ensure_disk_headroom
         )
         self.assertEqual(lease.release(), 100)
+
+    async def test_stream_larger_than_declared_size_aborts_and_removes_temp_file(self):
+        target = self.root / "declared-overflow.bin"
+        message = _OversizedStreamMessage(4, b"eight!!!")
+        with self.assertRaises(UploadTooLargeError):
+            await _download_media_limited(message, target, 10)
+        self.assertFalse(target.exists())
+
+    async def test_stream_larger_than_maximum_aborts_and_removes_temp_file(self):
+        target = self.root / "maximum-overflow.bin"
+        message = _OversizedStreamMessage(20, b"eleven-bytes")
+        with self.assertRaises(UploadTooLargeError):
+            await _download_media_limited(message, target, 10)
+        self.assertFalse(target.exists())

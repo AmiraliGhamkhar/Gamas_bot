@@ -307,6 +307,10 @@ async def _download_media_limited(
     declared_size = _message_file_size(message)
     if declared_size is not None and declared_size > limit_bytes:
         raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
+    # Telegram's declared size is an independent transport bound.  A malicious
+    # or faulty transport must not turn a small declared upload into a larger
+    # on-disk write merely because the generic bot ceiling is higher.
+    stream_limit = min(limit_bytes, declared_size) if declared_size is not None else limit_bytes
 
     supports_async_download = client is not None and callable(
         getattr(client, "iter_download", None)
@@ -343,10 +347,10 @@ async def _download_media_limited(
 
     def _guard(received: int, total: int) -> None:
         last_progress[0] = _monotonic()
-        if total and total > limit_bytes:
-            raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
-        if received > limit_bytes:
-            raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
+        if total and total > stream_limit:
+            raise UploadTooLargeError(f"file exceeds limit ({stream_limit} bytes)")
+        if received > stream_limit:
+            raise UploadTooLargeError(f"file exceeds limit ({stream_limit} bytes)")
 
     writer = await AsyncFileWriter.open(target) if supports_async_download else None
     file_target: Any = writer if writer is not None else str(target)
@@ -377,8 +381,12 @@ async def _download_media_limited(
             raise RuntimeError("download did not produce a file") from exc
         if not downloaded or not stat.S_ISREG(file_stat.st_mode):
             raise RuntimeError("download did not produce a file")
-        if file_stat.st_size > limit_bytes:
-            raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
+        if file_stat.st_size > stream_limit:
+            raise UploadTooLargeError(f"file exceeds limit ({stream_limit} bytes)")
+        if declared_size is not None and file_stat.st_size != declared_size:
+            raise RuntimeError(
+                f"download produced {file_stat.st_size} of declared {declared_size} bytes"
+            )
         return target
     except BaseException:
         if task is not None and not task.done():
