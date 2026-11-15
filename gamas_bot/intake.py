@@ -21,7 +21,7 @@ from typing import Any
 from telethon.tl.types import MessageMediaWebPage
 
 from .db import InsufficientBalanceError
-from .doc_extract import classify_document, classify_image
+from .doc_extract import classify_document
 from .media import MediaToolError
 from .office import OfficeError, classify_text_file
 from .presentations import PresentationError, classify_presentation
@@ -375,30 +375,6 @@ def _text_file_metadata(message: Any) -> tuple[str | None, str | None]:
     mime_type = getattr(message.file, "mime_type", None)
     suffix = classify_text_file(filename, mime_type)
     return (suffix, filename) if suffix is not None else (None, filename)
-
-
-def _image_metadata(message: Any) -> tuple[str | None, str | None]:
-    """``("image", name)`` for a photo or image file the OCR flow can read."""
-    if (
-        getattr(message, "sticker", None) is not None
-        or getattr(message, "gif", None) is not None
-    ):
-        return None, None
-    if (
-        getattr(message, "voice", None) is not None
-        or getattr(message, "audio", None) is not None
-    ):
-        return None, None
-    file_obj = getattr(message, "file", None)
-    name = getattr(file_obj, "name", None)
-    mime = getattr(file_obj, "mime_type", None)
-    if getattr(message, "photo", None) is not None:
-        if mime and not str(mime).lower().startswith("image/"):
-            return None, None
-        return "image", name
-    if getattr(message, "document", None) is None:
-        return None, None
-    return ("image", name) if classify_image(name, mime) else (None, None)
 
 
 def _is_unsupported_attachment(message: Any) -> bool:

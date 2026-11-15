@@ -67,7 +67,8 @@ Keep changes small and practical.
 - Store logical Unicode order — never reversed BiDi. PDF and DOCX render from the
   same validated `StructuredNotes` model.
 - Excel values are literal strings, never executable formulas.
-- OCR stays opt-in and remote; disabled means no page uploads.
+- Document ingestion is text-layer only: a scanned PDF or a photo is refused
+  with an explicit message, and no page image ever leaves the host.
 
 ## Verification
 

@@ -124,7 +124,7 @@ class MigrationSchemaTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             await self.db.library_add(12, "unknown", 12, 45, None, title="نامعتبر")
 
-    async def test_documents_accept_the_ocr_image_source_only(self):
+    async def test_documents_accept_the_image_source_only(self):
         """Migration 017 widens the source types by exactly one value."""
         await self.db.ensure_user(13)
         await self.db._write(

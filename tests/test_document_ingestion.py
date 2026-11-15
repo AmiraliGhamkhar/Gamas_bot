@@ -125,23 +125,22 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("گلیکولیز", stored["text"])
         self.assertEqual(stored["source_type"], "docx")
 
-    async def test_scanned_pdf_gets_the_ocr_message_and_stores_nothing(self):
+    async def test_scanned_pdf_gets_the_explicit_message_and_stores_nothing(self):
         from tests.test_doc_extract import make_blank_pdf_bytes
 
         event = self.upload("scan.pdf", make_blank_pdf_bytes(), mime="application/pdf")
         await self.bot._handle_message(event)
         self.assertEqual(await self.db.document_count(OWNER), 0)
         sent = "\n".join(item["text"] for item in self.client.texts)
-        self.assertIn("OCR اختیاری فعلاً خاموش", sent)
+        self.assertIn("قابل‌خواندن نیست", sent)
 
-    async def test_document_card_hides_unavailable_learning_and_explains_ocr(self):
+    async def test_document_card_hides_unavailable_learning(self):
         _, documents = await self.ingest("notes.pdf", make_pdf_bytes(), mime="application/pdf")
         self.bot.settings = replace(
             self.bot.settings,
             note_api_key="",
             note_api_base_url="",
             note_providers=(),
-            ocr_enabled=False,
         )
         card = self.press(f"doc:show:{documents[0]['id']}".encode())
 
@@ -149,7 +148,6 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
 
         text, buttons = card.edits[-1]["text"], card.edits[-1]["buttons"]
         self.assertIn(texts.LEARNING_GENERATION_UNAVAILABLE, text)
-        self.assertIn(texts.DOCUMENT_OCR_OFF_NOTICE, text)
         payloads = self.button_payloads([{"buttons": buttons}])
         self.assertFalse(any(data.startswith((b"doc:quiz:", b"doc:fc:")) for data in payloads))
 
@@ -210,7 +208,7 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         event.message.file.mime_type = "image/jpeg"
         await self.bot._handle_message(event)
         sent = "\n".join(item["text"] for item in self.client.texts)
-        self.assertIn(texts.DOCUMENT_PHOTO_OCR_OFF, sent)
+        self.assertIn(texts.DOCUMENT_PHOTO_UNSUPPORTED, sent)
 
     # --------------------------------------------------------------- library
     async def test_library_documents_section_lists_and_opens_the_document(self):
@@ -389,7 +387,7 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         upload, _ = await self.ingest("legacy.ppt", source, mime="application/vnd.ms-powerpoint")
         stored = await self.db.documents_list(OWNER)
         # The historical converter is exercised; text-only decks are cached,
-        # while image-only decks receive the explicit OCR limitation.
+        # while image-only decks are refused with the explicit no-text message.
         if stored:
             self.assertEqual(stored[0]["source_type"], "pptx")
             document = await self.db.document_get(OWNER, stored[0]["id"])
@@ -403,7 +401,9 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._store_presentation_document(job, upload.source, SimpleNamespace(slides=[slide]))
             self.assertEqual(await self.db.document_count(OWNER), 1)
         else:
-            self.assertTrue(any("OCR" in entry["text"] for entry in self.client.texts))
+            self.assertTrue(
+                any("متن قابل‌استخراجی" in entry["text"] for entry in self.client.texts)
+            )
 
     async def test_identical_uploads_are_deduplicated_per_user_and_reference_is_refreshed(self):
         payload = make_pdf_bytes()

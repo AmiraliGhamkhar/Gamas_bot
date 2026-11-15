@@ -7,7 +7,7 @@ routing; this module owns wording, emoji and the glossary (جزوه، فلش‌�
 as one document and lets tests assert screens instead of scattered literals.
 
 Administrator report tables and some workflow prompts remain in their owning
-modules; document/OCR/Office and learning availability copy is centralized here.
+modules; document/Office and learning availability copy is centralized here.
 
 Rules followed here:
 
@@ -83,40 +83,30 @@ PRESENTATION_PROCESSING_NOTICE: Final = (
     "«🎧 پردازش صدای ارائه» آغاز می‌شود. فقط صدای ضبط‌شده اعتبار مصرف می‌کند؛ "
     "ارائهٔ بی‌صدا رایگان است."
 )
-DOCUMENT_OCR_OFF_NOTICE: Final = (
-    "PDF اسکن‌شده یا عکس سند بدون OCR قابل‌خواندن نیست؛ OCR اختیاری فعلاً خاموش است."
+DOCUMENT_SCANNED_NOTICE: Final = (
+    "PDF اسکن‌شده یا عکس سند قابل‌خواندن نیست؛ "
+    "لطفاً نسخهٔ متنی PDF یا فایل Word بفرستید."
 )
-DOCUMENT_OCR_ON_NOTICE: Final = (
-    "PDF اسکن‌شده و عکس سند با OCR خوانده می‌شوند؛ تصویر صفحه به سرویس بیرونی ارسال می‌شود."
-)
-DOCUMENT_PHOTO_OCR_OFF: Final = (
-    "📷 عکس سند نیازمند OCR اختیاری است که فعلاً در ربات خاموش است.\n"
+DOCUMENT_PHOTO_UNSUPPORTED: Final = (
+    "📷 عکس سند پشتیبانی نمی‌شود.\n"
     "PDF متنی یا فایل Word دارای متن بفرستید؛ عکس‌های داخل Word/PowerPoint خوانده نمی‌شوند."
 )
-DOCUMENT_OCR_FAILED: Final = (
-    "⚠️ خواندن این اسکن با OCR موفق نشد؛ سرویس بیرونی در دسترس نبود یا متنی تشخیص نداد.\n"
-    "کمی بعد دوباره تلاش کنید یا نسخهٔ متنی/Word فایل را بفرستید."
-)
 DOCUMENT_EMBEDDED_IMAGES_NOTICE: Final = (
-    "تصویرهای داخل Word یا PowerPoint استخراج یا با OCR خوانده نمی‌شوند."
+    "تصویرهای داخل Word یا PowerPoint استخراج نمی‌شوند."
 )
 DOCUMENT_WORD_NO_TEXT: Final = (
-    "متن قابل‌استخراجی در این Word پیدا نشد؛ OCR تصویرهای داخل Word انجام نمی‌شود. "
-    "نسخهٔ دارای متن بفرستید."
+    "متن قابل‌استخراجی در این Word پیدا نشد؛ نسخهٔ دارای متن بفرستید."
 )
 DOCUMENT_PRESENTATION_NO_TEXT: Final = (
-    "متن قابل‌استخراجی در اسلایدها پیدا نشد؛ OCR تصویرهای داخل PowerPoint انجام نمی‌شود."
+    "متن قابل‌استخراجی در اسلایدها پیدا نشد."
 )
 DOCUMENT_EXTRACTION_EMPTY: Final = (
     "متن قابل‌استخراجی از این سند پیدا نشد؛ اگر فایل تصویری یا اسکن‌شده است، "
-    "OCR اختیاری باید برای ربات فعال باشد."
+    "نسخهٔ متنی را بفرستید."
 )
 DOCUMENT_FREE_NOTICE: Final = (
     "جزوه، مرور سریع و خروجی‌های Office از اعتبار کم نمی‌کنند؛ "
     "آفیس هم سقف ورودی و محدودیت ظرفیت دارد."
-)
-DOCUMENT_IMAGE_OCR_OFF: Final = (
-    "خواندن تصویر نیازمند OCR اختیاری است؛ این قابلیت فعلاً در ربات فعال نیست."
 )
 
 # Admin menu labels.
@@ -325,7 +315,6 @@ def help_screen(
     *,
     office_enabled: bool,
     notes_configured: bool = True,
-    ocr_enabled: bool = False,
 ) -> str:
     """The one-screen guide followed by the billing contract."""
     lines = [
@@ -353,9 +342,7 @@ def help_screen(
     lines.append(
         "🎧 صدای PowerPoint خودکار پردازش نمی‌شود؛ از کارت سند، دکمهٔ پردازش صدا را بزنید."
     )
-    lines.append(
-        DOCUMENT_OCR_ON_NOTICE if ocr_enabled else DOCUMENT_OCR_OFF_NOTICE
-    )
+    lines.append(DOCUMENT_SCANNED_NOTICE)
     lines.append(DOCUMENT_EMBEDDED_IMAGES_NOTICE)
     lines.extend(
         [

@@ -1,8 +1,8 @@
 # Features and limits
 
-Everything below runs in one process with SQLite; no office suite, media binary
-or local OCR engine is involved. Overflow is **refused**, never silently
-truncated — split the source instead.
+Everything below runs in one process with SQLite; no office suite or media
+binary is involved. Overflow is **refused**, never silently truncated — split
+the source instead.
 
 ## Audio and video
 
@@ -77,7 +77,9 @@ merge, split/repair and grounding gates remain enabled as configured. See
 ## Study documents
 
 Send a text PDF, DOCX or PowerPoint (`.pptx`). Legacy `.ppt`/`.pps`/`.pot` is
-converted in-process; `.doc` is not supported — save as `.docx` first.
+converted in-process; `.doc` is not supported — save as `.docx` first. A scanned
+PDF (no text layer) or a photo of a page is refused with an explicit message;
+no page image is ever sent to a third-party recognition service.
 
 - The source card offers extracted text, full booklets, compact revision notes,
   exports, the original download and learning actions. Page/section/slide
@@ -117,37 +119,6 @@ pick Word, Excel, PowerPoint or PDF.
 Office and document notes/exports never spend user credit or learning gifts, but
 configured AI calls still cost the operator money.
 
-## OCR (opt-in, third party)
-
-**Off by default.** `OCR_ENABLED=false` refuses text-poor scans and photos
-instead of saving an empty document. Enabling it uploads page images to
-**i2ocr.com** — no local OCR engine runs.
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install ".[ocr]"
-```
-
-```bash
-python -m pip install '.[ocr]'
-```
-
-```dotenv
-OCR_ENABLED=true
-OCR_LANGUAGE=persian          # `fa` and `farsi` are accepted aliases
-OCR_MAX_PAGES=20              # 0 = every page
-OCR_TIMEOUT_SECONDS=600
-```
-
-`curl-cffi` is only needed for this feature and is validated at startup when OCR
-is on. Existing PDF text is not OCRed; images embedded inside Word/PowerPoint
-are not OCRed either — send them separately. Successful text is cached in
-SQLite, and library pruning does not erase that cache. Test live with your own
-non-sensitive file:
-
-```bash
-python -m scripts.ocr_smoke scan.jpg --language persian
-```
-
 ## Library and learning
 
 - **Library** keeps the newest `LIBRARY_MAX_ITEMS` (50) Telegram file references
@@ -160,7 +131,6 @@ python -m scripts.ocr_smoke scan.jpg --language persian
 
 ## Privacy summary
 
-Audio goes to your STT provider; note text goes to your note provider; OCR (if
-enabled) sends images to i2ocr. Logs contain references, counts and durations —
-never keys, transcript text, receipts or document contents. See
-[Security](SECURITY.md).
+Audio goes to your STT provider; note text goes to your note provider. Logs
+contain references, counts and durations — never keys, transcript text, receipts
+or document contents. See [Security](SECURITY.md).

@@ -7,11 +7,11 @@ version does not establish that the other matrix jobs passed.
 
 ## Offline gates
 
-Install runtime requirements and the declared OCR/test tools first:
+Install runtime requirements and the test tools first:
 
 ```bash
 python -m pip install -r requirements.txt
-python -m pip install '.[ocr]' 'ruff>=0.6' 'pytest>=8' 'mypy>=1.11' 'pypdf>=4.0,<7.0'
+python -m pip install 'ruff>=0.6' 'pytest>=8' 'mypy>=1.11' 'pypdf>=4.0,<7.0'
 python -m pip check
 python -m scripts.sync_requirements --check
 ruff check .

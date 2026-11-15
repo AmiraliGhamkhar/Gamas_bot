@@ -83,9 +83,7 @@ LEARNING_PROGRESS_EDIT_TIMEOUT_SECONDS = 1.0
 DOC_UNSUPPORTED_HINT = (
     "⚠️ فقط PDF، Word (docx) یا PowerPoint (pptx) به‌عنوان سند پذیرفته می‌شود."
 )
-DOC_PHOTO_HINT = texts.DOCUMENT_PHOTO_OCR_OFF
-DOC_OCR_FAILED = texts.DOCUMENT_OCR_FAILED
-DEFAULT_INTAKE_SUFFIX: dict[str, str] = {"image": ".jpg"}
+DOC_PHOTO_HINT = texts.DOCUMENT_PHOTO_UNSUPPORTED
 DOC_GENERATE_CARDS = "🃏 ساخت فلش‌کارت"
 DOC_GENERATE_QUESTIONS = "❓ ساخت سؤالات"
 

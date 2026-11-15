@@ -25,7 +25,7 @@ examples assume you activated the virtualenv (`source .venv/bin/activate`).
 
 | Guide | Use it for |
 | --- | --- |
-| [Features](FEATURES.md) | Media, documents, Office, OCR, narration, notes and exports |
+| [Features](FEATURES.md) | Media, documents, Office, narration, notes and exports |
 | [Billing](BILLING.md) | Credit, plans, purchases, learning costs, refunds, referrals |
 | [Admin](ADMIN.md) | Admin panel, commands, payments review, support, membership gate |
 

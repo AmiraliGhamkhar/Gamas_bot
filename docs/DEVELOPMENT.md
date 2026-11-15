@@ -22,7 +22,7 @@ wallet → order + receipt → admin review → transactional credit
 | Contracts/routing | `protocols`, `bot_deps`, `routing`, `conversation_state`, `intake` |
 | Queue/transfers | `jobs`, `capacity`, `progress`, `telegram_transfer`, `telegram_text` |
 | Media/providers | `media`, `media_worker`, `presentations`, `stt`, `llm`, `llm_profiles`, `http_util` |
-| Notes/documents | `transcript`, `notes`, `notes_evidence`, `doc_extract`, `ocr`, `office*`, `docx_export`, `notes_pdf`, `pdf_export`, `pdf_common` |
+| Notes/documents | `transcript`, `notes`, `notes_evidence`, `doc_extract`, `office*`, `docx_export`, `notes_pdf`, `pdf_export`, `pdf_common` |
 | Storage/billing | `db` facade, `db_*` facets, `billing`, `subscription`, `learning`, `referrals` |
 
 ## Invariants to preserve
@@ -61,8 +61,8 @@ python -m scripts.sync_requirements
 ```
 
 Runtime dependencies stay bounded ranges with a justification in
-`pyproject.toml`. `curl-cffi` is the opt-in `ocr` extra; dev tools live in `dev`.
-No dependency may require a system binary on shared hosting.
+`pyproject.toml`. Dev tools live in the `dev` extra. No dependency may require a
+system binary on shared hosting.
 
 ## Migrations
 

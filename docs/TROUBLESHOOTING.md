@@ -64,13 +64,13 @@ tail -n 80 data/logs/launcher.err
 | Speechmatics 403 | Two different causes now read differently: «دسترسی حساب … مجاز نیست» means subscription/permission, «اعتبارنامه را نپذیرفت» means the key itself. Both put the provider on cooldown and fail over to the next `STT_PROVIDERS` entry |
 | Long provider timeouts on a slow free tier | Keep the conservative output budget; adjust `NOTE_REQUEST_TIMEOUT_SECONDS` only with evidence. Dispatch never hedges, even with a stale nonzero hedge setting |
 
-## Documents, Office and OCR
+## Documents and Office
 
 | Symptom | Fix |
 | --- | --- |
 | `.doc` refused | Save as `.docx`; legacy `.ppt`/`.pps`/`.pot` is converted automatically |
 | Large source refused | Split it; limits refuse overflow instead of truncating |
-| Scan or photo refused | OCR is off by default; read [OCR](FEATURES.md#ocr-opt-in-third-party) before enabling uploads |
+| Scan or photo refused | Only the PDF text layer is read; send a text PDF or a Word file instead of a scan or photo |
 | Word layout or font looks wrong | Install Vazirmatn from `assets/fonts/`; check in Microsoft Word |
 | Excel cell shows a formula | Values are literal strings by design; nothing is calculated |
 | Narration never starts | It needs the explicit **🎧 پردازش صدای ارائه** button, not the upload |

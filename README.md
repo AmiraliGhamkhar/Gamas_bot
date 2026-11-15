@@ -81,8 +81,9 @@ or deployment compatibility is implied by offline tests. See
 | Wallet | Credit, plans and manually reviewed receipts |
 | Support | Persistent support tickets |
 
-PowerPoint narration starts only from its audio button. Scans and photos need
-[opt-in third-party OCR](docs/FEATURES.md#ocr-opt-in-third-party). Details:
+PowerPoint narration starts only from its audio button. Scans and photos are
+refused (there is no text layer to read); send a text PDF or a Word file.
+Details:
 [features](docs/FEATURES.md) · [note providers](docs/PROVIDERS.md) ·
 [billing](docs/BILLING.md).
 

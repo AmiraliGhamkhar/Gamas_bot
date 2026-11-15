@@ -27,11 +27,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
       - name: Install test extras and development tools
-        # The offline OCR tests exercise the production curl-cffi transport
-        # against a local test server, so install the already-declared OCR
-        # extra. pypdf is also used to read generated PDFs in the test suite.
+        # pypdf is used to read generated PDFs in the test suite.
         run: |
-          python -m pip install '.[ocr]'
           python -m pip install "ruff>=0.6" "pytest>=8" "mypy>=1.11" "pypdf>=4.0,<7.0"
       - name: Dependency consistency
         run: |
