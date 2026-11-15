@@ -167,11 +167,15 @@ The database is also housekept automatically: a passive WAL checkpoint daily and
 | Downloads / media workers / uploads | 2 / 1 / 2 |
 | STT slots (Speechmatics / Deepgram / OpenAI-compatible) | 2 / 4 / 2 |
 | Note-map concurrency / primary / fallback LLM slots | 3 / 3 / 1 |
-| Media upload / duration | 1 GiB / 2 h |
-| Temporary reserve | 64 MiB plus working copies |
+| Media upload / duration | 1 GiB / 2 h (default ceiling; preflight must admit it) |
+| Temporary reserve | 64 MiB per admitted download, plus two working copies |
 | Office builds | 2 |
 
-Independent stages overlap network waits, so a single media worker is fine.
+The default two-download, 1 GiB profile needs 4.125 GiB of *free* temporary
+space: `2 × ((2 × 1 GiB) + 64 MiB)`. `python -m scripts.cpanel_preflight` makes
+this calculation from the effective environment and actual free space and fails
+instead of starting an impossible profile. Independent stages overlap network
+waits, so a single media worker is fine.
 `NOTE_MAX_OUTPUT_TOKENS` is a per-request budget, not RAM: 32 768 tokens at a
 conservative 20 tokens/s can exceed the 900 s request deadline, which `--check`
 warns about. The shipped output budget is 16,384, with a 131,072-token context
@@ -181,7 +185,7 @@ transport retries and schema compatibility adjustments still cost requests.
 Provider-specific caps and the shared quota ledger also apply (see
 [Providers](PROVIDERS.md)).
 
-Recommended 2 GB cPanel profile (`.env`):
+Conservative 1 GiB cPanel profile (`.env`):
 
 ```dotenv
 MAX_ACTIVE_JOBS=3
@@ -189,18 +193,26 @@ MAX_QUEUED_JOBS=6
 MEDIA_WORKER_CONCURRENCY=1
 MAX_CONCURRENT_DOWNLOADS=2
 TELEGRAM_DOWNLOAD_CONNECTIONS=1
+TEMP_MIN_FREE_BYTES=67108864
+MAX_FILE_SIZE=134217728
+DOC_MAX_BYTES=134217728
+DOC_UNPACKED_MAX_BYTES=134217728
+PRESENTATION_MAX_UNPACKED_BYTES=134217728
+PRESENTATION_MAX_TEMP_BYTES=268435456
+PRESENTATION_WAV_LIMIT_BYTES=134217728
 NOTE_CONCURRENCY=3
 LEARNING_CHUNK_CONCURRENCY=2
 LEARNING_GLOBAL_CONCURRENCY=2
 NOTE_HEDGE_AFTER_SECONDS=0
-DOC_MAX_BYTES=1073741824
 ```
 
-If the account gets throttled: check CPU/RAM/process/disk quotas first, then
-lower jobs, media and note concurrency, then file limits. Cron cannot bypass host
-quotas — move to a VPS if the host kills permitted background work. Document
-parsing uses bounded threads, not a memory sandbox: pathological files still cost
-CPU.
+This profile needs 640 MiB of free temporary space for its two download slots;
+run `python -m scripts.cpanel_preflight` with the final `.env` and require its
+**Temp download capacity** check to pass. If the account gets throttled: check
+CPU/RAM/process/disk quotas first, then lower jobs, media and note concurrency,
+then file limits. Cron cannot bypass host quotas — move to a VPS if the host
+kills permitted background work. Document parsing uses bounded threads, not a
+memory sandbox: pathological files still cost CPU.
 
 ## Monitoring
 

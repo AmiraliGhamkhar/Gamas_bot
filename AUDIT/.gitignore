@@ -1,0 +1,3 @@
+# Local command output can be regenerated from the commands cited in the report.
+# Keep large/generated scanner, test, and benchmark artifacts out of source control.
+/results/

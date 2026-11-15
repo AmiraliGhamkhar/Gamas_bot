@@ -43,12 +43,31 @@ python -m gamas_bot
 
 `cpanel_preflight` checks Python version, packages, permissions, free disk,
 web-root placement, the instance lock and Telegram reachability, and prints
-`PASS`/`WARN`/`FAIL`. `--check` is offline and never migrates data. Fix every
-`FAIL`. Then send `/start` and a short voice note, stop with **Ctrl+C**, and wait
-for `stopped` before enabling cron.
+`PASS`/`WARN`/`FAIL`. It also fails **Temp download capacity** when the actual
+free space cannot hold two working copies plus the configured free-space reserve
+for every configured concurrent download. `--check` is offline and never
+migrates data. Fix every `FAIL`. Then send `/start` and a short voice note, stop
+with **Ctrl+C**, and wait for `stopped` before enabling cron.
 
-Start with the shipped limits (3 active jobs, 8 queued, 1 media worker, 1 GiB
-uploads). They are ceilings, not a RAM guarantee — see [host sizing](OPERATIONS.md#host-sizing).
+Do **not** start a 1 GB cPanel account with the shipped 1 GiB media/document
+ceilings unchanged: two concurrent 1 GiB downloads require 4.125 GiB of free
+temporary space under the production admission formula. For a 1 GB account,
+set a smaller profile before preflight, for example:
+
+```dotenv
+MAX_FILE_SIZE=134217728
+DOC_MAX_BYTES=134217728
+DOC_UNPACKED_MAX_BYTES=134217728
+MAX_CONCURRENT_DOWNLOADS=2
+TEMP_MIN_FREE_BYTES=67108864
+```
+
+That 128 MiB example requires 640 MiB of *currently free* temporary space for
+its two download slots. The virtual environment, database, receipts, logs and
+other jobs also consume quota, so treat the preflight result—not the nominal
+account size—as the hard deployment gate. The remaining stage defaults are 3
+active jobs, 8 queued jobs and 1 media worker; they are ceilings, not a RAM
+guarantee — see [host sizing](OPERATIONS.md#host-sizing).
 
 ## 3. Cron watchdog (once per minute)
 
@@ -129,11 +148,12 @@ du -sh data            # database, session, receipts, logs
 df -h "$HOME"
 ```
 
-A 2 GB cPanel account is enough for a small deployment, but plan for the SQLite
-database plus receipts and temporary media. If the host kills background
-processes or `pip install` cannot build `av`/`lxml` wheels, ask for
-CloudLinux/AlmaLinux 8+ with Python 3.11+, or move to a VPS; cron cannot bypass
-CPU/RAM/process quotas.
+A nominal account quota alone is not a capacity guarantee: the preflight uses
+actual free space and the configured upload/download values. Retain room for the
+SQLite database, receipts, logs, virtual environment and temporary media. If the
+host kills background processes or `pip install` cannot build `av`/`lxml` wheels,
+ask for CloudLinux/AlmaLinux 8+ with Python 3.11+, or move to a VPS; cron cannot
+bypass CPU/RAM/process quotas.
 
 ## Troubleshooting (short)
 
