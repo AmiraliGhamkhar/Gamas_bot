@@ -1,5 +1,11 @@
 # Architecture and coverage matrix — Second pass
 
+> **Historical audit:** This document records an earlier checkout and its
+> reported results, not the current branch or a fresh verification. Generated
+> `AUDIT/results/` logs are ignored and are not present in the repository;
+> cited line numbers and removed files may no longer match current code.
+> Re-run relevant checks before relying on these findings.
+
 **Date:** 2026-11-15 UTC
 
 **Branch:** `arena/357a91cc-gamas-bot`

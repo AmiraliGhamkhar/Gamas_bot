@@ -50,8 +50,10 @@ Keep changes small and practical.
 - Credit is an integer-second, lot-aware ledger. Never rewrite history; preserve
   earliest-expiry allocations and held lots; refunds create non-expiring lots only
   when all contributing lots were non-expiring.
-- Reserve measured audio before STT; charge only after the transcript is stored
-  and delivered; pre-delivery failure releases the hold.
+- Reserve measured audio before STT; settle after the transcript is produced
+  and stored, before note generation and the results notification. A failure
+  before settlement releases the hold; a later notification failure does not
+  undo a charge for the stored transcript.
 - Learning debits commit with a durable pending charge; save finalizes; failure,
   cancel, preview expiry and recovery refund at most once.
 - Office, document notes and exports never spend credit or gifts, though they may
@@ -60,7 +62,9 @@ Keep changes small and practical.
 
 ## Documents and Persian text
 
-- Deliver the full raw transcript before notes. Failed chunks never produce a
+- Persist the full raw transcript before generating notes. The final results
+  screen offers the transcript and available artifacts via buttons; it does not
+  automatically push a transcript file first. Failed chunks never produce a
   partial booklet; truncated completions are refused.
 - Keep grounding/completeness/repair gates and source order. Preserve source
   numbers, units and ZWNJ; display normalization must stay idempotent.

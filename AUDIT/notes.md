@@ -1,5 +1,11 @@
 # Audit working notes — Second pass
 
+> **Historical audit:** This document records an earlier checkout and its
+> reported results, not the current branch or a fresh verification. Generated
+> `AUDIT/results/` logs are ignored and are not present in the repository;
+> cited line numbers and removed files may no longer match current code.
+> Re-run relevant checks before relying on these findings.
+
 ## Scope and safety record
 
 - **[VERIFIED]** The repository instructions were read before work: `AGENTS.md`, `README.md`, `docs/DEVELOPMENT.md`, `docs/TESTING.md`, and `docs/CPANEL.md`; source/test tooling only was used.

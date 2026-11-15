@@ -46,8 +46,9 @@ web-root placement, the instance lock and Telegram reachability, and prints
 `PASS`/`WARN`/`FAIL`. It also fails **Temp download capacity** when the actual
 free space cannot hold two working copies plus the configured free-space reserve
 for every configured concurrent download. `--check` is offline and never
-migrates data. Fix every `FAIL`. Then send `/start` and a short voice note, stop
-with **Ctrl+C**, and wait for `stopped` before enabling cron.
+migrates data. Fix every `FAIL`. Then send `/start` and a short voice note;
+check the transcript button on the final results screen and any available booklet
+buttons. Stop with **Ctrl+C**, and wait for `stopped` before enabling cron.
 
 Do **not** start a 1 GB cPanel account with the shipped 1 GiB media/document
 ceilings unchanged: two concurrent 1 GiB downloads require 4.125 GiB of free

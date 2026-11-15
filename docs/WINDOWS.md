@@ -43,8 +43,10 @@ and [Providers](PROVIDERS.md). Restart after **every** `.env` change.
 
 `--check` is offline: it verifies packages, configuration, paths and the
 effective provider order, but not live keys. Fix every `FAIL`, review every
-`WARN`. Then send `/start` and a short voice note: the transcript must arrive
-before any booklet. Stop with **Ctrl+C** and wait for shutdown.
+`WARN`. Then send `/start` and a short voice note. On the final results screen,
+use the transcript button and check any available booklet buttons. The transcript
+is stored before note generation, but it is not automatically sent as a file.
+Stop with **Ctrl+C** and wait for shutdown.
 
 ## 4. Run in the background
 
@@ -107,7 +109,7 @@ taken before the update.
 | Symptom | Fix |
 | --- | --- |
 | `py` not found | Install Python 3.11+ from python.org, reopen PowerShell |
-| Script execution blocked | Call `.\\.venv\\Scripts\\python.exe` directly, as above |
+| Script execution blocked | Call `.\.venv\Scripts\python.exe` directly, as above |
 | Missing packages | Re-run pip install with **the same** interpreter |
 | `--check` reports `FAIL` | Fill Telegram credentials, numeric `ADMIN_IDS`, one STT key |
 | No answer in Telegram | Check logs, network and that only one instance runs |

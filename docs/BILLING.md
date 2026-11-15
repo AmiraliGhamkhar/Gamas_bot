@@ -41,8 +41,9 @@ syncs do not deactivate unrelated plans.
 - The charge is committed once the transcript has been produced and stored, so a
   chat that refuses a message does not cost the user twice or erase a finished
   transcript.
-- Pre-delivery failure or cancel releases the hold; startup recovery releases
-  interrupted holds.
+- Failure or cancellation before settlement releases the hold; startup recovery
+  releases interrupted holds. Settlement occurs before the results notification,
+  not when the user downloads the transcript.
 - A later booklet or results-notification failure leaves a `partial` job when
   the base transcript was retained. The measured transcription charge stands
   even if no PDF booklet was persisted: booklet generation is optional and has
@@ -114,10 +115,13 @@ rewritten.
 Run the one-shot importer with a separate fresh v3 target:
 
 ```bash
-python scripts/import_v2.py --from data/gamas_v2.db --into data/gamas.db
+python scripts/import_v2.py --from data/gamas_v2.db --into data/imported_v3.db
 ```
 
-The source is opened read-only; the target refuses an existing user population,
+This example writes a separate target, not the default live `DB_PATH`
+(`data/gamas_v3.db`). Stop the bot and test with copies; configure the intended
+`DB_PATH` separately only after verifying the import. The source is opened
+read-only; the target refuses an existing user population,
 and the data import commits or rolls back as one transaction. v2 and v3 both
 store balances in integer seconds, so eligible balances convert at **1 second to
 1 second** (the user-facing credit tariff is not applied during migration).

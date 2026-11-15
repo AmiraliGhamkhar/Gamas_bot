@@ -146,6 +146,7 @@ Legacy v2 data import is exceptional: read
 | Reviewed receipt images | 90 days (`RECEIPT_RETENTION_DAYS`) |
 | Pending-review receipts, payments, ledger | kept |
 | Transcript text | kept (`TRANSCRIPT_RETENTION_DAYS=0`) |
+| Media-submission PDF, DOCX and review HTML | Stored in the SQLite database; include them in database backups |
 | Job temporary files | cleaned after each job, stale work swept at startup |
 | Uploaded-document text cache | kept (`DOCUMENT_RETENTION_DAYS=0`) |
 | Quizzes, audits, released holds | kept within their retention settings |

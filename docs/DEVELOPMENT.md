@@ -6,8 +6,8 @@ No broker, web framework, external database or system Office/media binary.
 ## Flows
 
 ```text
-audio/video → admission + hold → queue → media → STT → transcript delivered
-            → optional grounded notes → RTL Word + PDF → Telegram library
+audio/video → admission + hold → queue → media → STT → transcript stored + charge settled
+            → optional grounded notes + artifacts → results screen → user downloads → library
 PDF/DOCX/PPTX → owner-scoped extraction → SQLite text cache → notes/exports
 text/CSV/MD → private Office draft → bounded build → Word/Excel/PPT/PDF
 wallet → order + receipt → admin review → transactional credit
@@ -22,7 +22,7 @@ wallet → order + receipt → admin review → transactional credit
 | Contracts/routing | `protocols`, `bot_deps`, `routing`, `conversation_state`, `intake` |
 | Queue/transfers | `jobs`, `capacity`, `progress`, `telegram_transfer`, `telegram_text` |
 | Media/providers | `media`, `media_worker`, `presentations`, `stt`, `llm`, `llm_profiles`, `http_util` |
-| Notes/documents | `transcript`, `notes`, `notes_evidence`, `doc_extract`, `office*`, `docx_export`, `notes_pdf`, `pdf_export`, `pdf_common` |
+| Notes/documents | `transcript`, `notes`, `notes_evidence`, `doc_extract`, `office*`, `docx_export`, `notes_pdf`, `pdf_export`, `pdf_common`, `review_sheet*` |
 | Storage/billing | `db` facade, `db_*` facets, `billing`, `subscription`, `learning`, `referrals` |
 
 ## Invariants to preserve

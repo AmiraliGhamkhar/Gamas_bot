@@ -11,7 +11,7 @@ Install runtime requirements and the test tools first:
 
 ```bash
 python -m pip install -r requirements.txt
-python -m pip install 'ruff>=0.6' 'pytest>=8' 'mypy>=1.11' 'pypdf>=4.0,<7.0'
+python -m pip install 'ruff>=0.6' 'pytest>=8' 'mypy>=1.11' 'pypdf>=4.0,<7.0' 'PyMuPDF>=1.24,<2.0'
 python -m pip check
 python -m scripts.sync_requirements --check
 ruff check .
@@ -29,6 +29,8 @@ with `MIGRATIONS_DIR`, compare the exact application table set with
 
 PowerShell equivalents use `.\.venv\Scripts\python.exe` and
 `.\.venv\Scripts\ruff.exe` instead of the activated environment commands.
+Run the migration-integrity Python block from the workflow separately: the Bash
+here-document syntax in that block is not PowerShell syntax.
 `unittest discover` covers the unittest-compatible tests; pytest additionally
 collects function-based regressions. Run both, and report skipped tests and
 unavailable checks explicitly. The workflow's `pip-audit` is a separate

@@ -1,5 +1,9 @@
 # Gamas booklet design system
 
+Media-submission artifacts are stored before the results screen offers them
+for download; see [Features](FEATURES.md#booklets-word-and-pdf) for delivery
+and eligibility, including the optional HTML review sheet.
+
 Every AI booklet Gamas sends is a designed publication, not a Word file with a
 template applied. This page documents the layer that makes that true and the
 rules that keep it true.
