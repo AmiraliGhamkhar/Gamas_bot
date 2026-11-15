@@ -28,7 +28,6 @@ class ConversationStateStore:
     pending_reject_reason: dict[int, int] = field(default_factory=dict)
     pending_flashcard: dict[int, tuple[int, str]] = field(default_factory=dict)
     pending_flashcard_front: dict[int, str] = field(default_factory=dict)
-    curation: dict[int, dict[str, Any]] = field(default_factory=dict)
     pending_user_search: set[int] = field(default_factory=set)
     pending_free_reset: dict[int, int] = field(default_factory=dict)
     office_sessions: dict[int, OfficeSession] = field(default_factory=dict)

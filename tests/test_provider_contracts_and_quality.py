@@ -11,8 +11,6 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from unittest import mock
 
-from telethon.errors import FloodWaitError, MessageIdInvalidError
-
 from gamas_bot import llm, office_ai
 from gamas_bot.bot import GamasBot
 from gamas_bot.config import NoteRoute, note_routes
@@ -806,39 +804,37 @@ class LearningRobustnessTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await bot.shutdown()
 
-    async def test_render_curation_retries_short_flood_wait_and_falls_back_on_deleted_placeholder(self) -> None:
+    async def test_learning_html_delivery_failure_refunds_credit_and_stores_no_library_item(self) -> None:
+        from tests.support import FakeCallbackEvent
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            settings = make_settings(db_path=root / "cur.db", temp_dir=root / "tmp")
+            settings = make_settings(
+                db_path=root / "cur.db",
+                temp_dir=root / "tmp",
+                avalai_api_key="avalai-test-key",
+            )
             settings.temp_dir.mkdir(parents=True, exist_ok=True)
             db = Database(settings.db_path)
             await db.connect()
+            await db.ensure_user(77)
+            await db.grant_free_plan_once(77, 1000)
+            await db.consume_free_use(77, "deck")
+            item_id = await db.library_add(77, "booklet", 77, 10, None, title="درس", content_text="متن کافی برای ساخت فلش‌کارت " * 30)
             client = FakeTelegramClient()
+            client.send_file = mock.AsyncMock(side_effect=RuntimeError("telegram upload down"))
             bot = GamasBot(settings, db=db, client=client)
             try:
-                bot._curation[77] = {
-                    "kind": "deck",
-                    "items": [{"front": "پ۱", "back": "ج۱", "source": "بخش ۱"}],
-                    "page": 0,
-                    "title": "درس",
-                    "requested": 1,
-                }
-                flaky_msg = mock.AsyncMock()
-                flood = FloodWaitError(request=None, capture=1)
-                flaky_msg.edit = mock.AsyncMock(side_effect=[flood, None])
-                with mock.patch("gamas_bot.bot_learning.asyncio.sleep", new=mock.AsyncMock()):
-                    ok = await bot._render_curation(flaky_msg, 77)
-                self.assertTrue(ok)
-                self.assertEqual(flaky_msg.edit.await_count, 2)
-
-                gone_msg = mock.AsyncMock()
-                gone_msg.edit = mock.AsyncMock(side_effect=MessageIdInvalidError(request=None))
-                ok_fallback = await bot._render_curation(gone_msg, 77)
-                self.assertTrue(ok_fallback)
-                gone_msg.respond.assert_awaited_once()
-                self.assertIn("پیش‌نمایش فلش‌کارت", gone_msg.respond.await_args.args[0])
+                cards = {"cards": [{"front": f"پرسش {i}", "back": f"پاسخ {i}", "source": "بخش ۱"} for i in range(6)]}
+                ev = FakeCallbackEvent(client, data=f"fc:go:{item_id}".encode(), chat_id=77)
+                ev.client = client
+                with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards)):
+                    await bot._handle_callback(ev)
+                self.assertEqual(await db.available_seconds(77), 1000)
+                self.assertEqual(await db.library_count_kind(77, "flashcards"), 0)
             finally:
                 await bot.shutdown()
+                await db.close()
 
 
 if __name__ == "__main__":

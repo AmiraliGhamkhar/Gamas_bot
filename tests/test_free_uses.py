@@ -283,29 +283,34 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(FREE_TRY_RESTORED, self.client.texts[-1]["text"])
         self.assertEqual(await self.db.deck_count(OWNER), 0)
 
-    async def test_a_valid_generation_consumes_the_gift_only_on_save(self):
+    async def test_a_valid_generation_consumes_the_gift_and_delivers_html_immediately(self):
         event = self.press(f"fc:go:{self.item_id}".encode())
         with mock.patch(
             "gamas_bot.bot.complete_json",
             new=mock.AsyncMock(return_value=cards_payload(6)),
         ):
             await self.bot._handle_callback(event)
-        # Claimed for the attempt, but the artwork is not durable yet.
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
-        save = self.press(b"fc:cur:save")
-        await self.bot._handle_callback(save)
         self.assertEqual(await self.db.deck_count(OWNER), 1)
+        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
+        self.assertEqual(len(await self.db.library_list_kind(OWNER, "flashcards")), 1)
 
-    async def test_cancel_restores_the_free_try(self):
+    async def test_delivery_failure_restores_the_free_try(self):
         event = self.press(f"fc:go:{self.item_id}".encode())
-        with mock.patch(
-            "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=cards_payload(6)),
+        with (
+            mock.patch(
+                "gamas_bot.bot.complete_json",
+                new=mock.AsyncMock(return_value=cards_payload(6)),
+            ),
+            mock.patch.object(
+                self.client,
+                "send_file",
+                new=mock.AsyncMock(side_effect=RuntimeError("telegram upload failed")),
+            ),
         ):
             await self.bot._handle_callback(event)
-        await self.bot._handle_callback(self.press(b"fc:cur:cancel"))
         self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
         self.assertEqual(await self.db.deck_count(OWNER), 0)
+        self.assertEqual(await self.db.library_list_kind(OWNER, "flashcards"), [])
 
     async def test_first_quiz_is_free_and_second_is_paid(self):
         await self.db.add_credit(OWNER, 600, note="paid", validity_days=30)
@@ -356,28 +361,25 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state["deck"])
         self.assertTrue(state["quiz"], "the quiz gift must be untouched")
 
-    async def test_curation_delete_drops_an_item_before_save(self):
+    async def test_direct_html_generation_skips_curation_and_saves_all_valid_cards(self):
         event = self.press(f"fc:go:{self.item_id}".encode())
         with mock.patch(
             "gamas_bot.bot.complete_json",
             new=mock.AsyncMock(return_value=cards_payload(6)),
         ):
             await self.bot._handle_callback(event)
-        preview = self.client.texts[-1]["text"]
-        self.assertIn("پیش‌نمایش فلش‌کارت", preview)
-        self.assertIn("← پاسخ 0", preview)
-        # The per-item delete button (R5.1 curation) removes card #1 and
-        # re-renders the preview in place.
-        delete = self.press(b"fc:cur:del:0")
-        await self.bot._handle_callback(delete)
-        re_rendered = delete.edits[-1]["text"]
-        self.assertNotIn("← پاسخ 0", re_rendered)
-        self.assertIn("۵ مورد", re_rendered)
-        await self.bot._handle_callback(self.press(b"fc:cur:save"))
+        summary = self.client.texts[-1]["text"]
+        self.assertIn("فایل تعاملی فلش‌کارت", summary)
+        self.assertNotIn("پیش‌نمایش فلش‌کارت", summary)
         decks = await self.db.decks_list(OWNER)
-        self.assertEqual(decks[0]["card_count"], 5)
+        self.assertEqual(decks[0]["card_count"], 6)
         cards = await self.db.deck_cards(decks[0]["deck_id"])
-        self.assertEqual(cards[0]["front"], "پرسش 1")
+        self.assertEqual(cards[0]["front"], "پرسش 0")
+        lib_items = await self.db.library_list_kind(OWNER, "flashcards")
+        self.assertEqual(len(lib_items), 1)
+        blob = await self.db.library_file_blob(OWNER, lib_items[0]["item_id"])
+        self.assertIsNotNone(blob)
+        self.assertIn("پاسخ 0".encode("utf-8"), bytes(blob["content"]))
 
     async def test_size_preset_changes_count_and_price(self):
         await self.db.add_credit(OWNER, 5000, note="paid", validity_days=30)
@@ -429,41 +431,40 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
 
 
-    async def test_expiry_refunds_unsaved_free_preview(self):
-        self.bot.CURATION_TTL_SECONDS = 0.02
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
-            await self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
-        timer = self.bot._curation_tasks[OWNER]
-        await asyncio.wait_for(timer, 2)
-        self.assertNotIn(OWNER, self.bot._curation)
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
-
-    async def test_expiry_refunds_a_paid_preview_once(self):
-        self.bot.CURATION_TTL_SECONDS = 0.02
+    async def test_paid_delivery_failure_refunds_credit_once(self):
         await self.db.consume_free_use(OWNER, "deck")
         await self.db.add_credit(OWNER, 600, note="اعتبار", validity_days=30)
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
+        with (
+            mock.patch(
+                "gamas_bot.bot.complete_json",
+                new=mock.AsyncMock(return_value=cards_payload(6)),
+            ),
+            mock.patch.object(
+                self.client,
+                "send_file",
+                new=mock.AsyncMock(side_effect=RuntimeError("upload error")),
+            ),
+        ):
             await self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
-        self.assertEqual(await self.db.available_seconds(OWNER), 300)
-        await asyncio.wait_for(self.bot._curation_tasks[OWNER], 2)
         self.assertEqual(await self.db.available_seconds(OWNER), 600)
-        await self.bot._handle_callback(self.press(b"fc:cur:cancel"))
-        self.assertEqual(await self.db.available_seconds(OWNER), 600)
+        self.assertEqual(await self.db.deck_count(OWNER), 0)
 
-    async def test_preview_edit_failure_keeps_gift_pending_until_expiry(self):
+    async def test_progress_edit_failure_does_not_abort_html_delivery(self):
         from tests.support import FakeSentMessage
 
-        self.bot.CURATION_TTL_SECONDS = 0.05
-        with mock.patch.object(FakeSentMessage, "edit", new=mock.AsyncMock(side_effect=RuntimeError("blocked"))), \
-             mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
+        with (
+            mock.patch.object(
+                FakeSentMessage, "edit", new=mock.AsyncMock(side_effect=RuntimeError("blocked"))
+            ),
+            mock.patch(
+                "gamas_bot.bot.complete_json",
+                new=mock.AsyncMock(return_value=cards_payload(6)),
+            ),
+        ):
             await self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
         self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
-        self.assertIn(OWNER, self.bot._curation)
-        await asyncio.wait_for(self.bot._curation_tasks[OWNER], 2)
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
-        self.assertNotIn(OWNER, self.bot._curation)
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
+        self.assertEqual(await self.db.deck_count(OWNER), 1)
+        self.assertEqual(len(await self.db.library_list_kind(OWNER, "flashcards")), 1)
 
     async def test_task_cancellation_restores_free_gift(self):
         started = asyncio.Event()
@@ -479,17 +480,12 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
         self.assertNotIn(OWNER, self.bot._learning_in_flight)
 
-    async def test_simultaneous_save_and_cancel_is_exactly_once(self):
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
-            await self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
-        await asyncio.gather(
-            self.bot._handle_callback(self.press(b"fc:cur:save")),
-            self.bot._handle_callback(self.press(b"fc:cur:cancel")),
-        )
-        decks = await self.db.deck_count(OWNER)
-        self.assertIn(decks, (0, 1))
-        self.assertEqual((await self.db.free_use_state(OWNER))["deck"], decks == 0)
-        self.assertNotIn(OWNER, self.bot._curation)
+    async def test_legacy_curation_callbacks_are_safe_noops(self):
+        for payload in (b"fc:cur:save", b"fc:cur:cancel", b"quiz:cur:save", b"quiz:cur:cancel"):
+            event = self.press(payload)
+            await self.bot._handle_callback(event)
+        self.assertEqual(await self.db.deck_count(OWNER), 0)
+        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
 
     async def test_quiz_second_attempt_without_credit_reaches_paywall(self):
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(5))):
@@ -549,22 +545,30 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
         self.assertNotIn(OWNER, self.bot._learning_in_flight)
 
-    async def test_shutdown_racing_save_never_refunds_a_committed_artifact(self):
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
-            await self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
+    async def test_shutdown_racing_commit_never_refunds_a_committed_artifact(self):
         saving, release = asyncio.Event(), asyncio.Event()
         original = self.db.deck_create_with_cards
+
         async def delayed_save(*args, **kwargs):
             saving.set()
             await release.wait()
             return await original(*args, **kwargs)
-        with mock.patch.object(self.db, "deck_create_with_cards", side_effect=delayed_save):
-            save_task = asyncio.create_task(self.bot._handle_callback(self.press(b"fc:cur:save")))
+
+        with (
+            mock.patch(
+                "gamas_bot.bot.complete_json",
+                new=mock.AsyncMock(return_value=cards_payload(6)),
+            ),
+            mock.patch.object(self.db, "deck_create_with_cards", side_effect=delayed_save),
+        ):
+            gen_task = asyncio.create_task(
+                self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
+            )
             await asyncio.wait_for(saving.wait(), 2)
             shutdown_task = asyncio.create_task(self.bot.shutdown())
             await asyncio.sleep(0)
             release.set()
-            await asyncio.gather(save_task, shutdown_task)
+            await asyncio.gather(gen_task, shutdown_task, return_exceptions=True)
         await self.db.connect()
         self.assertEqual(await self.db.deck_count(OWNER), 1)
         self.assertFalse((await self.db.free_use_state(OWNER))["deck"])

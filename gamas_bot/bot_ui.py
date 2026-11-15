@@ -33,13 +33,8 @@ LEARNING_LEGACY_NOTICE = (
     "🧪 آزمون و 🃏 فلش‌کارت فقط برای جزوه‌های تازه کار می‌کند."
 )
 QUIZ_START_GUIDANCE = (
-    "سؤال‌های متوسط تا سخت؛ تعداد را انتخاب کنید.\n"
-    "هر پاسخ درست ۱۰ امتیاز دارد."
-)
-LEADERBOARD_EMPTY = (
-    "🏆 لیدربورد\n\n"
-    "هنوز امتیازی ثبت نشده است.\n"
-    "اولین آزمون خود را از «📚 کتابخانه من» شروع کنید."
+    "سؤال‌های متوسط تا سخت با پاسخ تشریحی در قالب فایل تعاملی HTML آفلاین.\n"
+    "تعداد سؤال را انتخاب کنید تا فایل مستقیم برایتان ارسال شود."
 )
 FLASHCARD_EMPTY = (
     "🃏 فلش‌کارت‌ها\n\n"
@@ -62,9 +57,7 @@ FLASHCARD_ASK_FRONT = "پرسش کارت را بفرستید:"
 FLASHCARD_ASK_BACK = "پاسخ کارت را بفرستید:"
 LEARNING_STALE_ALERT = "این آزمون دیگر معتبر نیست."
 LEARNING_BUSY_ALERT = "درخواست قبلی شما در حال پردازش است؛ کمی صبر کنید."
-LEADERBOARD_FALLBACK_NAME = "کاربر گاماس"
 QUIZ_COUNTS = (5, 10, 15, 20)
-QUIZ_POINTS_PER_ANSWER = 10
 FREE_TRY_BADGE = "🎁 اولین بار رایگان"
 FREE_TRY_USED_NOTICE = (
     "🎁 هدیهٔ اولین بار شما برای این بخش استفاده شده است؛ "
@@ -74,10 +67,6 @@ FREE_TRY_RESTORED = "🎁 هدیهٔ اولین بار شما برگشت؛ دو�
 LEARNING_REFUND_PENDING_NOTICE = (
     "بازگشت اعتبار یا هدیه فعلاً ناموفق بود؛ لطفاً با پشتیبانی تماس بگیرید."
 )
-CURATION_GUIDANCE = (
-    "هر مورد را که نمی‌خواهید حذف کنید، بعد «✅ ذخیره» را بزنید."
-)
-CURATION_STALE_ALERT = "این پیش‌نمایش دیگر معتبر نیست؛ دوباره بسازید."
 LEARNING_PROGRESS_EDIT_TIMEOUT_SECONDS = 1.0
 
 DOC_UNSUPPORTED_HINT = (

@@ -125,9 +125,8 @@ configured AI calls still cost the operator money.
   per user; files themselves stay in Telegram. Pruning a reference does not
   delete cached extracted text.
 - **Learning**: quizzes and flashcards generated from a saved booklet or
-  document, previewed before saving. Costs are in [Billing](BILLING.md).
-- **Leaderboard**: native Telegram ranking from quiz answers, including the
-  caller's own rank. Every study workflow stays inside the chat.
+  document, previewed before saving. Costs are in [Billing](BILLING.md). Every
+  study workflow stays inside the chat.
 
 ## Privacy summary
 

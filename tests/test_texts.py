@@ -130,8 +130,6 @@ class MainAndHelpCopyTests(unittest.TestCase):
         self.assertIn("فعلاً فعال نیست", texts.documents_empty(notes_configured=False))
         self.assertIn("کارت‌های دستی", texts.flashcard_empty(notes_configured=False))
         self.assertNotIn("از یک جزوه بسازید", texts.flashcard_empty(notes_configured=False))
-        self.assertIn("فعلاً فعال نیست", texts.leaderboard_empty(notes_configured=False))
-        self.assertIn("اولین آزمون", texts.leaderboard_empty(notes_configured=True))
 
     def test_referral_rules_explain_first_start_eligibility(self):
         self.assertIn("نخستین ورود دوست", texts.REFERRALS_RULES)

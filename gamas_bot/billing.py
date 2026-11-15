@@ -7,8 +7,8 @@ and one second costs exactly 100/3 credits. The ledger never stores a fraction,
 so :func:`seconds_to_credits` rounds up and :func:`credits_to_seconds` rounds
 down — the user is never charged more time than the credits they hold.
 
-That ratio is the single definition the ledger, the Telegram plan screen, the
-mini app and the tests share; no screen may invent its own conversion.
+That ratio is the single definition the ledger, the Telegram plan screen
+and the tests share; no screen may invent its own conversion.
 
 The catalogue in this module is the single source of truth used by the database
 seed/upsert, by the Telegram plan screen, the wallet and the tests, so a price
@@ -146,7 +146,7 @@ def format_credits(credits: int | float | None) -> str:
 
     ``None`` renders «نامشخص»: an unknown balance must never look like zero.
     The number is grouped with the Persian thousands separator so a six-digit
-    balance stays readable in the wallet and the mini app.
+    balance stays readable in the wallet.
     """
     if credits is None:
         return "نامشخص"

@@ -228,6 +228,10 @@ class LibraryRepositoryMixin(DatabaseCore):
         )
         return [dict(row) for row in rows]
 
+    async def _library_columns(self) -> set[str]:
+        rows = await _rows(self.read_db, "PRAGMA table_info(library_items)")
+        return {str(row[1]) for row in rows}
+
     async def library_add(
         self,
         user_id: int,
@@ -237,22 +241,271 @@ class LibraryRepositoryMixin(DatabaseCore):
         submission_id: int | None = None,
         *,
         title: str = "",
+        delivered: bool = True,
+        artifact_kind: str = "",
+        content_text: str | None = None,
     ) -> int:
+        cols = await self._library_columns()
+        async with self._transaction():
+            if "delivered" in cols and "artifact_kind" in cols:
+                cursor = await self.db.execute(
+                    "INSERT INTO library_items(user_id, submission_id, kind, chat_id, "
+                    "message_id, title, created_at, content_text, delivered, artifact_kind) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        int(user_id),
+                        submission_id,
+                        kind,
+                        int(chat_id),
+                        int(message_id),
+                        str(title),
+                        iso(self._now()),
+                        str(content_text) if content_text is not None else None,
+                        int(bool(delivered)),
+                        str(artifact_kind),
+                    ),
+                )
+            else:
+                cursor = await self.db.execute(
+                    "INSERT INTO library_items(user_id, submission_id, kind, chat_id, "
+                    "message_id, title, created_at, content_text) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        int(user_id),
+                        submission_id,
+                        kind,
+                        int(chat_id),
+                        int(message_id),
+                        str(title),
+                        iso(self._now()),
+                        str(content_text) if content_text is not None else None,
+                    ),
+                )
+            return int(cursor.lastrowid or 0)
+
+    async def library_record_delivered_file(
+        self,
+        user_id: int,
+        kind: str,
+        *,
+        title: str,
+        chat_id: int,
+        message_id: int,
+        submission_id: int | None = None,
+        artifact_kind: str = "",
+        content_text: str | None = None,
+        filename: str = "",
+        content_type: str = "",
+        content: bytes | None = None,
+    ) -> int:
+        """Persist one bot-delivered file into the user's library (and optional blob)."""
+        uid = int(user_id)
+        now = iso(self._now())
+        payload = bytes(content) if content is not None else None
+        digest = hashlib.sha256(payload).hexdigest() if payload else ""
+        async with self._transaction():
+            item_id = 0
+            if submission_id is not None and artifact_kind:
+                existing = await _rows(
+                    self.db,
+                    "SELECT item_id FROM library_items "
+                    "WHERE user_id = ? AND submission_id = ? AND artifact_kind = ? "
+                    "AND delivered = 1 ORDER BY item_id DESC LIMIT 1",
+                    (uid, int(submission_id), str(artifact_kind)),
+                )
+                if existing:
+                    item_id = int(existing[0][0])
+                    await self.db.execute(
+                        "UPDATE library_items SET kind = ?, chat_id = ?, message_id = ?, "
+                        "title = ?, created_at = ?, unavailable = 0, "
+                        "content_text = COALESCE(?, content_text) "
+                        "WHERE item_id = ? AND user_id = ?",
+                        (
+                            str(kind),
+                            int(chat_id),
+                            int(message_id),
+                            str(title)[:200],
+                            now,
+                            str(content_text) if content_text is not None else None,
+                            item_id,
+                            uid,
+                        ),
+                    )
+            if not item_id:
+                cursor = await self.db.execute(
+                    "INSERT INTO library_items(user_id, submission_id, kind, chat_id, "
+                    "message_id, title, created_at, content_text, delivered, artifact_kind) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                    (
+                        uid,
+                        int(submission_id) if submission_id is not None else None,
+                        str(kind),
+                        int(chat_id),
+                        int(message_id),
+                        str(title)[:200],
+                        now,
+                        str(content_text) if content_text is not None else None,
+                        str(artifact_kind),
+                    ),
+                )
+                item_id = int(cursor.lastrowid or 0)
+            if payload and filename:
+                await self.db.execute(
+                    "INSERT INTO library_file_blobs("
+                    "item_id, user_id, filename, content_type, content, sha256, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(item_id) DO UPDATE SET "
+                    "filename = excluded.filename, content_type = excluded.content_type, "
+                    "content = excluded.content, sha256 = excluded.sha256, "
+                    "updated_at = excluded.updated_at",
+                    (
+                        item_id,
+                        uid,
+                        str(filename)[:200],
+                        str(content_type or "application/octet-stream")[:120],
+                        payload,
+                        digest,
+                        now,
+                        now,
+                    ),
+                )
+            return item_id
+
+    async def library_file_blob(
+        self, user_id: int, item_id: int
+    ) -> dict[str, Any] | None:
+        """Return one owner's persisted library file blob, never another user's."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT item_id, user_id, filename, content_type, content, sha256, "
+            "created_at, updated_at FROM library_file_blobs "
+            "WHERE item_id = ? AND user_id = ?",
+            (int(item_id), int(user_id)),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def library_delete(self, user_id: int, item_id: int) -> bool:
+        """Remove a delivered file from the user's library (cascades its stored blob)."""
         async with self._transaction():
             cursor = await self.db.execute(
-                "INSERT INTO library_items(user_id, submission_id, kind, chat_id, "
-                "message_id, title, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    int(user_id),
-                    submission_id,
-                    kind,
-                    int(chat_id),
-                    int(message_id),
-                    str(title),
-                    iso(self._now()),
-                ),
+                "DELETE FROM library_items WHERE user_id = ? AND item_id = ? AND delivered = 1",
+                (int(user_id), int(item_id)),
             )
-            return int(cursor.lastrowid or 0)
+            return cursor.rowcount == 1
+
+    async def library_submission_source_item(
+        self, user_id: int, submission_id: int
+    ) -> dict[str, Any] | None:
+        """Return an internal/existing booklet source record for one submission."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
+            "title, created_at, unavailable, content_text, delivered, artifact_kind "
+            "FROM library_items "
+            "WHERE user_id = ? AND submission_id = ? AND kind = 'booklet' "
+            "AND unavailable = 0 ORDER BY delivered ASC, item_id DESC LIMIT 1",
+            (int(user_id), int(submission_id)),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def library_submission_source_text(
+        self, user_id: int, submission_id: int
+    ) -> str | None:
+        """Return cached booklet text for a submission regardless of delivered flag."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT content_text FROM library_items "
+            "WHERE user_id = ? AND submission_id = ? "
+            "AND content_text IS NOT NULL AND trim(content_text) != '' "
+            "ORDER BY item_id DESC LIMIT 1",
+            (int(user_id), int(submission_id)),
+        )
+        return str(rows[0][0]) if rows and rows[0][0] else None
+
+    @staticmethod
+    def _category_kinds(category: str) -> tuple[str, ...]:
+        mapping: dict[str, tuple[str, ...]] = {
+            "booklet": ("booklet",),
+            "quiz": ("quiz",),
+            "flashcards": ("flashcards",),
+            "other": ("office", "transcript"),
+        }
+        kinds = mapping.get(category)
+        if kinds is None:
+            raise ValueError(f"unknown library category: {category!r}")
+        return kinds
+
+    async def library_category_counts(self, user_id: int) -> dict[str, int]:
+        """Return delivered file counts grouped by user-facing library category."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT kind, COUNT(*) FROM library_items "
+            "WHERE user_id = ? AND delivered = 1 GROUP BY kind",
+            (int(user_id),),
+        )
+        by_kind = {str(row[0]): int(row[1]) for row in rows}
+        booklet = by_kind.get("booklet", 0)
+        quiz = by_kind.get("quiz", 0)
+        flashcards = by_kind.get("flashcards", 0)
+        other = by_kind.get("office", 0) + by_kind.get("transcript", 0)
+        return {
+            "booklet": booklet,
+            "quiz": quiz,
+            "flashcards": flashcards,
+            "other": other,
+            "total": booklet + quiz + flashcards + other,
+        }
+
+    async def library_list_category(
+        self, user_id: int, category: str, *, limit: int = 6, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        kinds = self._category_kinds(category)
+        placeholders = ",".join("?" for _ in kinds)
+        rows = await _rows(
+            self.read_db,
+            "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
+            "title, created_at, unavailable, delivered, artifact_kind "
+            f"FROM library_items WHERE user_id = ? AND delivered = 1 AND kind IN ({placeholders}) "
+            "ORDER BY item_id DESC LIMIT ? OFFSET ?",
+            (int(user_id), *kinds, max(1, int(limit)), max(0, int(offset))),
+        )
+        return [dict(row) for row in rows]
+
+    async def library_count_category(self, user_id: int, category: str) -> int:
+        kinds = self._category_kinds(category)
+        placeholders = ",".join("?" for _ in kinds)
+        rows = await _rows(
+            self.read_db,
+            f"SELECT COUNT(*) FROM library_items "
+            f"WHERE user_id = ? AND delivered = 1 AND kind IN ({placeholders})",
+            (int(user_id), *kinds),
+        )
+        return int(rows[0][0]) if rows else 0
+
+    async def library_source_booklets(
+        self, user_id: int, *, limit: int = 6, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Delivered booklets that carry cached text for quiz/flashcard generation."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
+            "title, created_at, unavailable, delivered, artifact_kind "
+            "FROM library_items WHERE user_id = ? AND delivered = 1 AND kind = 'booklet' "
+            "AND content_text IS NOT NULL AND trim(content_text) != '' "
+            "ORDER BY item_id DESC LIMIT ? OFFSET ?",
+            (int(user_id), max(1, int(limit)), max(0, int(offset))),
+        )
+        return [dict(row) for row in rows]
+
+    async def library_source_booklets_count(self, user_id: int) -> int:
+        rows = await _rows(
+            self.read_db,
+            "SELECT COUNT(*) FROM library_items "
+            "WHERE user_id = ? AND delivered = 1 AND kind = 'booklet' "
+            "AND content_text IS NOT NULL AND trim(content_text) != ''",
+            (int(user_id),),
+        )
+        return int(rows[0][0]) if rows else 0
 
     async def library_list(
         self, user_id: int, limit: int = 6, offset: int = 0
@@ -260,32 +513,47 @@ class LibraryRepositoryMixin(DatabaseCore):
         rows = await _rows(
             self.read_db,
             "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
-            "title, created_at, unavailable FROM library_items WHERE user_id = ? "
+            "title, created_at, unavailable, delivered, artifact_kind "
+            "FROM library_items WHERE user_id = ? AND delivered = 1 "
             "ORDER BY item_id DESC LIMIT ? OFFSET ?",
             (int(user_id), max(0, int(limit)), max(0, int(offset))),
         )
         return [dict(row) for row in rows]
 
     async def library_item(self, user_id: int, item_id: int) -> dict[str, Any] | None:
-        rows = await _rows(
-            self.read_db,
-            "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
-            "title, created_at, unavailable FROM library_items "
-            "WHERE user_id = ? AND item_id = ?",
-            (int(user_id), int(item_id)),
-        )
+        cols = await self._library_columns()
+        if "delivered" in cols and "artifact_kind" in cols:
+            sql = (
+                "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
+                "title, created_at, unavailable, delivered, artifact_kind FROM library_items "
+                "WHERE user_id = ? AND item_id = ?"
+            )
+        else:
+            sql = (
+                "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
+                "title, created_at, unavailable, 1 AS delivered, '' AS artifact_kind "
+                "FROM library_items WHERE user_id = ? AND item_id = ?"
+            )
+        rows = await _rows(self.read_db, sql, (int(user_id), int(item_id)))
         return dict(rows[0]) if rows else None
 
     async def library_item_detail(
         self, user_id: int, item_id: int
     ) -> dict[str, Any] | None:
-        rows = await _rows(
-            self.read_db,
-            "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
-            "title, created_at, unavailable, content_text FROM library_items "
-            "WHERE user_id = ? AND item_id = ?",
-            (int(user_id), int(item_id)),
-        )
+        cols = await self._library_columns()
+        if "delivered" in cols and "artifact_kind" in cols:
+            sql = (
+                "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
+                "title, created_at, unavailable, content_text, delivered, artifact_kind "
+                "FROM library_items WHERE user_id = ? AND item_id = ?"
+            )
+        else:
+            sql = (
+                "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
+                "title, created_at, unavailable, content_text, 1 AS delivered, '' AS artifact_kind "
+                "FROM library_items WHERE user_id = ? AND item_id = ?"
+            )
+        rows = await _rows(self.read_db, sql, (int(user_id), int(item_id)))
         return dict(rows[0]) if rows else None
 
     async def library_set_content(self, item_id: int, content_text: str) -> None:
@@ -314,7 +582,7 @@ class LibraryRepositoryMixin(DatabaseCore):
     async def library_count(self, user_id: int) -> int:
         rows = await _rows(
             self.read_db,
-            "SELECT COUNT(*) FROM library_items WHERE user_id = ?",
+            "SELECT COUNT(*) FROM library_items WHERE user_id = ? AND delivered = 1",
             (int(user_id),),
         )
         return int(rows[0][0]) if rows else 0
@@ -344,8 +612,9 @@ class LibraryRepositoryMixin(DatabaseCore):
         )
         async with self._transaction():
             cursor = await self.db.execute(
-                "DELETE FROM library_items WHERE user_id = ? AND item_id NOT IN ("
-                "SELECT item_id FROM library_items WHERE user_id = ? "
+                "DELETE FROM library_items WHERE user_id = ? AND delivered = 1 "
+                "AND item_id NOT IN ("
+                "SELECT item_id FROM library_items WHERE user_id = ? AND delivered = 1 "
                 "ORDER BY item_id DESC LIMIT ?) "
                 "AND NOT EXISTS (SELECT 1 FROM quiz_sessions q "
                 "WHERE q.user_id = library_items.user_id AND q.item_id = library_items.item_id "
@@ -360,8 +629,8 @@ class LibraryRepositoryMixin(DatabaseCore):
         rows = await _rows(
             self.read_db,
             "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
-            "title, created_at, unavailable FROM library_items "
-            "WHERE user_id = ? AND kind = ? "
+            "title, created_at, unavailable, delivered, artifact_kind "
+            "FROM library_items WHERE user_id = ? AND delivered = 1 AND kind = ? "
             "ORDER BY item_id DESC LIMIT ? OFFSET ?",
             (int(user_id), str(kind), max(1, int(limit)), max(0, int(offset))),
         )
@@ -370,7 +639,8 @@ class LibraryRepositoryMixin(DatabaseCore):
     async def library_count_kind(self, user_id: int, kind: str) -> int:
         rows = await _rows(
             self.read_db,
-            "SELECT COUNT(*) FROM library_items WHERE user_id = ? AND kind = ?",
+            "SELECT COUNT(*) FROM library_items "
+            "WHERE user_id = ? AND delivered = 1 AND kind = ?",
             (int(user_id), str(kind)),
         )
         return int(rows[0][0]) if rows else 0

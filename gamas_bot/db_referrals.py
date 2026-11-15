@@ -250,7 +250,7 @@ class ReferralsRepositoryMixin(DatabaseCore):
         }
 
     async def top_referrers(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Read-only leaderboard for the administrator referral report."""
+        """Read-only top-inviters summary for the administrator referral report."""
         rows = await _rows(
             self.read_db,
             "WITH invite_counts AS ("

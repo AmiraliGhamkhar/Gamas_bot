@@ -461,6 +461,43 @@ class RemovedMiniAppTests(unittest.TestCase):
                     self.assertFalse((REPO_ROOT / "docs" / guide).exists())
 
 
+class RemovedLeaderboardTests(unittest.TestCase):
+    """The leaderboard and unused Studio revision table are gone."""
+
+    def test_leaderboard_ui_and_db_symbols_are_absent(self):
+        from gamas_bot import bot, bot_learning, bot_ui, db_core, db_learning, texts
+
+        for name in (
+            "BTN_LEADERBOARD",
+            "BTN_LEADERBOARD_LEGACY",
+            "BTN_ADMIN_TOP_USERS",
+            "INVALID_GIFT",
+            "LEADERBOARD_EMPTY_RAW_ONLY",
+            "leaderboard_empty",
+        ):
+            with self.subTest(module="texts", name=name):
+                self.assertFalse(hasattr(texts, name))
+        for name in ("LEADERBOARD_EMPTY", "LEADERBOARD_FALLBACK_NAME"):
+            with self.subTest(module="bot_ui", name=name):
+                self.assertFalse(hasattr(bot_ui, name))
+                self.assertFalse(hasattr(bot, name))
+        for name in (
+            "_show_leaderboard",
+            "_admin_board",
+            "_admin_gift_pick",
+            "_admin_gift_confirm",
+            "_gift_plan",
+            "_admin_gift_execute",
+        ):
+            with self.subTest(module="bot_learning", name=name):
+                self.assertFalse(hasattr(bot_learning.LearningWorkflowMixin, name))
+        for name in ("leaderboard_top", "leaderboard_rank", "leaderboard_admin_top"):
+            with self.subTest(module="db_learning", name=name):
+                self.assertFalse(hasattr(db_learning.LearningRepositoryMixin, name))
+        self.assertNotIn("booklet_revisions", db_core.APPLICATION_TABLES)
+        self.assertNotIn("quiz_point_events", db_core.APPLICATION_TABLES)
+
+
 class VersionConsistencyTests(unittest.TestCase):
     def test_package_version_matches_pyproject(self):
         import tomllib

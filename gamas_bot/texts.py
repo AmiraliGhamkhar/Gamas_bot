@@ -33,8 +33,6 @@ BTN_WALLET_LEGACY: Final = "🛒 خرید اشتراک"
 BTN_WALLET_UPGRADE_LEGACY: Final = "🛒 افزایش اعتبار"
 BTN_OFFICE: Final = "آفیس رایگان"
 BTN_OFFICE_LEGACY: Final = "🗂 آفیس رایگان"
-BTN_LEADERBOARD: Final = "لیدربورد"
-BTN_LEADERBOARD_LEGACY: Final = "🏆 لیدربورد"
 BTN_SUPPORT: Final = "پشتیبانی"
 BTN_SUPPORT_LEGACY: Final = "🎧 پشتیبانی"
 BTN_HELP: Final = "راهنما"
@@ -48,6 +46,18 @@ BTN_CANCEL: Final = "لغو"
 BTN_BOOKLETS: Final = "همهٔ موارد"
 BTN_DOCUMENTS: Final = "اسناد"
 BTN_FLASHCARDS: Final = "فلش‌کارت‌ها"
+BTN_LIB_BOOKLETS_TAB: Final = "📖 جزوه‌ها ({count})"
+BTN_LIB_QUIZZES_TAB: Final = "🧪 کوییزها ({count})"
+BTN_LIB_FLASHCARDS_TAB: Final = "🃏 فلش‌کارت‌ها ({count})"
+BTN_LIB_OTHER_TAB: Final = "🗂 سایر فایل‌ها ({count})"
+BTN_LIB_QUIZZES_SHORT: Final = "🧪 کوییزها"
+BTN_LIB_FLASHCARDS_SHORT: Final = "🃏 فلش‌کارت‌ها"
+BTN_MANUAL_FLASHCARD: Final = "✍️ ساخت فلش‌کارت دستی"
+BTN_AI_QUIZ_FROM_BOOKLET: Final = "🤖 ساخت کوییز از جزوه"
+BTN_AI_FC_FROM_BOOKLET: Final = "🤖 ساخت فلش‌کارت از جزوه"
+BTN_DELETE_ITEM: Final = "🗑 حذف از کتابخانه"
+BTN_DELETE_ICON: Final = "🗑"
+BTN_CONFIRM_DELETE: Final = "✅ بله، حذف کن"
 BTN_HISTORY: Final = "نتایج پردازش"
 BTN_PREV: Final = "◀️ قبلی"
 BTN_NEXT: Final = "بعدی ▶️"
@@ -117,7 +127,6 @@ BTN_ADMIN_SYSTEM: Final = "🩺 سامانه"
 BTN_ADMIN_SUPPORT: Final = "🎧 مدیریت پشتیبانی"
 BTN_ADMIN_BROADCAST: Final = "📣 ارسال پیام"
 BTN_ADMIN_AUDIT: Final = "🛡 گزارش فعالیت‌ها"
-BTN_ADMIN_TOP_USERS: Final = "🏆 برترین کاربران"
 BTN_ADMIN_BACK_USER: Final = "↩️ پنل کاربری"
 
 # Subscription buttons (the labels the mandatory-channel gate renders).
@@ -366,16 +375,78 @@ def help_screen(
 # --------------------------------------------------------------------- library
 UNLIMITED_BALANCE: Final = "نامحدود ⭐ (کاربر ویژه)"
 LIBRARY_TITLE: Final = "📚 کتابخانه من"
+LIBRARY_HOME_SUBTITLE: Final = (
+    "فقط فایل‌هایی که از ربات دریافت کرده‌اید این‌جا دسته‌بندی و ذخیره می‌شوند:"
+)
+LIBRARY_HOME_SUMMARY: Final = (
+    "📖 جزوه‌ها: {booklet}   |   🧪 کوییزها: {quiz}\n"
+    "🃏 فلش‌کارت‌ها: {flashcards}   |   🗂 سایر فایل‌ها: {other}"
+)
 LIBRARY_EMPTY: Final = (
     "📚 کتابخانه من\n\n"
-    "کتابخانهٔ شما خالی است.\n"
-    "اولین فایل درس را بفرستید؛ متن و جزوه به‌صورت خودکار این‌جا ذخیره می‌شوند."
+    "هنوز فایلی از ربات دریافت نکرده‌اید.\n"
+    "هر جزوه، کوییز تعاملی HTML، فلش‌کارت تعاملی HTML یا خروجی آفیس که از ربات "
+    "دریافت کنید به‌صورت خودکار و دسته‌بندی‌شده این‌جا ذخیره می‌شود."
 )
 LIBRARY_EMPTY_RAW_ONLY: Final = (
     "📚 کتابخانه من\n\n"
-    "کتابخانهٔ شما خالی است.\n"
-    "فایل صوتی/ویدیویی بفرستید تا متن گفتار ذخیره شود؛ متن سند هم پس از استخراج این‌جا می‌ماند."
+    "هنوز فایلی از ربات دریافت نکرده‌اید.\n"
+    "هر فایل متنی، خروجی آفیس یا فلش‌کارت دستی که از ربات دریافت کنید این‌جا ذخیره می‌شود."
 )
+LIBRARY_CATEGORY_TITLES: Final[dict[str, str]] = {
+    "booklet": "📖 جزوه‌ها",
+    "quiz": "🧪 کوییزها (HTML تعاملی)",
+    "flashcards": "🃏 فلش‌کارت‌ها (HTML تعاملی)",
+    "other": "🗂 سایر فایل‌ها",
+}
+LIBRARY_CATEGORY_EMPTY: Final[dict[str, str]] = {
+    "booklet": (
+        "هنوز جزوه‌ای از ربات دریافت نکرده‌اید.\n"
+        "فایل صوتی، ویدیویی یا سند درسی بفرستید و پس از ساخت جزوه، نسخهٔ PDF، Word "
+        "یا مرور HTML آن را دریافت کنید تا این‌جا بماند."
+    ),
+    "quiz": (
+        "هنوز کوییز تعاملی نساخته‌اید.\n"
+        "از روی هر جزوه یا سند می‌توانید کوییز HTML آفلاین بسازید تا مستقیم در چت "
+        "ارسال و همین‌جا ذخیره شود."
+    ),
+    "flashcards": (
+        "هنوز فلش‌کارت تعاملی نساخته‌اید.\n"
+        "می‌توانید از روی جزوه‌ها فلش‌کارت هوشمند بسازید یا همین الان فلش‌کارت دستی بسازید."
+    ),
+    "other": (
+        "هنوز فایل خروجی آفیس یا متن خام (TXT) دریافت نکرده‌اید."
+    ),
+}
+LIBRARY_CATEGORY_EMPTY_RAW_ONLY: Final[dict[str, str]] = {
+    "booklet": (
+        "هنوز جزوه‌ای از ربات دریافت نکرده‌اید.\n"
+        "فایل‌های دریافتی جزوه به‌صورت خودکار این‌جا ذخیره می‌شوند."
+    ),
+    "quiz": (
+        "ساخت آزمون هوشمند فعلاً فعال نیست."
+    ),
+    "flashcards": (
+        "هنوز فلش‌کارت دستی نساخته‌اید.\n"
+        "با دکمهٔ «✍️ ساخت فلش‌کارت دستی» می‌توانید کارت‌های دستی خود را بسازید و فایل تعاملی HTML دریافت کنید."
+    ),
+    "other": (
+        "هنوز فایل خروجی آفیس یا متن خام (TXT) دریافت نکرده‌اید."
+    ),
+}
+
+
+def library_category_empty(category: str, *, notes_configured: bool) -> str:
+    """Return category-specific empty copy honoring AI availability."""
+    table = LIBRARY_CATEGORY_EMPTY if notes_configured else LIBRARY_CATEGORY_EMPTY_RAW_ONLY
+    return table.get(category, LIBRARY_EMPTY_RAW_ONLY)
+LIBRARY_CATEGORY_TAP_HINT: Final = "برای دریافت مجدد فایل، روی نام آن بزنید:"
+LIBRARY_CATEGORY_BOOKLET_HINT: Final = (
+    "برای دریافت مجدد یا ساخت کوییز و فلش‌کارت، روی جزوه بزنید:"
+)
+LIBRARY_DELETE_CONFIRM: Final = "آیا از حذف «{title}» از کتابخانه مطمئن هستید؟"
+LIBRARY_ITEM_DELETED: Final = "🗑 فایل از کتابخانه حذف شد."
+ITEM_SENT_DONE: Final = "✅ فایل در گفتگو ارسال شد."
 
 
 def library_empty(*, notes_configured: bool) -> str:
@@ -427,7 +498,6 @@ INVALID_PERIOD: Final = "بازهٔ زمانی نامعتبر است."
 INVALID_REPORT: Final = "بخش گزارش نامعتبر است."
 INVALID_ORDERS_PAGE: Final = "صفحهٔ سفارش‌ها نامعتبر است."
 INVALID_ORDER_ID: Final = "شناسهٔ سفارش نامعتبر است."
-INVALID_GIFT: Final = "درخواست هدیه نامعتبر است."
 INVALID_PAYMENTS_PAGE: Final = "صفحهٔ پرداخت‌ها نامعتبر است."
 INVALID_REPORT_PAGE: Final = "صفحهٔ گزارش نامعتبر است."
 INVALID_COMMAND_TEXT: Final = "دستور نامعتبر است؛ متن پیام را بفرستید یا /cancel بزنید."
@@ -487,10 +557,6 @@ FLASHCARD_EMPTY_RAW_ONLY: Final = (
     "هنوز مجموعه‌ای نساخته‌اید. می‌توانید کارت‌های دستی خودتان را اضافه کنید؛ "
     "ساخت خودکار از جزوه فعلاً فعال نیست."
 )
-LEADERBOARD_EMPTY_RAW_ONLY: Final = (
-    "🏆 لیدربورد\n\n"
-    "هنوز امتیازی ثبت نشده است. ساخت خودکار آزمون، راه کسب امتیاز، فعلاً فعال نیست."
-)
 
 
 def flashcard_empty(*, notes_configured: bool) -> str:
@@ -501,17 +567,6 @@ def flashcard_empty(*, notes_configured: bool) -> str:
             "هنوز مجموعه‌ای نساخته‌اید. از یک جزوه بسازید یا کارت‌های دستی خودتان را اضافه کنید."
         )
     return FLASHCARD_EMPTY_RAW_ONLY
-
-
-def leaderboard_empty(*, notes_configured: bool) -> str:
-    """Avoid suggesting a quiz when the configured note/learning provider is absent."""
-    if notes_configured:
-        return (
-            "🏆 لیدربورد\n\n"
-            "هنوز امتیازی ثبت نشده است.\n"
-            "اولین آزمون خود را از «📚 کتابخانه من» شروع کنید."
-        )
-    return LEADERBOARD_EMPTY_RAW_ONLY
 
 # ------------------------------------------------------------------ membership
 SUBSCRIPTION_REQUIRED_TEMPLATE: Final = (
@@ -838,11 +893,6 @@ PROGRESS_WORK_DONE: Final = "✅ آماده شد"
 PROGRESS_DEFAULT_FAIL: Final = "❌ پردازش تکمیل نشد."
 PROGRESS_WORK_FAIL: Final = "❌ انجام نشد."
 
-CURATION_DELIVERY_RETRY: Final = "پیش‌نمایش ارسال نشد؛ با /start دوباره تلاش کنید."
-CURATION_RESUME_BUTTON: Final = "🧐 ادامهٔ بررسی"
-
-CURATION_SOURCE_REMOVED: Final = "منبع این پیش‌نمایش حذف شده بود؛ مبلغ بازگشت داده شد."
-CURATION_SOURCE_REMOVED_FREE: Final = "منبع این پیش‌نمایش حذف شده بود؛ هزینه‌ای کسر نشد."
 LEARNING_PRORATA_REFUND: Final = "اعتبار بازگشتی: {duration}"
 PAYMENT_HISTORY_CANCELLED: Final = "لغوشده"
 
@@ -856,3 +906,12 @@ LEARNING_PRODUCING: Final = "در حال تولید {label}"
 
 LEARNING_DECK_SAVED: Final = "✅ مجموعه ذخیره شد."
 LEARNING_QUIZ_READY: Final = "✅ آزمون آماده است."
+LEARNING_HTML_SENT_QUIZ: Final = (
+    "✅ فایل تعاملی آزمون ({count} سؤال) ارسال شد و در بخش «🧪 کوییزها» در کتابخانه ذخیره شد."
+)
+LEARNING_HTML_SENT_DECK: Final = (
+    "✅ فایل تعاملی فلش‌کارت ({count} کارت) ارسال شد و در بخش «🃏 فلش‌کارت‌ها» در کتابخانه ذخیره شد."
+)
+LEARNING_MANUAL_HTML_SENT: Final = (
+    "✅ فایل تعاملی فلش‌کارت دستی ({count} کارت) ارسال شد و در بخش «🃏 فلش‌کارت‌ها» در کتابخانه ذخیره شد."
+)

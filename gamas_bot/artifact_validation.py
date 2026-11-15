@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import zipfile
 from dataclasses import dataclass
@@ -350,3 +351,120 @@ def validate_review_html_artifact(content: bytes) -> None:
     report = inspect_review_html(content)
     if report.errors:
         raise ValueError("renderer returned an invalid review HTML: " + "; ".join(report.errors[:5]))
+
+
+_LEARNING_SCRIPT_RE = re.compile(
+    r"<script(?P<attrs>[^>]*)>(?P<body>.*?)</script>",
+    re.IGNORECASE | re.DOTALL,
+)
+_LEARNING_STYLE_RE = re.compile(
+    r"<style(?:\s[^>]*)?>(?P<body>.*?)</style>",
+    re.IGNORECASE | re.DOTALL,
+)
+_LEARNING_JSON_TYPE_RE = re.compile(
+    r'\btype\s*=\s*["\']application/json["\']',
+    re.IGNORECASE,
+)
+_LEARNING_DATA_ID_RE = re.compile(
+    r'\bid\s*=\s*["\']gamas-learning-data["\']',
+    re.IGNORECASE,
+)
+
+
+def validate_learning_html_artifact(
+    content: bytes,
+    *,
+    expected_kind: str | None = None,
+    max_bytes: int = MAX_REVIEW_HTML_BYTES,
+) -> None:
+    """Raise ``ValueError`` when an interactive quiz/flashcard HTML is unsafe or invalid."""
+    from .review_sheet_html import script_hash
+
+    if not content or len(content) > max_bytes:
+        raise ValueError("learning HTML artifact is empty or exceeds size limit")
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("learning HTML artifact is not valid UTF-8") from exc
+    if not text.lstrip().lower().startswith("<!doctype html>"):
+        raise ValueError("learning HTML artifact must start with <!DOCTYPE html>")
+
+    scanner = _ReviewHtmlScanner()
+    try:
+        scanner.feed(text)
+        scanner.close()
+    except Exception as exc:
+        raise ValueError("learning HTML artifact could not be parsed") from exc
+
+    tags = scanner.tags
+    if not tags or tags[0][0] != "html" or tags[0][1].get("lang") != "fa" or tags[0][1].get("dir") != "rtl":
+        raise ValueError('learning HTML root element must be <html lang="fa" dir="rtl">')
+    if not any(tag == "meta" and attrs.get("charset", "").lower() == "utf-8" for tag, attrs in tags):
+        raise ValueError('learning HTML missing <meta charset="utf-8">')
+
+    csp = next(
+        (
+            attrs.get("content", "")
+            for tag, attrs in tags
+            if tag == "meta" and attrs.get("http-equiv", "").lower() == "content-security-policy"
+        ),
+        "",
+    )
+    if not csp:
+        raise ValueError("learning HTML missing Content-Security-Policy")
+    directives = _parse_csp(csp)
+    required_directives = {
+        "default-src": ["'none'"],
+        "font-src": ["data:"],
+        "img-src": ["data:"],
+        "object-src": ["'none'"],
+        "base-uri": ["'none'"],
+        "style-src": ["'unsafe-inline'"],
+    }
+    for name, expected_values in required_directives.items():
+        if directives.get(name) != expected_values:
+            raise ValueError(f"learning HTML CSP {name} must be {' '.join(expected_values)}")
+
+    styles = [m.group("body") for m in _LEARNING_STYLE_RE.finditer(text)]
+    if len(styles) != 1:
+        raise ValueError("learning HTML must contain exactly one <style> block")
+    if _EXTERNAL_URL.search(styles[0]) or "@import" in styles[0]:
+        raise ValueError("learning HTML stylesheet must not load external resources")
+    if _NETWORK_REFERENCE.search(text):
+        raise ValueError("learning HTML must not reference external network resources")
+
+    exec_scripts: list[str] = []
+    json_payload_raw: str | None = None
+    for match in _LEARNING_SCRIPT_RE.finditer(text):
+        attrs_raw = match.group("attrs") or ""
+        body = match.group("body")
+        if _LEARNING_JSON_TYPE_RE.search(attrs_raw) and _LEARNING_DATA_ID_RE.search(attrs_raw):
+            json_payload_raw = body
+        elif _LEARNING_JSON_TYPE_RE.search(attrs_raw):
+            raise ValueError("unexpected JSON script block in learning HTML")
+        else:
+            exec_scripts.append(body)
+
+    if len(exec_scripts) != 1:
+        raise ValueError("learning HTML must contain exactly one executable <script> block")
+    if directives.get("script-src") != [script_hash(exec_scripts[0])]:
+        raise ValueError("learning HTML executable script does not match CSP hash")
+    if json_payload_raw is None:
+        raise ValueError("learning HTML missing embedded gamas-learning-data JSON payload")
+
+    try:
+        payload = json.loads(json_payload_raw)
+    except Exception as exc:
+        raise ValueError("learning HTML embedded JSON payload is invalid") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("learning HTML JSON payload must be an object")
+    kind = payload.get("kind")
+    if kind not in {"quiz", "flashcards"}:
+        raise ValueError("learning HTML JSON payload has unsupported kind")
+    if expected_kind is not None and kind != expected_kind:
+        raise ValueError(f"learning HTML kind mismatch: expected {expected_kind}, got {kind}")
+    items_key = "questions" if kind == "quiz" else "cards"
+    items = payload.get(items_key)
+    if not isinstance(items, list) or not items:
+        raise ValueError(f"learning HTML JSON payload must contain non-empty {items_key}")
+

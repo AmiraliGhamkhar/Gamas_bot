@@ -7,7 +7,7 @@ Architecture:
 * :mod:`gamas_bot.db_users` — user accounts, identity, bans, and free tries.
 * :mod:`gamas_bot.db_library` — submissions, transcripts, and Telegram library.
 * :mod:`gamas_bot.db_documents` — owner-scoped study document cache.
-* :mod:`gamas_bot.db_learning` — quizzes, flashcards, and leaderboards.
+* :mod:`gamas_bot.db_learning` — quizzes and flashcards.
 * :mod:`gamas_bot.db_billing` — append-only ledger, FIFO lots, and holds.
 * :mod:`gamas_bot.db_payments` — tariff catalog and manual receipt payments.
 * :mod:`gamas_bot.db_support` — support tickets and state transitions.
@@ -111,7 +111,7 @@ class Database(
 
     @property
     def learning(self) -> LearningStoreProtocol:
-        """Segregated quiz/flashcard/leaderboard persistence view (ISP)."""
+        """Segregated quiz/flashcard persistence view (ISP)."""
         return self
 
     @property

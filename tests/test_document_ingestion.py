@@ -163,8 +163,8 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(screen)
 
         text = screen.edits[-1]["text"]
-        self.assertIn("آزمون و فلش‌کارت هوشمند فعلاً فعال نیست", text)
-        self.assertNotIn("از آن فلش‌کارت و سؤال ساخته شود", text)
+        self.assertIn("هنوز فایلی از ربات دریافت نکرده‌اید", text)
+        self.assertNotIn("کوییز تعاملی HTML", text)
 
     async def test_document_screen_metadata_excludes_full_text_and_chunks(self):
         _, documents = await self.ingest("first.pdf", make_pdf_bytes(), mime="application/pdf")
@@ -211,11 +211,13 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(texts.DOCUMENT_PHOTO_UNSUPPORTED, sent)
 
     # --------------------------------------------------------------- library
-    async def test_library_documents_section_lists_and_opens_the_document(self):
+    async def test_uploaded_document_stays_out_of_delivered_library_but_card_works(self):
         await self.ingest("notes.pdf", make_pdf_bytes(), mime="application/pdf")
-        section = self.press(b"lib:docs:0")
+        # User-uploaded files are NOT shown in the delivered-only Library.
+        self.assertEqual(await self.db.library_list(OWNER), [])
+        section = self.press(b"library")
         await self.bot._handle_callback(section)
-        self.assertIn("📄 اسناد", section.edits[-1]["text"])
+        self.assertIn("هنوز فایلی از ربات دریافت نکرده‌اید", section.edits[-1]["text"])
 
         document = (await self.db.documents_list(OWNER))[0]
         card = self.press(f"doc:show:{document['id']}".encode())
@@ -249,13 +251,18 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         # The prompt names the chunk locator, so the model can anchor items.
         user_prompt = generator.await_args.kwargs["user"]
         self.assertIn("صفحهٔ", user_prompt)
-        await self.bot._handle_callback(self.press(b"fc:cur:save"))
+        # Delivered directly as interactive HTML without curation step.
         decks = await self.db.decks_list(OWNER)
         self.assertEqual(len(decks), 1)
         cards = await self.db.deck_cards(decks[0]["deck_id"])
         self.assertTrue(all(card["source"] for card in cards))
+        lib_items = await self.db.library_list_kind(OWNER, "flashcards")
+        self.assertEqual(len(lib_items), 1)
+        blob = await self.db.library_file_blob(OWNER, lib_items[0]["item_id"])
+        self.assertIsNotNone(blob)
+        self.assertTrue(blob["filename"].endswith(".html"))
 
-    async def test_questions_from_a_document_are_created_after_curation(self):
+    async def test_questions_from_a_document_are_created_directly_as_html(self):
         await self.ingest("lecture.docx", make_docx_bytes(), mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         document = (await self.db.documents_list(OWNER))[0]
         with mock.patch(
@@ -265,15 +272,16 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_callback(
                 self.press(f"doc:gen:quiz:{document['id']}:5".encode())
             )
-        self.assertEqual(
-            len(await self.db.db.execute_fetchall("SELECT * FROM quiz_sessions")), 0
-        )
-        await self.bot._handle_callback(self.press(b"quiz:cur:save"))
         rows = await self.db.db.execute_fetchall(
             "SELECT question, source FROM quiz_questions"
         )
         self.assertEqual(len(rows), 5)
         self.assertTrue(all(row[1] for row in rows))
+        lib_items = await self.db.library_list_kind(OWNER, "quiz")
+        self.assertEqual(len(lib_items), 1)
+        blob = await self.db.library_file_blob(OWNER, lib_items[0]["item_id"])
+        self.assertIsNotNone(blob)
+        self.assertIn(b"gamas-learning-data", bytes(blob["content"]))
 
     async def test_overflow_split_persists_real_parent_locator(self):
         from gamas_bot.doc_extract import DocChunk
@@ -339,12 +347,13 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
                 note="fc-pending:doc:1",
                 title="جزوهٔ دو بخشی — فلش‌کارت",
             )
-        self.assertIn(OWNER, self.bot._curation)
-        self.assertEqual(self.bot._curation[OWNER]["failures"], 1)
         sent = "\n".join(item["text"] for item in self.client.texts)
         self.assertIn("بخش به‌طور کامل پردازش نشد", sent)
-        # The cards that did arrive are still offered for curation.
-        self.assertGreaterEqual(len(self.bot._curation[OWNER]["items"]), 5)
+        # The cards that did arrive are delivered directly as HTML and saved.
+        decks = await self.db.decks_list(OWNER)
+        self.assertEqual(len(decks), 1)
+        cards = await self.db.deck_cards(decks[0]["deck_id"])
+        self.assertGreaterEqual(len(cards), 5)
         # Coverage is exactly what the user is told: one of two parts.
         self.assertIn("۱ بخش", sent)
 
@@ -455,12 +464,10 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         from gamas_bot.titles import word_count
 
         mirrored = await self.db.library_item(OWNER, item_id)
+        self.assertEqual(mirrored["delivered"], 0)
         self.assertGreaterEqual(word_count(mirrored["title"]), 2, mirrored["title"])
         self.assertLessEqual(word_count(mirrored["title"]), 4, mirrored["title"])
         self.assertNotIn("📄", mirrored["title"])
-        library = self.press(f"lib:it:{item_id}".encode())
-        await self.bot._handle_callback(library)
-        self.assertIn(f"doc:quiz:{document['id']}".encode(), self.button_payloads(library.edits))
         select = self.press(f"quiz:new:{item_id}".encode())
         await self.bot._handle_callback(select)
         self.assertIn(f"doc:gen:quiz:{document['id']}:5".encode(), self.button_payloads(select.edits))
@@ -513,17 +520,10 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         # A top-up was requested for the four cards still missing after the
         # first six arrived; the answer is not thrown away.
         self.assertEqual(generator.await_count, 2)
-        state = self.bot._curation[OWNER]
-        self.assertTrue(state["items"])
-        self.assertTrue(
-            all(item["source"].startswith("صفحهٔ") for item in state["items"])
-        )
-        self.assertNotIn(
-            "ساختگی", " ".join(item["source"] for item in state["items"])
-        )
-        await self.bot._handle_callback(self.press(b"fc:cur:save"))
         cards = await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])
-        self.assertTrue(all(card["source"] and "ساختگی" not in card["source"] for card in cards))
+        self.assertTrue(cards)
+        self.assertTrue(all(card["source"].startswith("صفحهٔ") for card in cards))
+        self.assertTrue(all("ساختگی" not in card["source"] for card in cards))
 
     async def test_persian_difficulty_labels_are_mapped_and_stored(self):
         """A Persian «سخت»/«متوسط» answer is mapped to the required tag.
@@ -543,19 +543,13 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=payload)) as generator:
             await self.bot._handle_callback(self.press(f"doc:gen:quiz:{doc_id}:5".encode()))
         self.assertEqual(generator.await_count, 1)
-        self.assertIn(OWNER, self.bot._curation)
-        await self.bot._handle_callback(self.press(b"quiz:cur:save"))
         rows = await self.db.db.execute_fetchall("SELECT difficulty,source FROM quiz_questions")
         self.assertEqual(len(rows), 5)
         self.assertTrue(all(row[1] == "صفحهٔ ۱" for row in rows))
         self.assertEqual(sorted(row[0] for row in rows), sorted(expected))
 
-    async def test_persian_difficulty_and_retyped_locator_still_produce_a_preview(self):
-        """A re-typed locator («صفحه 1» vs «صفحهٔ ۱») cites the same page.
-
-        Byte-identical matching used to discard every item the model returned,
-        which ended as «ساخت محتوا ناموفق بود» for a perfectly grounded answer.
-        """
+    async def test_persian_difficulty_and_retyped_locator_still_produce_html(self):
+        """A re-typed locator («صفحه 1» vs «صفحهٔ ۱») cites the same page."""
         await self.ingest("notes.pdf", make_pdf_bytes(), mime="application/pdf")
         doc_id = (await self.db.documents_list(OWNER))[0]["id"]
         payload = quiz_payload(5, source="صفحه 1")
@@ -564,13 +558,12 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=payload)) as generator:
             await self.bot._handle_callback(self.press(f"doc:gen:quiz:{doc_id}:5".encode()))
         self.assertEqual(generator.await_count, 1)
-        state = self.bot._curation[OWNER]
-        self.assertEqual(len(state["items"]), 5)
-        self.assertEqual(state["failures"], 0)
-        self.assertTrue(all(item["difficulty"] in {"medium", "hard"} for item in state["items"]))
+        rows = await self.db.db.execute_fetchall("SELECT difficulty,source FROM quiz_questions")
+        self.assertEqual(len(rows), 5)
+        self.assertTrue(all(row[0] in {"medium", "hard"} for row in rows))
         # The stored locator is the document's own spelling, so two cards from
         # one page cannot disagree about its name.
-        self.assertTrue(all(item["source"] == "صفحهٔ ۱" for item in state["items"]))
+        self.assertTrue(all(row[1] == "صفحهٔ ۱" for row in rows))
 
     async def test_parallel_chunk_calls_are_bounded_and_report_progress(self):
         """Concurrent chunk calls are bounded by the quiz scheduling window.
@@ -633,14 +626,11 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=[cards_payload(6), cards_payload(4)])) as generator:
             await self.bot._handle_callback(self.press(f"doc:gen:fc:{doc_id}:quick".encode()))
         self.assertEqual(generator.await_count, 2)
-        state = self.bot._curation[OWNER]
-        self.assertEqual(len(state["items"]), 6)  # retain the best valid partial
-        self.assertEqual(state["failures"], 1)
-        preview = self.client.texts[-1]["text"]
-        self.assertIn("۱۰ مورد درخواست‌شده", preview)
-        self.assertIn("۶ مورد معتبر", preview)
-        await self.bot._handle_callback(self.press(b"fc:cur:cancel"))
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        cards = await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])
+        self.assertEqual(len(cards), 6)  # retain the best valid partial
+        summary = self.client.texts[-1]["text"]
+        self.assertIn("۱۰ مورد درخواست‌شده", summary)
+        self.assertIn("۶ مورد معتبر", summary)
 
     async def test_unallocated_chunks_are_reported_to_the_user(self):
         from gamas_bot.doc_extract import DocChunk
@@ -657,10 +647,11 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
             await self.bot._generate_learning(self.press(b"menu:main"), user_id=OWNER, kind="deck",
                                                source=source, wanted=5, cost=0, note="test", title="سند")
-        self.assertEqual(len(self.bot._curation[OWNER]["items"]), 5)
-        self.assertEqual(self.bot._curation[OWNER]["skipped"], 10)
-        self.assertIn("۱۰ بخش", self.client.texts[-1]["text"])
-        self.assertIn("بررسی نشد", self.client.texts[-1]["text"])
+        cards = await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])
+        self.assertEqual(len(cards), 5)
+        summary = self.client.texts[-1]["text"]
+        self.assertIn("۱۰ بخش", summary)
+        self.assertIn("بررسی نشد", summary)
 
 
 if __name__ == "__main__":

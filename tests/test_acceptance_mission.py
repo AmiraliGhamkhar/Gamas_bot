@@ -415,8 +415,11 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bytes(docx["content"]).startswith(b"PK"))
         stored = await self.db.transcription(job.submission_id)
         self.assertIn("متن کامل جلسه", str(stored["text"]))
-        items = await self.db.library_list(USER, limit=6)
-        self.assertEqual([item["kind"] for item in items], ["booklet"])
+        # Library stores only files actually delivered to the user: undownloaded
+        # virtual booklet rows stay hidden behind the scenes until fetched.
+        self.assertEqual(await self.db.library_list(USER, limit=6), [])
+        source = await self.db.library_submission_source_item(USER, job.submission_id)
+        self.assertIsNotNone(source)
         results = [reply for reply in event.replies if "پردازش تمام شد" in reply]
         self.assertEqual(len(results), 1)
         self.assertEqual((await self.db.submission(job.submission_id)).status, "done")
@@ -434,7 +437,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         )
         more_payloads = menu_payloads(self.bot._more_menu())
         self.assertIn(b"office:start", more_payloads)
-        self.assertIn(b"board", more_payloads)
+        self.assertNotIn(b"board", more_payloads)
         self.assertIn(b"results", more_payloads)
         self.assertIn(b"ref:home", more_payloads)
 
@@ -446,7 +449,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("💳 پرداخت‌های در انتظار", admin_labels)
         self.assertNotIn("📋 تاریخچه پرداخت‌ها", admin_labels)
         self.assertIn("🎧 مدیریت پشتیبانی", admin_labels)
-        self.assertIn("🏆 برترین کاربران", admin_labels)
+        self.assertNotIn("🏆 برترین کاربران", admin_labels)
         self.assertIn("↩️ پنل کاربری", admin_labels)
 
         self.assertEqual(

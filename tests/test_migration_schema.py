@@ -96,9 +96,11 @@ class MigrationSchemaTests(unittest.IsolatedAsyncioTestCase):
         indexes = await self.db.db.execute_fetchall(
             "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
         )
-        self.assertTrue({"idx_users_quiz_points", "idx_users_banned_seen", "idx_users_seen_active",
+        index_names = {row[0] for row in indexes}
+        self.assertTrue({"idx_users_banned_seen", "idx_users_seen_active",
                          "idx_transcriptions_created", "idx_documents_library_item"}
-                        <= {row[0] for row in indexes})
+                        <= index_names)
+        self.assertNotIn("idx_users_quiz_points", index_names)
 
     async def test_application_tables_are_exactly_the_declared_set(self):
         rows = await self.db.db.execute_fetchall(
@@ -363,6 +365,63 @@ class LearningChargeUpgradeTests(unittest.IsolatedAsyncioTestCase):
                 "refunded",
             )
             await db.close()
+
+
+class LeaderboardAndStudioCleanupUpgradeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_populated_pre_034_upgrade_and_interrupted_034_replay(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "before-034.sqlite3"
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
+            for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                if migration.name >= "034":
+                    break
+                conn.executescript(migration.read_text(encoding="utf-8"))
+                conn.execute("INSERT INTO schema_migrations VALUES (?, '2026-01-01')", (migration.name,))
+            conn.execute("INSERT INTO users(telegram_id, joined_at, quiz_points) VALUES (111, '2026-01-01', 40)")
+            conn.execute(
+                "INSERT INTO library_items(user_id, kind, chat_id, message_id, title, content_text, created_at) "
+                "VALUES (111, 'booklet', 111, 10, 'جزوه', 'متن', '2026-01-01')"
+            )
+            conn.execute(
+                "INSERT INTO booklet_revisions(item_id, user_id, content_text, source, created_at) "
+                "VALUES (1, 111, 'نسخه قدیمی', 'mini_app', '2026-01-01')"
+            )
+            conn.execute(
+                "INSERT INTO quiz_point_events(user_id, points, session_id, created_at) "
+                "VALUES (111, 10, NULL, '2026-01-01')"
+            )
+            conn.commit()
+            conn.close()
+
+            for replay in (False, True):
+                db = Database(path)
+                try:
+                    await db.connect()
+                    await db.assert_user_reference_integrity()
+                    tables = {
+                        str(row[0])
+                        for row in await db.db.execute_fetchall(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        )
+                    }
+                    indexes = {
+                        str(row[0])
+                        for row in await db.db.execute_fetchall(
+                            "SELECT name FROM sqlite_master WHERE type='index'"
+                        )
+                    }
+                    self.assertNotIn("booklet_revisions", tables)
+                    self.assertNotIn("quiz_point_events", tables)
+                    self.assertNotIn("idx_users_quiz_points", indexes)
+                    # Active user and library records survive untouched.
+                    self.assertEqual(await db.library_count(111), 1)
+                    if not replay:
+                        await db._write(
+                            "DELETE FROM schema_migrations WHERE name='034_remove_leaderboard_and_studio_remnants.sql'"
+                        )
+                finally:
+                    await db.close()
 
 
 if __name__ == "__main__":

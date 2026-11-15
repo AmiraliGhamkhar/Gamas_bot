@@ -296,7 +296,7 @@ class DocumentStoreProtocol(Protocol):
 
 @runtime_checkable
 class LearningStoreProtocol(Protocol):
-    """Narrow persistence view for quizzes, flashcards, and leaderboards."""
+    """Narrow persistence view for quizzes and flashcards."""
 
     async def quiz_get_session(
         self, session_id: int, user_id: int
@@ -305,8 +305,6 @@ class LearningStoreProtocol(Protocol):
     async def deck_get(
         self, deck_id: int, user_id: int
     ) -> dict[str, Any] | None: ...
-
-    async def leaderboard_top(self, limit: int = 20) -> list[dict[str, Any]]: ...
 
 
 @runtime_checkable

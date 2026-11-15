@@ -1,4 +1,4 @@
-"""Tests for the learning loop: quiz engine, leaderboard and content helpers.
+"""Tests for the learning loop: quiz engine, flashcards and content helpers.
 
 The LLM is faked at the ``gamas_bot.bot.complete_json`` seam exactly like the
 note pipeline tests fake their generators, so every billing/refund guarantee
@@ -38,7 +38,6 @@ from tests.support import (
     FakeCallbackEvent,
     FakeTelegramClient,
     FakeSentMessage,
-    docx_text,
     make_settings,
 )
 from tests.test_bot import FakeMessageEvent, menu_payloads
@@ -221,13 +220,6 @@ class NameCaptureTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_message(bare)
         identity = await self.db.user_identity(OTHER)
         self.assertEqual(identity["first_name"], "")
-        # The board falls back to the generic Persian name.
-        await self.db.db.execute(
-            "UPDATE users SET quiz_points=10 WHERE telegram_id=?", (OTHER,)
-        )
-        await self.db.db.commit()
-        board = await self.db.leaderboard_top(5)
-        self.assertEqual(board[0]["first_name"], "")
 
     async def test_long_name_is_bounded(self):
         event = FakeMessageEvent(OWNER, "سلام", first_name="گ" * 100)
@@ -273,7 +265,7 @@ class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
         for table in ("quiz_sessions", "quiz_questions"):
             self.assertEqual((await self.db.db.execute_fetchall(f"SELECT COUNT(*) FROM {table}"))[0][0], 0)
 
-    async def test_full_answer_flow_scores_points_and_ranks(self):
+    async def test_full_answer_flow_scores_points(self):
         session_id = await self._create_session()
         first = await self.db.quiz_current_question(session_id)
         self.assertEqual(first["idx"], 0)
@@ -282,17 +274,14 @@ class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "ok")
         self.assertTrue(result["correct"])
         self.assertFalse(result["finished"])
-        rank = await self.db.leaderboard_rank(OWNER)
-        self.assertEqual(rank["points"], 10)
-        self.assertEqual(rank["rank"], 1)
+        self.assertEqual(result["score"], 10)
         # Second answer, intentionally wrong.
         second = await self.db.quiz_current_question(session_id)
         result = await self.db.quiz_record_answer(
             session_id, second["question_id"], 3
         )
         self.assertFalse(result["correct"])
-        rank = await self.db.leaderboard_rank(OWNER)
-        self.assertEqual(rank["points"], 10)  # wrong answer adds nothing
+        self.assertEqual(result["score"], 10)  # wrong answer adds nothing
         # Third answer correct -> session finishes.
         third = await self.db.quiz_current_question(session_id)
         result = await self.db.quiz_record_answer(session_id, third["question_id"], 2)
@@ -300,6 +289,7 @@ class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["score"], 20)
         session = await self.db.quiz_get_session(session_id, OWNER)
         self.assertEqual(session["status"], "done")
+        self.assertEqual(session["score"], 20)
         self.assertIsNone(await self.db.quiz_current_question(session_id))
         # Exactly one answer row per question.
         rows = await self.db.db.execute_fetchall(
@@ -322,8 +312,9 @@ class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
             result = await self.db.quiz_record_answer(session_id, question["question_id"], 0)
         self.assertEqual(result["status"], "already")
         rollback.assert_awaited_once()
-        self.assertEqual((await self.db.quiz_get_session(session_id, OWNER))["current_index"], 0)
-        self.assertEqual((await self.db.leaderboard_rank(OWNER))["points"], 0)
+        session = await self.db.quiz_get_session(session_id, OWNER)
+        self.assertEqual(session["current_index"], 0)
+        self.assertEqual(session["score"], 0)
 
     async def test_double_answer_is_rejected_once_and_never_double_scores(self):
         session_id = await self._create_session()
@@ -336,8 +327,8 @@ class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
             session_id, question["question_id"], 1
         )
         self.assertEqual(second["status"], "already")
-        rank = await self.db.leaderboard_rank(OWNER)
-        self.assertEqual(rank["points"], 10)
+        session = await self.db.quiz_get_session(session_id, OWNER)
+        self.assertEqual(session["score"], 10)
 
     async def test_out_of_turn_question_is_stale(self):
         session_id = await self._create_session()
@@ -387,24 +378,6 @@ class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("expired", {row[0] for row in statuses})
 
-    async def test_leaderboard_orders_and_excludes_banned_and_zeros(self):
-        await self.db.set_first_name(OWNER, "نگار")
-        await self.db.ensure_user(777)
-        await self.db.set_first_name(777, "سارا")
-        await self.db.db.execute("UPDATE users SET quiz_points=30 WHERE telegram_id=?", (OWNER,))
-        await self.db.db.execute("UPDATE users SET quiz_points=50 WHERE telegram_id=?", (777,))
-        await self.db.db.execute("UPDATE users SET banned=1, quiz_points=99 WHERE telegram_id=?", (OTHER,))
-        await self.db.db.commit()
-        board = await self.db.leaderboard_top(20)
-        self.assertEqual([row["quiz_points"] for row in board], [50, 30])
-        self.assertEqual(board[1]["first_name"], "نگار")
-        # Banned user cannot outrank anyone.
-        self.assertTrue(all(row["first_name"] != "" for row in board))
-        rank_other = await self.db.leaderboard_rank(OTHER)
-        # Banned users still get a numeric rank from the points table; the user
-        # screen itself is ban-gated before this is ever shown.
-        self.assertIsInstance(rank_other["rank"], int)
-
     async def test_quit_keeps_earned_points(self):
         session_id = await self._create_session()
         question = await self.db.quiz_current_question(session_id)
@@ -413,124 +386,6 @@ class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
         session = await self.db.quiz_get_session(session_id, OWNER)
         self.assertEqual(session["status"], "quit")
         self.assertEqual(session["score"], 10)
-        self.assertEqual((await self.db.leaderboard_rank(OWNER))["points"], 10)
-
-
-class LeaderboardAndGiftTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        root = Path(self._tmp.name)
-        self.settings = make_settings(db_path=root / "board.db", temp_dir=root / "tmp")
-        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
-        self.db = Database(self.settings.db_path)
-        await self.db.connect()
-        self.bot = GamasBot(self.settings)
-        self.bot.db = self.db
-        self.client = FakeTelegramClient()
-        self.bot.client = self.client
-        self.admin_id = next(iter(self.settings.admin_ids))
-        for uid in (OWNER, OTHER, 777):
-            await self.db.ensure_user(uid)
-        await self.db.sync_plans([
-            {"code": "paid_5h_30d", "hours": 5, "price": 50000, "validity_days": 30},
-        ])
-
-    async def asyncTearDown(self):
-        await self.bot.shutdown()
-        await self.db.close()
-        self._tmp.cleanup()
-
-    def _event(self, data: bytes, user_id: int) -> FakeCallbackEvent:
-        event = FakeCallbackEvent(self.client, data=data, chat_id=user_id)
-        event.client = self.client
-        return event
-
-    async def test_empty_board_uses_persian_empty_state(self):
-        event = self._event(b"board", OWNER)
-        await self.bot._handle_callback(event)
-        self.assertIn("هنوز امتیازی ثبت نشده است", event.edits[-1]["text"])
-
-    async def test_board_shows_medals_names_and_own_rank_footer(self):
-        await self.db.set_first_name(OWNER, "نگار")
-        await self.db.set_first_name(777, "سارا")
-        await self.db.db.execute("UPDATE users SET quiz_points=50 WHERE telegram_id=?", (777,))
-        await self.db.db.execute("UPDATE users SET quiz_points=30 WHERE telegram_id=?", (OWNER,))
-        await self.db.db.commit()
-        event = self._event(b"board", OWNER)
-        await self.bot._handle_callback(event)
-        text = event.edits[-1]["text"]
-        self.assertIn("🥇 سارا", text)
-        self.assertIn("🥈 نگار", text)
-        self.assertIn("رتبهٔ شما: ۲ با ۳۰ امتیاز", text)
-        # No telegram id ever reaches the public board.
-        self.assertNotIn(str(OWNER), text)
-        # The board is fully native: only the way back, no WebView entry.
-        self.assertEqual(menu_payloads(event.edits[-1]["buttons"]), {b"menu:main"})
-
-    async def test_missing_name_renders_fallback_only(self):
-        await self.db.db.execute("UPDATE users SET quiz_points=10 WHERE telegram_id=?", (OWNER,))
-        await self.db.db.commit()
-        event = self._event(b"board", OTHER)
-        await self.bot._handle_callback(event)
-        self.assertIn("کاربر گاماس", event.edits[-1]["text"])
-
-    async def test_admin_gift_flow_credits_audits_and_dms(self):
-        await self.db.set_first_name(OWNER, "نگار")
-        await self.db.db.execute("UPDATE users SET quiz_points=40 WHERE telegram_id=?", (OWNER,))
-        await self.db.db.commit()
-        board = self._event(b"adm:board", self.admin_id)
-        await self.bot._handle_callback(board)
-        board_text = board.edits[-1]["text"]
-        self.assertIn("نگار", board_text)
-        gift_payloads = menu_payloads(board.edits[-1]["buttons"])
-        self.assertIn(f"adm:bg:{OWNER}".encode(), gift_payloads)
-        # Plan picker.
-        pick = self._event(f"adm:bg:{OWNER}".encode(), self.admin_id)
-        await self.bot._handle_callback(pick)
-        pick_payloads = menu_payloads(pick.edits[-1]["buttons"])
-        self.assertIn(f"adm:bg:{OWNER}:paid_5h_30d".encode(), pick_payloads)
-        # Confirmation screen §6.13.
-        confirm = self._event(
-            f"adm:bg:{OWNER}:paid_5h_30d".encode(), self.admin_id
-        )
-        await self.bot._handle_callback(confirm)
-        confirm_text = confirm.edits[-1]["text"]
-        self.assertIn("ثبت شود؟", confirm_text)
-        self.assertIn("نگار", confirm_text)
-        # Execute.
-        ok = self._event(
-            f"adm:bgok:{OWNER}:paid_5h_30d".encode(), self.admin_id
-        )
-        await self.bot._handle_callback(ok)
-        self.assertEqual(await self.db.available_seconds(OWNER), 5 * 3600)
-        audit = await self.db.db.execute_fetchall(
-            "SELECT action, subject_user FROM audit WHERE subject_user=?", (OWNER,)
-        )
-        self.assertTrue(any(row[0] == "grant_credit" for row in audit))
-        # DM delivered with §6.8 wording.
-        dm = [record["text"] for record in self.client.texts if record["entity"] == OWNER]
-        self.assertTrue(dm and "تبریک" in dm[-1] and "اعتبار رایگان" in dm[-1])
-        # Board re-rendered with the success notice.
-        self.assertIn("هدیه ثبت شد", ok.edits[-1]["text"])
-
-    async def test_gift_to_another_admin_is_refused(self):
-        ok = self._event(
-            f"adm:bgok:{self.admin_id}:paid_5h_30d".encode(), self.admin_id
-        )
-        await self.bot._handle_callback(ok)
-        self.assertEqual(await self.db.available_seconds(self.admin_id), 0)
-
-    async def test_gift_to_banned_user_is_refused(self):
-        await self.db.set_banned(OWNER, True)
-        pick = self._event(f"adm:bg:{OWNER}".encode(), self.admin_id)
-        await self.bot._handle_callback(pick)
-        self.assertTrue(pick.answers[-1][1])  # alert
-
-    async def test_non_admin_cannot_open_gift_screens(self):
-        event = self._event(b"adm:board", OWNER)
-        await self.bot._handle_callback(event)
-        self.assertEqual(event.answers[-1][1], True)
-        self.assertFalse(event.edits)
 
 
 class FlashcardDatabaseTests(unittest.IsolatedAsyncioTestCase):
@@ -671,22 +526,12 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
 
     def _assert_failure_frame(self, text: str) -> None:
         """A failed generation ends on the bar: fail headline, 🛑 and the hint."""
-        self.assertIn("ساخت محتوا ناموفق بود", text)
+        self.assertIn("ساخت فایل تعاملی ناموفق بود", text)
         self.assertIn("🛑", text)
         self.assertIn("کمی بعد دوباره امتحان کنید", text)
 
-    async def save_curation(self, kind: str = "deck") -> None:
-        prefix = "fc" if kind == "deck" else "quiz"
-        await self.bot._handle_callback(self._event(f"{prefix}:cur:save".encode()))
-
     async def test_booklet_cards_with_a_retyped_locator_are_not_discarded(self):
-        """The production failure: «بخش 1» was not byte-identical to «بخش ۱».
-
-        A booklet is chunked as «بخش ۱», so a model that re-types the locator
-        with Latin digits (or brackets) had *every* card rejected; the retry
-        failed the same way and the user got «ساخت محتوا ناموفق بود» after a
-        full generation. The comparison now folds digit shape and punctuation.
-        """
+        """The production failure: «بخش 1» was not byte-identical to «بخش ۱»."""
         payload = {
             "cards": [
                 {"front": f"پرسش {index}", "back": f"پاسخ {index}", "source": "بخش 1"}
@@ -698,18 +543,14 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         ) as generator:
             await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}:quick".encode()))
         self.assertEqual(generator.await_count, 1)
-        state = self.bot._curation[OWNER]
-        self.assertEqual(len(state["items"]), 10)
-        self.assertEqual(state["failures"], 0)
+        decks = await self.db.decks_list(OWNER)
+        self.assertEqual(len(decks), 1)
+        cards = await self.db.deck_cards(decks[0]["deck_id"])
+        self.assertEqual(len(cards), 10)
+        self.assertEqual(len(await self.db.library_list_kind(OWNER, "flashcards")), 1)
 
     async def test_a_fabricated_locator_is_never_stored_and_never_fails_the_deck(self):
-        """The chunk the model read *is* the source; the invented place is not.
-
-        A model that cites «صفحهٔ ۹۹» for a booklet with one part used to lose
-        every card and refund a billed generation. The card is now anchored to
-        the chunk label it was generated from, and the fabricated locator is
-        never written anywhere.
-        """
+        """The chunk the model read *is* the source; the invented place is not."""
         payload = {
             "cards": [
                 {"front": f"پرسش {index}", "back": f"پاسخ {index}", "source": "صفحهٔ ۹۹"}
@@ -723,11 +564,8 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         # The second call is the top-up for the four cards still missing, not a
         # rejection of the first answer.
         self.assertEqual(generator.await_count, 2)
-        state = self.bot._curation[OWNER]
-        self.assertEqual(len(state["items"]), 6)
-        self.assertEqual({item["source"] for item in state["items"]}, {"بخش ۱"})
-        await self.save_curation("deck")
         cards = await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])
+        self.assertEqual(len(cards), 6)
         self.assertTrue(all(card["source"] == "بخش ۱" for card in cards))
         self.assertNotIn("صفحهٔ ۹۹", " ".join(card["source"] for card in cards))
 
@@ -805,21 +643,17 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
             ) for uid in (OWNER, OTHER, 777)))
         self.assertEqual(peak, 2)
 
-    async def test_paid_curation_refunds_pro_rata_when_items_removed(self):
+    async def test_paid_deck_shortfall_refunds_pro_rata_automatically(self):
         from gamas_bot.doc_extract import DocChunk
 
         await self.spend_free_try("deck")
         source = {"item_id": self.item_id, "doc_id": None, "title": "test", "chunks": [
             DocChunk(0, "بخش ۱", ("بخش ۱",), "متن درس")
         ]}
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(20))):
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(5))):
             await self.bot._generate_learning(self._event(b"fc:hub"), user_id=OWNER, kind="deck",
                                                source=source, wanted=20, cost=401, note="test", title="test")
-        self.assertEqual(len(self.bot._curation[OWNER]["items"]), 20)
-        for _ in range(15):
-            await self.bot._handle_callback(self._event(b"fc:cur:del:0"))
-        event = self._event(b"fc:cur:save")
-        await self.bot._handle_callback(event)
+        # 5 of 20 cards delivered -> pro-rata refund of 15/20 of 401 = 301s.
         self.assertEqual(await self.db.available_seconds(OWNER), 3600 - 401 + 301)
         self.assertEqual((await self.db.db.execute_fetchall("SELECT status FROM learning_charges"))[0][0], "finalized")
         refund = (await self.db.db.execute_fetchall(
@@ -827,82 +661,50 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         ))[0]
         self.assertEqual(refund[0], 301)
         self.assertIsNotNone(refund[1])
-        self.assertTrue(any("اعتبار بازگشتی" in (answer or "") for answer, _ in event.answers))
         self.assertEqual(len(await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])), 5)
 
-    async def test_pending_curation_source_is_protected_from_prune(self):
+    async def test_source_pruned_mid_generation_still_persists_delivered_html(self):
         await self.spend_free_try("deck")
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))):
+
+        async def prune_during_llm(*_args, **_kwargs):
+            await self.db.library_prune(OWNER, 0)
+            return self._cards_payload(6)
+
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=prune_during_llm)):
             await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
-        await self.db.library_prune(OWNER, 0, protected_item_ids=self.bot._protected_curation_items(OWNER))
-        self.assertIsNotNone(await self.db.library_item(OWNER, self.item_id))
-        await self.save_curation()
         self.assertEqual(await self.db.deck_count(OWNER), 1)
+        self.assertEqual(len(await self.db.library_list_kind(OWNER, "flashcards")), 1)
+        charges = await self.db.db.execute_fetchall("SELECT status FROM learning_charges")
+        self.assertEqual(charges[0][0], "finalized")
 
-    async def test_missing_curation_source_refunds_cleanly(self):
+    async def test_progress_edit_failure_still_delivers_html_and_finalizes(self):
         await self.spend_free_try("deck")
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))):
-            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
-        await self.db.library_prune(OWNER, 0)
-        event = self._event(b"fc:cur:save")
-        await self.bot._handle_callback(event)
-        self.assertTrue(any("منبع این پیش‌نمایش حذف شده بود؛ مبلغ بازگشت داده شد" in edit["text"]
-                            for edit in event.edits))
-        self.assertEqual(await self.db.available_seconds(OWNER), 3600)
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
-
-    async def test_preview_edit_failure_uses_new_message_and_finalizes(self):
-        await self.spend_free_try("deck")
-        original_edit = FakeSentMessage.edit
-
-        async def fail_preview(message, text="", buttons=None):
-            if text.startswith("🧐 پیش‌نمایش"):
-                raise RuntimeError("edit unavailable")
-            return await original_edit(message, text, buttons=buttons)
-
-        with mock.patch.object(FakeSentMessage, "edit", new=fail_preview), mock.patch(
+        with mock.patch.object(FakeSentMessage, "edit", new=mock.AsyncMock(side_effect=RuntimeError("edit unavailable"))), mock.patch(
             "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))
         ):
             await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
-        self.assertTrue(any("پیش‌نمایش" in str(row["text"]) for row in self.client.texts))
-        await self.save_curation()
         charges = await self.db.db.execute_fetchall("SELECT status FROM learning_charges")
         self.assertEqual(charges[0][0], "finalized")
         self.assertEqual(await self.db.available_seconds(OWNER), 3300)
+        self.assertEqual(len(await self.db.library_list_kind(OWNER, "flashcards")), 1)
 
-    async def test_undelivered_preview_stays_pending_until_expiry(self):
+    async def test_undelivered_html_refunds_paid_charge(self):
         await self.spend_free_try("deck")
-        self.bot.CURATION_TTL_SECONDS = 0.05
-        original_edit = FakeSentMessage.edit
-        original_send = self.client.send_message
-
-        async def fail_preview_edit(message, text="", buttons=None):
-            if text.startswith("🧐 پیش‌نمایش"):
-                raise RuntimeError("edit unavailable")
-            return await original_edit(message, text, buttons=buttons)
-
-        async def fail_preview_send(*args, **kwargs):
-            if len(args) > 1 and str(args[1]).startswith("🧐 پیش‌نمایش"):
-                raise RuntimeError("send unavailable")
-            return await original_send(*args, **kwargs)
-
-        with mock.patch.object(FakeSentMessage, "edit", new=fail_preview_edit), mock.patch.object(
-            self.client, "send_message", new=fail_preview_send
-        ), mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))):
+        with (
+            mock.patch.object(
+                self.client, "send_file", new=mock.AsyncMock(side_effect=RuntimeError("send unavailable"))
+            ),
+            mock.patch(
+                "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))
+            ),
+        ):
             await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
-            self.assertIn(OWNER, self.bot._curation)
-            charges = await self.db.db.execute_fetchall("SELECT status FROM learning_charges")
-            self.assertEqual(charges[0][0], "pending")
-            self.assertEqual(await self.db.available_seconds(OWNER), 3300)
-            self.assertTrue(any("پیش‌نمایش ارسال نشد" in str(row["text"]) for row in self.client.texts))
-            await self.bot._curation_tasks[OWNER]
         charges = await self.db.db.execute_fetchall("SELECT status FROM learning_charges")
         self.assertEqual(charges[0][0], "refunded")
         self.assertEqual(await self.db.available_seconds(OWNER), 3600)
+        self.assertEqual(await self.db.deck_count(OWNER), 0)
 
-    async def test_ai_generation_debits_and_builds_deck(self):
-        # The paid path: the free first try is already spent, so this deck is
-        # charged, previewed, and only written after «✅ ذخیره» (R5.1 curation).
+    async def test_ai_generation_debits_and_builds_deck_and_html(self):
         await self.spend_free_try("deck")
         event = self._event(f"fc:go:{self.item_id}".encode())
         with mock.patch(
@@ -911,8 +713,6 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         ) as generator:
             await self.bot._handle_callback(event)
             generator.assert_awaited_once()
-        self.assertEqual(await self.db.deck_count(OWNER), 0)  # nothing saved yet
-        await self.save_curation("deck")
         self.assertEqual(await self.db.available_seconds(OWNER), 3300)
         decks = await self.db.decks_list(OWNER)
         self.assertEqual(len(decks), 1)
@@ -920,6 +720,11 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(decks[0]["title"].endswith("— فلش‌کارت"))
         cards = await self.db.deck_cards(decks[0]["deck_id"])
         self.assertEqual(cards[0]["front"], "پرسش 0")
+        html_items = await self.db.library_list_kind(OWNER, "flashcards")
+        self.assertEqual(len(html_items), 1)
+        blob = await self.db.library_file_blob(OWNER, html_items[0]["item_id"])
+        self.assertIsNotNone(blob)
+        self.assertIn("پرسش 0".encode("utf-8"), bytes(blob["content"]))
 
     async def test_unlimited_user_generates_decks_for_free(self):
         await self.db.set_unlimited(OWNER, True, admin_id=1, reason="vip")
@@ -929,7 +734,6 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
             new=mock.AsyncMock(return_value=self._cards_payload(6)),
         ):
             await self.bot._handle_callback(event)
-        await self.save_curation("deck")
         debits = await self.db.db.execute_fetchall(
             "SELECT COUNT(*) FROM ledger WHERE kind='debit'"
         )
@@ -942,7 +746,7 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         text = event.edits[-1]["text"]
         self.assertIn("هزینهٔ معمول: ۲٬۷۷۸ اعتبار", text)
         self.assertIn("نخستین مجموعه رایگان است", text)
-        self.assertIn("۶ پرسش و پاسخ", text)
+        self.assertIn("HTML آفلاین", text)
 
     async def test_failure_refunds_and_short_output_refunds(self):
         event = self._event(f"fc:go:{self.item_id}".encode())
@@ -987,7 +791,7 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_hub_empty_state_and_manual_guided_flow_with_disarm(self):
         hub = self._event(b"fc:hub")
         await self.bot._handle_callback(hub)
-        self.assertIn("هنوز مجموعه‌ای نساخته‌اید", hub.edits[-1]["text"])
+        self.assertIn("هنوز فلش‌کارت تعاملی نساخته‌اید", hub.edits[-1]["text"])
         # Arm the manual conversation.
         await self.bot._handle_callback(self._event(b"fc:man"))
         self.assertEqual(self.bot._pending_flashcard[OWNER][1], "front")
@@ -999,15 +803,18 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_message(back)
         self.assertIn("کارت اضافه شد (۱ کارت)", back.replies[-1])
         deck_id = self.bot._pending_flashcard[OWNER][0]
-        # Finishing disarms.
+        # Finishing disarms and exports interactive HTML into Library.
         done = self._event(b"fc:man:done")
         await self.bot._handle_callback(done)
         self.assertNotIn(OWNER, self.bot._pending_flashcard)
-        self.assertTrue(any("ساخت کارت پایان یافت" in str(reply) for reply in done.client.texts))
-        self.assertTrue(done.edits)
         cards = await self.db.deck_cards(deck_id)
         self.assertEqual(len(cards), 1)
         self.assertEqual(cards[0]["front"], "پرسش دستی یکم؟")
+        lib_items = await self.db.library_list_kind(OWNER, "flashcards")
+        self.assertEqual(len(lib_items), 1)
+        blob = await self.db.library_file_blob(OWNER, lib_items[0]["item_id"])
+        self.assertIsNotNone(blob)
+        self.assertIn("پرسش دستی یکم؟".encode("utf-8"), bytes(blob["content"]))
         # A stray text after a navigation tap never becomes a card.
         await self.bot._handle_callback(self._event(b"fc:man"))
         await self.bot._handle_callback(self._event(b"library"))
@@ -1032,75 +839,79 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(decks), 1)  # the armed manual deck itself
         self.assertEqual(await self.db.deck_cards(decks[0]["deck_id"]), [])
 
-    async def test_study_flip_next_persists_cursor_and_restarts(self):
+    async def test_legacy_in_chat_study_callbacks_fail_closed_with_stale_alert(self):
         deck_id = await self.db.deck_create(OWNER, None, "دسته دستی", "manual")
         for index in range(3):
             await self.db.deck_add_card(deck_id, f"پرسش {index}", f"پاسخ {index}")
-        study = self._event(f"fc:study:{deck_id}".encode())
-        await self.bot._handle_callback(study)
-        self.assertIn("پرسش:", study.edits[-1]["text"])
-        card = (await self.db.deck_cards(deck_id))[0]
-        flip = self._event(f"fc:flip:{deck_id}:{card['card_id']}".encode())
-        await self.bot._handle_callback(flip)
-        self.assertIn("پاسخ 0", flip.edits[-1]["text"])
-        nxt = self._event(f"fc:next:{deck_id}".encode())
-        await self.bot._handle_callback(nxt)
-        self.assertEqual((await self.db.deck_get(deck_id, OWNER))["study_cursor"], 1)
-        # Walk to the end summary.
-        await self.bot._handle_callback(self._event(f"fc:next:{deck_id}".encode()))
-        await self.bot._handle_callback(self._event(f"fc:next:{deck_id}".encode()))
-        end = self._event(f"fc:next:{deck_id}".encode())
-        await self.bot._handle_callback(end)
-        self.assertIn("مرور تمام شد — ۳ کارت مرور شد", end.edits[-1]["text"])
-        restart = self._event(f"fc:restart:{deck_id}".encode())
-        await self.bot._handle_callback(restart)
-        self.assertEqual((await self.db.deck_get(deck_id, OWNER))["study_cursor"], 0)
+        for payload in (
+            f"fc:study:{deck_id}".encode(),
+            f"fc:flip:{deck_id}:1".encode(),
+            f"fc:next:{deck_id}".encode(),
+            f"fc:restart:{deck_id}".encode(),
+            f"fc:exp:{deck_id}".encode(),
+        ):
+            ev = self._event(payload)
+            await self.bot._handle_callback(ev)
+            self.assertEqual(ev.answers[-1][1], True)
 
-    async def test_flashcard_export_requires_membership(self):
+    async def test_flashcard_generation_requires_membership(self):
         self.bot.subscription.settings = replace(self.bot.subscription.settings, subscription_required=True)
         self.bot.subscription.db = self.db
         async def nonmember(_user_id):
             return "left"
         self.bot.subscription._resolver = nonmember
-        deck_id = await self.db.deck_create(OWNER, None, "deck", "manual")
-        await self.db.deck_add_card(deck_id, "front", "back")
-        export = self._event(f"fc:exp:{deck_id}".encode())
-        await self.bot._handle_callback(export)
+        event = self._event(f"fc:go:{self.item_id}".encode())
+        with mock.patch("gamas_bot.bot.complete_json") as generator:
+            await self.bot._handle_callback(event)
+            generator.assert_not_called()
         self.assertFalse(self.client.deliveries)
-        self.assertTrue(any("عضویت" in edit["text"] for edit in export.edits))
+        self.assertTrue(
+            any("عضویت" in edit["text"] for edit in event.edits)
+            or any("عضویت" in record["text"] for record in self.client.texts)
+        )
 
-    async def test_word_export_delivers_rtl_docx_and_removes_the_temp_file(self):
-        deck_id = await self.db.deck_create(OWNER, None, "دسته آزمون", "manual")
-        await self.db.deck_add_card(deck_id, "پرسش مهم؟", "پاسخ کامل")
-        export = self._event(f"fc:exp:{deck_id}".encode())
-        await self.bot._handle_callback(export)
-        # The export is a bar from the first frame, not a frozen screen.
-        frames = [edit["text"] for edit in export.edits]
-        self.assertTrue(frames)
-        self.assertIn("٪", frames[0])
-        self.assertIn("۱۰۰٪", frames[-1])
-        docx_paths = [
+    async def test_manual_deck_export_delivers_interactive_html_and_stores_blob(self):
+        await self.bot._handle_callback(self._event(b"fc:man"))
+        await self.bot._handle_message(FakeMessageEvent(OWNER, "پرسش مهم؟"))
+        await self.bot._handle_message(FakeMessageEvent(OWNER, "پاسخ کامل"))
+        done = self._event(b"fc:man:done")
+        await self.bot._handle_callback(done)
+        html_paths = [
             record["path"] for record in self.client.deliveries
-            if str(record["path"]).endswith(".docx")
+            if str(record["path"]).endswith(".html")
         ]
-        self.assertTrue(docx_paths)
+        self.assertTrue(html_paths)
         # The temp file is removed after delivery.
-        self.assertFalse(Path(docx_paths[-1]).exists())
-        payload = self.recorder.file_payloads[-1][1]
-        text = docx_text(payload)
-        self.assertIn("پرسش مهم؟", text)
-        self.assertIn("پاسخ کامل", text)
+        self.assertFalse(Path(html_paths[-1]).exists())
+        payload = self.recorder.file_payloads[-1][1].decode("utf-8")
+        self.assertIn("پرسش مهم؟", payload)
+        self.assertIn("پاسخ کامل", payload)
+        self.assertIn('dir="rtl"', payload)
+        lib_items = await self.db.library_list_kind(OWNER, "flashcards")
+        self.assertEqual(len(lib_items), 1)
+        blob = await self.db.library_file_blob(OWNER, lib_items[0]["item_id"])
+        self.assertIsNotNone(blob)
 
-    async def test_delete_needs_confirmation_and_cascades(self):
-        deck_id = await self.db.deck_create(OWNER, None, "دسته", "manual")
-        await self.db.deck_add_card(deck_id, "پ", "پا")
-        confirm = self._event(f"fc:del:{deck_id}".encode())
+    async def test_library_delete_needs_confirmation_and_cascades_blob(self):
+        item_id = await self.db.library_record_delivered_file(
+            OWNER,
+            "flashcards",
+            title="دسته آزمون",
+            chat_id=OWNER,
+            message_id=99,
+            artifact_kind="flashcards_html",
+            filename="cards.html",
+            content_type="text/html; charset=utf-8",
+            content=b"<html></html>",
+        )
+        confirm = self._event(f"lib:del:{item_id}".encode())
         await self.bot._handle_callback(confirm)
-        self.assertIn("آیا مطمئنید؟", confirm.edits[-1]["text"])
-        self.assertIsNotNone(await self.db.deck_get(deck_id, OWNER))
-        ok = self._event(f"fc:delok:{deck_id}".encode())
+        self.assertIn("مطمئن", confirm.edits[-1]["text"])
+        self.assertIsNotNone(await self.db.library_item(OWNER, item_id))
+        ok = self._event(f"lib:delok:{item_id}".encode())
         await self.bot._handle_callback(ok)
-        self.assertIsNone(await self.db.deck_get(deck_id, OWNER))
+        self.assertIsNone(await self.db.library_item(OWNER, item_id))
+        self.assertIsNone(await self.db.library_file_blob(OWNER, item_id))
 
     async def test_picker_lists_booklets_only(self):
         picker = self._event(b"fc:pick:0")
@@ -1143,6 +954,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         self.bot = GamasBot(self.settings)
         self.bot.db = self.db
         self.client = FakeTelegramClient()
+        self.bot.client = self.client
         await self.db.ensure_user(OWNER)
         await self.db.add_credit(OWNER, 3600, note="test", validity_days=30)
         self.item_id = await self.db.library_add(
@@ -1166,13 +978,9 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
 
     def _assert_failure_frame(self, text: str) -> None:
         """A failed generation ends on the bar: fail headline, 🛑 and the hint."""
-        self.assertIn("ساخت محتوا ناموفق بود", text)
+        self.assertIn("ساخت فایل تعاملی ناموفق بود", text)
         self.assertIn("🛑", text)
         self.assertIn("کمی بعد دوباره امتحان کنید", text)
-
-    async def save_curation(self, kind: str = "quiz") -> None:
-        prefix = "fc" if kind == "deck" else "quiz"
-        await self.bot._handle_callback(self._event(f"{prefix}:cur:save".encode()))
 
     @staticmethod
     def _payloads(buttons) -> set[bytes]:
@@ -1261,7 +1069,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generate.await_args.kwargs["data_sensitivity"], "SENSITIVE")
         self.assertNotIn(private_text, repr(log_info.call_args_list))
 
-    async def test_paid_quiz_generation_shortfall_refunds_on_save(self):
+    async def test_paid_quiz_generation_shortfall_refunds_pro_rata_automatically(self):
         from gamas_bot.doc_extract import DocChunk
 
         await self.spend_free_try()
@@ -1273,9 +1081,6 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
                 self._event(b"quiz:hub"), user_id=OWNER, kind="quiz", source=source,
                 wanted=10, cost=401, note="test", title="test",
             )
-        self.assertEqual(len(self.bot._curation[OWNER]["items"]), 5)
-        event = self._event(b"quiz:cur:save")
-        await self.bot._handle_callback(event)
         self.assertEqual(await self.db.available_seconds(OWNER), 3600 - 401 + 201)
         self.assertEqual((await self.db.db.execute_fetchall(
             "SELECT status FROM learning_charges"
@@ -1283,13 +1088,13 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.db.db.execute_fetchall(
             "SELECT COUNT(*) FROM quiz_questions"
         ))[0][0], 5)
-        self.assertTrue(any("اعتبار بازگشتی" in (answer or "") for answer, _ in event.answers))
+        self.assertTrue(any("اعتبار بازگشتی" in row["text"] for row in self.client.texts))
 
     async def test_quiz_start_screen_shows_three_costs(self):
         event = self._event(f"quiz:new:{self.item_id}".encode())
         await self.bot._handle_callback(event)
         record = event.edits[-1]
-        self.assertIn("آزمون از جزوه", record["text"])
+        self.assertIn("آزمون تعاملی HTML از جزوه", record["text"])
         # R5.3 size presets: سریع ۵ سؤال · استاندارد ۱۰ · کامل ۲۰.
         for count in (5, 10, 20):
             self.assertIn(
@@ -1297,7 +1102,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
                 self._payloads(record["buttons"]),
             )
 
-    async def test_booklet_quiz_with_persian_difficulty_reaches_the_preview(self):
+    async def test_booklet_quiz_with_persian_difficulty_delivers_html(self):
         """«سخت»/«متوسط» are recorded as hard/medium instead of voiding the quiz."""
         payload = quiz_payload(5, source="بخش 1")
         for index, question in enumerate(payload["questions"]):
@@ -1309,12 +1114,12 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         ) as generator:
             await self.bot._handle_callback(self._event(f"quiz:go:{self.item_id}:5".encode()))
         self.assertEqual(generator.await_count, 1)
-        self.assertEqual(len(self.bot._curation[OWNER]["items"]), 5)
-        await self.save_curation("quiz")
         rows = await self.db.db.execute_fetchall("SELECT difficulty FROM quiz_questions")
+        self.assertEqual(len(rows), 5)
         self.assertEqual({row[0] for row in rows}, {"hard", "medium"})
+        self.assertEqual(len(await self.db.library_list_kind(OWNER, "quiz")), 1)
 
-    async def test_generation_debits_then_full_quiz_completes_with_rank(self):
+    async def test_generation_debits_then_delivers_html_quiz_and_stores_blob(self):
         await self.spend_free_try("quiz")
         with mock.patch("gamas_bot.learning.random.shuffle"):
             with mock.patch(
@@ -1324,8 +1129,6 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
                 event = self._event(f"quiz:go:{self.item_id}:5".encode())
                 await self.bot._handle_callback(event)
                 generator.assert_awaited_once()
-        # Generation ends on the curation preview; the session exists after save.
-        await self.save_curation("quiz")
         # A lot-aware debit exists with allocations.
         debits = await self.db.db.execute_fetchall(
             "SELECT id, seconds, note FROM ledger WHERE user_id=? AND kind='debit'",
@@ -1340,32 +1143,18 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tuple(allocations[0]), (1, 300))
         self.assertEqual(await self.db.available_seconds(OWNER), 3300)
         session_rows = await self.db.db.execute_fetchall(
-            "SELECT session_id FROM quiz_sessions WHERE user_id=?", (OWNER,)
+            "SELECT session_id, status FROM quiz_sessions WHERE user_id=?", (OWNER,)
         )
-        session_id = session_rows[0][0]
-        # Answer all five questions, alternating correct (option 0, no shuffle).
-        for index in range(5):
-            question = await self.db.quiz_current_question(session_id)
-            answer = self._event(
-                f"quiz:ans:{session_id}:{question['question_id']}:0".encode()
-            )
-            await self.bot._handle_callback(answer)
-            reveal = answer.edits[-1]
-            self.assertIn("✅ پاسخ درست", reveal["text"])
-            if index < 4:
-                self.assertTrue(
-                    any("سؤال بعدی" in label for label in self._labels(reveal["buttons"]))
-                )
-                next_event = self._event(f"quiz:next:{session_id}".encode())
-                await self.bot._handle_callback(next_event)
-        # Finish screen on the last reveal's next tap.
-        next_event = self._event(f"quiz:next:{session_id}".encode())
-        await self.bot._handle_callback(next_event)
-        finish = next_event.edits[-1]
-        self.assertIn("آزمون تمام شد", finish["text"])
-        self.assertIn("امتیاز کسب‌شده: ۵۰", finish["text"])
-        self.assertIn(b"board", self._payloads(finish["buttons"]))
-        self.assertEqual((await self.db.leaderboard_rank(OWNER))["points"], 50)
+        self.assertEqual(len(session_rows), 1)
+        self.assertEqual(session_rows[0][1], "done")
+        quiz_items = await self.db.library_list_kind(OWNER, "quiz")
+        self.assertEqual(len(quiz_items), 1)
+        blob = await self.db.library_file_blob(OWNER, quiz_items[0]["item_id"])
+        self.assertIsNotNone(blob)
+        self.assertTrue(blob["filename"].endswith(".html"))
+        html_text = bytes(blob["content"]).decode("utf-8")
+        self.assertIn('dir="rtl"', html_text)
+        self.assertIn("gamas-learning-data", html_text)
 
     async def test_llm_failure_refunds_in_full_and_shows_notice(self):
         await self.spend_free_try("quiz")
@@ -1403,7 +1192,6 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         ):
             retry = self._event(f"quiz:go:{self.item_id}:5".encode())
             await self.bot._handle_callback(retry)
-        await self.save_curation("quiz")
         sessions = await self.db.db.execute_fetchall("SELECT COUNT(*) FROM quiz_sessions")
         self.assertEqual(sessions[0][0], 1)
 
@@ -1427,7 +1215,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         ) as generator:
             await self.bot._handle_callback(self._event(f"quiz:go:{self.item_id}:5".encode()))
         self.assertGreaterEqual(generator.await_count, 1)
-        self.assertNotIn(OWNER, self.bot._curation)
+        self.assertEqual(await self.db.library_list_kind(OWNER, "quiz"), [])
         self.assertEqual(await self.db.available_seconds(OWNER), 3600)
         self._assert_failure_frame(self.client.texts[-1]["text"])
 
@@ -1452,9 +1240,8 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         # The repair prompt asks for the missing two, not for five again.
         self.assertIn("۲ سؤال", calls[1]["user"])
         self.assertEqual(calls[0]["system"], calls[1]["system"])
-        state = self.bot._curation[OWNER]
-        self.assertEqual(len(state["items"]), 5)
-        self.assertEqual(state["failures"], 0)
+        rows = await self.db.db.execute_fetchall("SELECT COUNT(*) FROM quiz_questions")
+        self.assertEqual(rows[0][0], 5)
 
     async def test_a_provider_that_rejects_structured_output_does_not_drop_schema(self):
         """Unsupported structured output fails safely instead of weakening validation."""
@@ -1473,7 +1260,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_callback(self._event(f"quiz:go:{self.item_id}:5".encode()))
         self.assertTrue(seen)
         self.assertTrue(all(schema is not None for schema in seen))
-        self.assertNotIn(OWNER, self.bot._curation)
+        self.assertEqual(await self.db.library_list_kind(OWNER, "quiz"), [])
         self.assertEqual(await self.db.available_seconds(OWNER), 3600)
 
     async def test_a_zero_result_failure_says_why(self):
@@ -1506,77 +1293,18 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(debits[0][0], 0)
 
-    async def test_double_tap_answer_gets_friendly_ack_and_one_row(self):
-        with mock.patch("gamas_bot.learning.random.shuffle"), mock.patch(
-            "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=quiz_payload(5)),
-        ):
-            await self.bot._handle_callback(
-                self._event(f"quiz:go:{self.item_id}:5".encode())
-            )
-        await self.save_curation("quiz")
-        session_id = (await self.db.db.execute_fetchall(
-            "SELECT session_id FROM quiz_sessions"
-        ))[0][0]
-        question = await self.db.quiz_current_question(session_id)
-        data = f"quiz:ans:{session_id}:{question['question_id']}:0".encode()
-        await self.bot._handle_callback(self._event(data))
-        second = self._event(data)
-        await self.bot._handle_callback(second)
-        self.assertEqual(second.answers[-1], ("پاسخ شما ثبت شده بود.", False))
-        rows = await self.db.db.execute_fetchall(
-            "SELECT COUNT(*) FROM quiz_answers WHERE question_id=?",
-            (question["question_id"],),
-        )
-        self.assertEqual(rows[0][0], 1)
+    async def test_legacy_in_chat_quiz_callbacks_fail_closed(self):
+        for data in (b"quiz:ans:1:1:0", b"quiz:next:1", b"quiz:quit:1", b"quiz:ans:abc:def:0"):
+            ev = self._event(data)
+            await self.bot._handle_callback(ev)
+            self.assertEqual(ev.answers[-1][1], True)
 
-    async def test_foreign_user_and_stale_callbacks_fail_closed(self):
-        with mock.patch("gamas_bot.learning.random.shuffle"), mock.patch(
-            "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=quiz_payload(5)),
-        ):
-            await self.bot._handle_callback(
-                self._event(f"quiz:go:{self.item_id}:5".encode())
-            )
-        await self.save_curation("quiz")
-        session_id = (await self.db.db.execute_fetchall(
-            "SELECT session_id FROM quiz_sessions"
-        ))[0][0]
-        question = await self.db.quiz_current_question(session_id)
-        foreign = self._event(
-            f"quiz:ans:{session_id}:{question['question_id']}:0".encode(),
-            user_id=OTHER,
-        )
-        await self.bot._handle_callback(foreign)
-        self.assertEqual(foreign.answers[-1][1], True)  # alert
-        self.assertIn("معتبر نیست", foreign.answers[-1][0])
-        # Malformed callback data.
-        bogus = self._event(b"quiz:ans:abc:def:0")
-        await self.bot._handle_callback(bogus)
-        self.assertEqual(bogus.answers[-1][1], True)
-
-    async def test_quit_shows_partial_summary_and_keeps_points(self):
-        with mock.patch("gamas_bot.learning.random.shuffle"), mock.patch(
-            "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=quiz_payload(5)),
-        ):
-            await self.bot._handle_callback(
-                self._event(f"quiz:go:{self.item_id}:5".encode())
-            )
-        await self.save_curation("quiz")
-        session_id = (await self.db.db.execute_fetchall(
-            "SELECT session_id FROM quiz_sessions"
-        ))[0][0]
-        question = await self.db.quiz_current_question(session_id)
-        await self.bot._handle_callback(
-            self._event(f"quiz:ans:{session_id}:{question['question_id']}:0".encode())
-        )
-        quit_event = self._event(f"quiz:quit:{session_id}".encode())
-        await self.bot._handle_callback(quit_event)
-        text = quit_event.edits[-1]["text"]
-        self.assertIn("آزمون پایان یافت", text)
-        self.assertIn("امتیاز کسب‌شده: ۱۰", text)
-        self.assertEqual((await self.db.leaderboard_rank(OWNER))["points"], 10)
+    async def test_foreign_user_cannot_generate_quiz_from_other_users_booklet(self):
+        foreign = self._event(f"quiz:go:{self.item_id}:5".encode(), user_id=OTHER)
+        with mock.patch("gamas_bot.bot.complete_json") as generator:
+            await self.bot._handle_callback(foreign)
+            generator.assert_not_called()
+        self.assertEqual(foreign.answers[-1][1], True)
 
     async def test_legacy_item_without_content_shows_notice(self):
         legacy = await self.db.library_add(
@@ -1594,13 +1322,12 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         ):
             event = self._event(f"quiz:go:{self.item_id}:5".encode())
             await self.bot._handle_callback(event)
-        await self.save_curation("quiz")
         debits = await self.db.db.execute_fetchall(
             "SELECT COUNT(*) FROM ledger WHERE kind='debit'"
         )
         self.assertEqual(debits[0][0], 0)
         sessions = await self.db.db.execute_fetchall(
-            "SELECT COUNT(*) FROM quiz_sessions WHERE status='active'"
+            "SELECT COUNT(*) FROM quiz_sessions WHERE status='done'"
         )
         self.assertEqual(sessions[0][0], 1)
 
@@ -1619,7 +1346,6 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
                 self.bot._handle_callback(first),
                 self.bot._handle_callback(second),
             )
-        await self.save_curation("quiz")
         # Only one generation and one debit; the second tap was rejected.
         debits = await self.db.db.execute_fetchall(
             "SELECT COUNT(*) FROM ledger WHERE kind='debit'"
@@ -1643,29 +1369,6 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(event)
         self.assertEqual(event.answers[-1][1], True)
         self.assertFalse(event.edits)
-
-    async def test_next_after_quit_shows_the_partial_summary(self):
-        with mock.patch("gamas_bot.learning.random.shuffle"), mock.patch(
-            "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=quiz_payload(5)),
-        ):
-            await self.bot._handle_callback(
-                self._event(f"quiz:go:{self.item_id}:5".encode())
-            )
-        await self.save_curation("quiz")
-        session_id = (await self.db.db.execute_fetchall(
-            "SELECT session_id FROM quiz_sessions"
-        ))[0][0]
-        question = await self.db.quiz_current_question(session_id)
-        await self.bot._handle_callback(
-            self._event(f"quiz:ans:{session_id}:{question['question_id']}:0".encode())
-        )
-        await self.bot._handle_callback(
-            self._event(f"quiz:quit:{session_id}".encode())
-        )
-        next_event = self._event(f"quiz:next:{session_id}".encode())
-        await self.bot._handle_callback(next_event)
-        self.assertIn("آزمون پایان یافت", next_event.edits[-1]["text"])
 
 
 class LearningMigrationTests(unittest.IsolatedAsyncioTestCase):
@@ -1739,53 +1442,10 @@ class CallbackBudgetTests(unittest.TestCase):
             f"quiz:next:{big}",
             f"fc:flip:{big}:{big}",
             f"fc:delok:{big}",
-            f"adm:bgok:{big}:paid_30h_30d",
             f"lib:it:{big}",
         ]
         for sample in samples:
             self.assertLessEqual(len(sample.encode("ascii")), 64, sample)
-
-
-class GiftCooldownTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        root = Path(self._tmp.name)
-        self.settings = make_settings(db_path=root / "gift.db", temp_dir=root / "tmp")
-        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
-        self.db = Database(self.settings.db_path)
-        await self.db.connect()
-        self.bot = GamasBot(self.settings)
-        self.bot.db = self.db
-        self.client = FakeTelegramClient()
-        self.bot.client = self.client
-        self.admin_id = next(iter(self.settings.admin_ids))
-        await self.db.ensure_user(OWNER)
-        await self.db.sync_plans([
-            {"code": "paid_5h_30d", "hours": 5, "price": 50000, "validity_days": 30},
-        ])
-
-    async def asyncTearDown(self):
-        await self.bot.shutdown()
-        await self.db.close()
-        self._tmp.cleanup()
-
-    def _event(self, data: bytes) -> FakeCallbackEvent:
-        event = FakeCallbackEvent(self.client, data=data, chat_id=self.admin_id)
-        event.client = self.client
-        return event
-
-    async def test_a_second_confirm_tap_within_cooldown_grants_nothing_twice(self):
-        first = self._event(f"adm:bgok:{OWNER}:paid_5h_30d".encode())
-        await self.bot._handle_callback(first)
-        self.assertEqual(await self.db.available_seconds(OWNER), 5 * 3600)
-        second = self._event(f"adm:bgok:{OWNER}:paid_5h_30d".encode())
-        await self.bot._handle_callback(second)
-        # The cooldown message replaces the gift; balance is unchanged.
-        self.assertEqual(await self.db.available_seconds(OWNER), 5 * 3600)
-        credits = await self.db.db.execute_fetchall(
-            "SELECT COUNT(*) FROM ledger WHERE user_id=? AND kind='credit'", (OWNER,)
-        )
-        self.assertEqual(credits[0][0], 1)
 
 
 # ===========================================================================
@@ -2084,6 +1744,7 @@ class QuizDifficultyGenerationSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.bot = GamasBot(self.settings)
         self.bot.db = self.db
         self.client = FakeTelegramClient()
+        self.bot.client = self.client
         await self.db.ensure_user(OWNER)
         await self.db.add_credit(OWNER, 3600, note="test", validity_days=30)
         reference = json.loads(
@@ -2129,11 +1790,6 @@ class QuizDifficultyGenerationSmokeTests(unittest.IsolatedAsyncioTestCase):
         ) as generator:
             await self.bot._handle_callback(event)
         generator.assert_awaited_once()
-        save = FakeCallbackEvent(
-            self.client, data=b"quiz:cur:save", chat_id=OWNER
-        )
-        save.client = self.client
-        await self.bot._handle_callback(save)
 
         # 1) The harder prompt and the real fixture booklet reach the model.
         call = generator.await_args

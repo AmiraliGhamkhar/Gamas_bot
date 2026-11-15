@@ -913,7 +913,6 @@ class TranscriptRetentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(await self.db.document_get(self.user_id, live))
         self.assertIsNone(await self.db.quiz_get_session(terminal, self.user_id))
         self.assertIsNotNone(await self.db.quiz_get_session(active, self.user_id))
-        self.assertEqual((await self.db.leaderboard_rank(self.user_id))["points"], 10)
         self.assertEqual((await self.db.db.execute_fetchall("SELECT submission_id FROM holds"))[0][0], running)
         self.assertEqual(await self.db.available_seconds(self.user_id), 900)
         self.assertEqual((await self.db.db.execute_fetchall("SELECT COUNT(*) FROM hold_allocations WHERE submission_id=?", (done,)))[0][0], 0)

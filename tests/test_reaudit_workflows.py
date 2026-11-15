@@ -196,41 +196,39 @@ class PaidCurationTests(CurationFixture):
         self.assertEqual(await self.db.available_seconds(OWNER), 1_000)
 
     async def test_refund_failure_is_reported_and_recovered_on_restart(self):
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
-            await self.bot._handle_callback(self.press(f"fc:go:{self.item}".encode()))
-        event = self.press(b"fc:cur:cancel")
-        with mock.patch.object(
-            self.db, "refund_learning_charge", side_effect=sqlite3.OperationalError("database unavailable")
+        with (
+            mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=RuntimeError("provider down"))),
+            mock.patch.object(
+                self.db, "refund_learning_charge", side_effect=sqlite3.OperationalError("database unavailable")
+            ),
         ):
-            await self.bot._handle_callback(event)
-        self.assertIn("فعلاً ناموفق", event.edits[-1]["text"])
+            await self.bot._handle_callback(self.press(f"fc:go:{self.item}".encode()))
+        frames = [m["text"] for m in self.client.texts]
+        self.assertTrue(any("فعلاً ناموفق" in f for f in frames), frames)
         self.assertEqual(await self.db.available_seconds(OWNER), 700)
         self.assertEqual(await self.db.recover_pending_learning_charges(), 1)
         self.assertEqual(await self.db.available_seconds(OWNER), 1_000)
 
-    async def test_unlimited_cancel_does_not_claim_a_gift_was_restored(self):
+    async def test_unlimited_failure_does_not_claim_a_gift_was_restored(self):
         await self.db.set_unlimited(OWNER, True, admin_id=1)
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=RuntimeError("provider down"))):
             await self.bot._handle_callback(self.press(f"fc:go:{self.item}".encode()))
-        event = self.press(b"fc:cur:cancel")
-        await self.bot._handle_callback(event)
-        self.assertIn("هزینه‌ای کسر نشده", event.edits[-1]["text"])
+        frames = [m["text"] for m in self.client.texts]
+        self.assertFalse(any("هدیه" in f for f in frames), frames)
 
     async def test_saved_paid_deck_and_quiz_are_not_refunded_on_restart(self):
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
             await self.bot._handle_callback(self.press(f"fc:go:{self.item}".encode()))
-        await self.bot._handle_callback(self.press(b"fc:cur:save"))
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(5))):
             await self.bot._handle_callback(self.press(f"quiz:go:{self.item}:5".encode()))
-        await self.bot._handle_callback(self.press(b"quiz:cur:save"))
         self.assertEqual(await self.db.available_seconds(OWNER), 400)
         self.assertEqual(await self.db.recover_pending_learning_charges(), 0)
         self.assertEqual(await self.db.deck_count(OWNER), 1)
         self.assertEqual(len(await self.db.db.execute_fetchall("SELECT * FROM quiz_sessions")), 1)
+        self.assertEqual(await self.db.library_count_kind(OWNER, "flashcards"), 1)
+        self.assertEqual(await self.db.library_count_kind(OWNER, "quiz"), 1)
 
     async def test_cancel_during_committed_save_never_refunds_paid_artifact(self):
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
-            await self.bot._handle_callback(self.press(f"fc:go:{self.item}".encode()))
         committed = asyncio.Event()
         original = self.db.deck_create_with_cards
 
@@ -240,8 +238,11 @@ class PaidCurationTests(CurationFixture):
             await asyncio.Event().wait()
             return result
 
-        with mock.patch.object(self.db, "deck_create_with_cards", side_effect=save_then_wait):
-            task = asyncio.create_task(self.bot._handle_callback(self.press(b"fc:cur:save")))
+        with (
+            mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))),
+            mock.patch.object(self.db, "deck_create_with_cards", side_effect=save_then_wait),
+        ):
+            task = asyncio.create_task(self.bot._handle_callback(self.press(f"fc:go:{self.item}".encode())))
             await asyncio.wait_for(committed.wait(), 2)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):

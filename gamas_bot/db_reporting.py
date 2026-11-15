@@ -21,6 +21,7 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
     USER_REFERENCE_COLUMNS: tuple[tuple[str, str], ...] = (
         ("submissions", "user_id"),
         ("library_items", "user_id"),
+        ("library_file_blobs", "user_id"),
         ("ledger", "user_id"),
         ("holds", "user_id"),
         ("payments", "user_id"),
@@ -45,6 +46,7 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
         ("holds", "submission_id", "submissions", "submission_id"),
         ("retired_holds", "submission_id", "submissions", "submission_id"),
         ("library_items", "submission_id", "submissions", "submission_id"),
+        ("library_file_blobs", "item_id", "library_items", "item_id"),
         ("ledger", "submission_id", "submissions", "submission_id"),
         ("ledger", "payment_id", "payments", "payment_id"),
         ("documents", "library_item_id", "library_items", "item_id"),

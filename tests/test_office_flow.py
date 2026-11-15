@@ -446,7 +446,7 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.billing_snapshot(), before)
         items = await self.db.library_list(self.user_id, limit=10)
         self.assertEqual(len(items), 4)
-        self.assertTrue(all(item["kind"] == "office" for item in items))
+        self.assertTrue(all(item["kind"] == "booklet" for item in items))
         # A document-note booklet is named by the same short title: the cover,
         # both files and all four rows share it.
         from gamas_bot.titles import word_count

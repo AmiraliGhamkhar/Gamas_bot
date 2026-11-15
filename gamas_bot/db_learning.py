@@ -1,4 +1,4 @@
-"""Quiz sessions, flashcard decks, and leaderboard repository (SRP)."""
+"""Quiz sessions and flashcard decks repository (SRP)."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ class FlashcardLimitError(ValueError):
 
 
 class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
-    """Single-responsibility persistence slice for quizzes, decks, and leaderboards."""
+    """Single-responsibility persistence slice for quizzes and flashcard decks."""
 
     async def quiz_admission(
         self,
@@ -61,10 +61,13 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
         item_id: int,
         questions: list[dict[str, Any]],
         *,
+        status: str = "active",
         free_claim_id: str | None = None,
         paid_charge_id: str | None = None,
         refund_seconds_value: int = 0,
     ) -> int:
+        if status not in ("active", "done"):
+            raise ValueError(f"invalid quiz session status {status!r}")
         if not questions:
             raise ValueError("quiz session needs at least one question")
         for question in questions:
@@ -82,8 +85,8 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
             cursor = await self.db.execute(
                 "INSERT INTO quiz_sessions(user_id, item_id, question_count, "
                 "current_index, score, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, 0, 0, 'active', ?, ?)",
-                (int(user_id), int(item_id), len(questions), now, now),
+                "VALUES (?, ?, ?, 0, 0, ?, ?, ?)",
+                (int(user_id), int(item_id), len(questions), status, now, now),
             )
             session_id = int(cursor.lastrowid or 0)
             await self.db.executemany(
@@ -188,20 +191,6 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                 )
                 if updated.rowcount != 1:
                     raise sqlite3.IntegrityError("quiz cursor changed during answer")
-                await self.db.execute(
-                    "UPDATE users SET quiz_points = quiz_points + 10 "
-                    "WHERE telegram_id = (SELECT user_id FROM quiz_sessions "
-                    "WHERE session_id = ?)",
-                    (int(session_id),),
-                )
-                # Weekly/monthly boards read only this append-only event table.
-                # users.quiz_points stays the all-time authority, so the ledger
-                # of points is never derived from a mutable total.
-                await self.db.execute(
-                    "INSERT INTO quiz_point_events(user_id, points, session_id, created_at) "
-                    "SELECT user_id, 10, ?, ? FROM quiz_sessions WHERE session_id = ?",
-                    (int(session_id), now, int(session_id)),
-                )
             else:
                 updated = await self.db.execute(
                     "UPDATE quiz_sessions SET current_index = current_index + 1, "
@@ -242,50 +231,6 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
             "WHERE session_id = ? AND status = 'active'",
             (status, iso(self._now()), int(session_id)),
         )
-
-    async def leaderboard_top(self, limit: int = 20) -> list[dict[str, Any]]:
-        rows = await _rows(
-            self.read_db,
-            "SELECT first_name, quiz_points FROM users "
-            "WHERE banned = 0 AND quiz_points > 0 "
-            "ORDER BY quiz_points DESC, telegram_id ASC LIMIT ?",
-            (max(1, int(limit)),),
-        )
-        return [
-            {"first_name": str(row[0] or ""), "quiz_points": int(row[1])}
-            for row in rows
-        ]
-
-    async def leaderboard_rank(self, user_id: int) -> dict[str, int]:
-        rows = await _rows(
-            self.read_db,
-            "SELECT quiz_points FROM users WHERE telegram_id = ?",
-            (int(user_id),),
-        )
-        points = int(rows[0][0]) if rows else 0
-        higher = await _rows(
-            self.read_db,
-            "SELECT COUNT(*) FROM users WHERE banned = 0 AND quiz_points > ?",
-            (points,),
-        )
-        return {"rank": (int(higher[0][0]) if higher else 0) + 1, "points": points}
-
-    async def leaderboard_admin_top(self, limit: int = 5) -> list[dict[str, Any]]:
-        rows = await _rows(
-            self.read_db,
-            "SELECT telegram_id, first_name, quiz_points FROM users "
-            "WHERE banned = 0 AND quiz_points > 0 "
-            "ORDER BY quiz_points DESC, telegram_id ASC LIMIT ?",
-            (max(1, int(limit)),),
-        )
-        return [
-            {
-                "telegram_id": int(row[0]),
-                "first_name": str(row[1] or ""),
-                "quiz_points": int(row[2]),
-            }
-            for row in rows
-        ]
 
     async def deck_count(self, user_id: int) -> int:
         rows = await _rows(

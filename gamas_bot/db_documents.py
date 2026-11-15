@@ -164,7 +164,8 @@ class DocumentsRepositoryMixin(DatabaseCore):
             display_title = title if title else f"📄 {str(rows[0][2])[:120]}"
             cursor = await self.db.execute(
                 "INSERT INTO library_items(user_id, kind, chat_id, message_id, title, "
-                "unavailable, created_at, content_text) VALUES (?, 'booklet', ?, ?, ?, ?, ?, ?)",
+                "unavailable, created_at, content_text, delivered, artifact_kind) "
+                "VALUES (?, 'booklet', ?, ?, ?, ?, ?, ?, 0, 'document_source')",
                 (
                     int(user_id),
                     chat_id,
