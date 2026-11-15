@@ -163,11 +163,11 @@ class PdfExtractionTests(TempFileMixin):
         self.assertEqual(extracted.sections[0].locator, "صفحهٔ ۱")
         self.assertIn("ATP", extracted.text)
 
-    def test_scanned_pdf_is_refused_with_the_ocr_message(self):
+    def test_scanned_pdf_is_refused_with_the_explicit_message(self):
         path = self.write("scan.pdf", make_blank_pdf_bytes())
         with self.assertRaises(ScannedPdfError) as caught:
             extract_document(path, "pdf")
-        self.assertIn("OCR اختیاری فعلاً خاموش", str(caught.exception))
+        self.assertIn("قابل‌خواندن نیست", str(caught.exception))
 
     def test_password_protected_pdf_is_refused(self):
         path = self.write("locked.pdf", make_encrypted_pdf_bytes())
@@ -230,7 +230,7 @@ class DocxExtractionTests(TempFileMixin):
         path = self.write("empty.docx", make_image_only_docx_bytes())
         with self.assertRaises(DocExtractError) as caught:
             extract_document(path, "docx")
-        self.assertIn("OCR", str(caught.exception))
+        self.assertIn("متن قابل‌استخراجی", str(caught.exception))
 
 
 class PptxExtractionTests(TempFileMixin):
@@ -246,14 +246,14 @@ class PptxExtractionTests(TempFileMixin):
         self.assertNotIn("اسلاید ۳", locators)
         self.assertIn("گلیکولیز", extracted.text)
 
-    def test_empty_presentation_is_refused_with_ocr_message(self):
+    def test_empty_presentation_is_refused(self):
         from pptx import Presentation
 
         out = io.BytesIO()
         Presentation().save(out)
         with self.assertRaises(DocExtractError) as caught:
             extract_document(self.write("empty.pptx", out.getvalue()), "pptx")
-        self.assertIn("OCR", str(caught.exception))
+        self.assertIn("متن قابل‌استخراجی", str(caught.exception))
 
     def test_sections_from_slides_is_the_shared_shape(self):
         from types import SimpleNamespace

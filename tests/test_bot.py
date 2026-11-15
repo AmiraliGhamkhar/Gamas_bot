@@ -1573,11 +1573,10 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         expected = texts.help_screen(
             office_enabled=self.bot.settings.office_enabled,
             notes_configured=self.bot.settings.note_configured,
-            ocr_enabled=self.bot.settings.ocr_enabled,
         )
         self.assertEqual(text, expected)
         self.assertIn(texts.OFFICE_CREDIT_NOTICE, text)
-        self.assertIn(texts.DOCUMENT_OCR_OFF_NOTICE, text)
+        self.assertIn(texts.DOCUMENT_SCANNED_NOTICE, text)
         self.assertIn("صدای PowerPoint خودکار پردازش نمی‌شود", text)
 
     async def test_main_panel_is_clear_when_word_generation_is_not_configured(self):

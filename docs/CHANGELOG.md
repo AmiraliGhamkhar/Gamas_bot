@@ -4,6 +4,16 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**OCR removed; document ingestion is text-layer only.** The optional i2ocr.com
+integration is gone: `gamas_bot/ocr.py`, `scripts/ocr_smoke.py`, the `ocr` extra
+(`curl-cffi`), the `OCR_ENABLED`/`OCR_LANGUAGE`/`OCR_MAX_PAGES`/
+`OCR_TIMEOUT_SECONDS` settings, their `.env.example` section, the OCR tests and
+the feature/troubleshooting documentation. A text-poor PDF and an uploaded photo
+are refused with an explicit Persian message instead of being sent to a
+third-party recognition service; photos no longer enter the document pipeline.
+The stored `documents.source_type='image'` value and migration `017` are left in
+place so existing libraries stay readable.
+
 **Booklet prompt and map/reduce corrections.** The Persian generation contract no
 longer asks each chunk to suppress its summary, key points, glossary and
 source-backed objectives while the default pipeline skips the optional compile;

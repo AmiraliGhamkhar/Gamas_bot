@@ -17,7 +17,6 @@
 | --- | --- |
 | Audio/video | The configured STT chain (Speechmatics, Deepgram and/or an OpenAI-compatible transcription API) |
 | Transcript text for booklets, AI quizzes and AI flashcards | Approved note-generation routes only: Gemini and AvalAI; OpenRouter is a fallback only when sensitivity policy permits it |
-| Scan and photo images | i2ocr.com — only when `OCR_ENABLED=true` |
 | Transcripts, notes, billing, tickets | local SQLite (`data/gamas_v3.db`) |
 | Generated files | Telegram; the library stores message references |
 

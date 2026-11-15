@@ -1,14 +1,14 @@
-"""Document extraction/OCR library and Free Office workspace workflows (SRP / DIP).
+"""Document extraction library and Free Office workspace workflows (SRP / DIP).
 
-Encapsulates PDF/Word/PowerPoint/image document ingestion, i2OCR integration,
-owner-scoped document exports & source-grounded booklets, and the ephemeral
-Free Office multi-message text composer.
+Encapsulates PDF/Word/PowerPoint document ingestion, owner-scoped document
+exports & source-grounded booklets, and the ephemeral Free Office multi-message
+text composer.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, MutableMapping, Sequence
+from collections.abc import MutableMapping
 from dataclasses import replace
 from datetime import datetime
 import logging
@@ -25,11 +25,9 @@ from telethon.tl.custom import Message
 from . import texts
 from .billing import format_seconds_as_credits
 from .bot_ui import (
-    DEFAULT_INTAKE_SUFFIX,
     DOC_EXTRACTION_STOPPED,
     DOC_GENERATE_CARDS,
     DOC_GENERATE_QUESTIONS,
-    DOC_OCR_FAILED,
     FREE_TRY_BADGE,
     LEARNING_BUSY_ALERT,
     MAX_OFFICE_OUTPUT_BYTES,
@@ -67,7 +65,6 @@ from .learning import MAX_MODEL_INPUT_CHARS, SIZE_PRESETS, bound_content_text, p
 from .media import MediaToolError, convert_to_pptx
 from .notes import StructuringError
 from .review_sheet import generate_review_sheet
-from .ocr import I2OCRClient, OcrError, extract_text_problem
 from .office import (
     FORMAT_LABELS,
     OFFICE_FORMATS,
@@ -103,14 +100,13 @@ logger = logging.getLogger("gamas_bot.bot.documents")
 
 
 class DocumentOfficeWorkflowMixin:
-    """Document ingestion/OCR/exports and Free Office draft sessions."""
+    """Document ingestion/exports and Free Office draft sessions."""
 
     db: Any
     settings: Any
     client: Any
     deps: BotDependencies
     _shutting_down: bool
-    _ocr_client: I2OCRClient | None
     _document_locks: MutableMapping[tuple[int, str], asyncio.Lock]
     _document_semaphore: asyncio.Semaphore
     # Supplied by the composed bot.
@@ -177,31 +173,6 @@ class DocumentOfficeWorkflowMixin:
             raise RuntimeError("document vanished after insert")
         return document, created
 
-    def _ocr_client_instance(self) -> I2OCRClient:
-        if self._ocr_client is None:
-            self._ocr_client = I2OCRClient(max_bytes=int(self.settings.doc_max_bytes))
-        return self._ocr_client
-
-    def _ocr_extractor(
-        self,
-    ) -> Callable[[Path, Sequence[int]], Sequence[str | None]] | None:
-        if not self.settings.ocr_enabled:
-            return None
-        settings = self.settings
-
-        def run(path: Path, pages: Sequence[int]) -> list[str | None]:
-            client = self._ocr_client_instance()
-            recognised = client.extract_pages(
-                path,
-                pages,
-                language=settings.ocr_language,
-                budget_seconds=settings.ocr_timeout_seconds,
-            )
-            by_page = {page.number: page.text for page in recognised}
-            return [by_page.get(number) for number in pages]
-
-        return run
-
     def _document_lock(self, user_id: int, digest: str) -> asyncio.Lock:
         key = (user_id, digest)
         lock = self._document_locks.get(key)
@@ -249,8 +220,6 @@ class DocumentOfficeWorkflowMixin:
                     self.deps.extract_document,
                     extract_path,
                     source_type,
-                    ocr=self._ocr_extractor(),
-                    ocr_max_pages=int(self.settings.ocr_max_pages),
                     max_unpacked_bytes=int(self.settings.doc_unpacked_max_bytes),
                 )
             text = await run_file_io(lambda: extracted.text)
@@ -291,6 +260,8 @@ class DocumentOfficeWorkflowMixin:
 
     def _document_card_text(self, document: dict) -> str:
         label = SOURCE_TYPE_LABELS_FA.get(str(document["source_type"]), "سند")
+        # ``image`` is only reachable for documents stored before OCR was
+        # removed; nothing new is ingested as an image.
         unit = {"pdf": "صفحه", "docx": "بخش", "pptx": "اسلاید", "image": "صفحه"}.get(
             document["source_type"], "بخش"
         )
@@ -304,12 +275,6 @@ class DocumentOfficeWorkflowMixin:
         if not self.settings.note_configured:
             lines.append(texts.LEARNING_GENERATION_UNAVAILABLE)
         source_type = str(document.get("source_type") or "")
-        if source_type in {"pdf", "image"}:
-            lines.append(
-                texts.DOCUMENT_OCR_ON_NOTICE
-                if self.settings.ocr_enabled
-                else texts.DOCUMENT_OCR_OFF_NOTICE
-            )
         if source_type in {"docx", "pptx"}:
             lines.append(texts.DOCUMENT_EMBEDDED_IMAGES_NOTICE)
         if source_type == "pptx":
@@ -1343,9 +1308,7 @@ class DocumentOfficeWorkflowMixin:
         )
         try:
             suffix = (
-                Path(filename).suffix.lower()
-                if filename
-                else DEFAULT_INTAKE_SUFFIX.get(source_type, f".{source_type}")
+                Path(filename).suffix.lower() if filename else f".{source_type}"
             )
             path = workdir / f"source{suffix}"
             try:
@@ -1406,19 +1369,6 @@ class DocumentOfficeWorkflowMixin:
                     progress,
                     f"⚠️ {exc}\nاگر ارائه صدای ضبط‌شده دارد، می‌توانید آن را پردازش کنید.",
                     buttons,
-                )
-                return
-            except OcrError as exc:
-                logger.warning(
-                    "ocr failed user=%s: %s", user_id, extract_text_problem(exc)
-                )
-                await self._edit(  # type: ignore[attr-defined]
-                    progress,
-                    failed_progress_text(
-                        progress.percent,
-                        DOC_OCR_FAILED,
-                        headline=DOC_EXTRACTION_STOPPED,
-                    ),
                 )
                 return
             except DocExtractError as exc:

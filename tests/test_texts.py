@@ -99,7 +99,7 @@ class MainAndHelpCopyTests(unittest.TestCase):
         self.assertIn(texts.OFFICE_CREDIT_NOTICE, text)
         self.assertIn("سقف ورودی و محدودیت ظرفیت", text)
         self.assertIn("صدای PowerPoint خودکار پردازش نمی‌شود", text)
-        self.assertIn(texts.DOCUMENT_OCR_OFF_NOTICE, text)
+        self.assertIn(texts.DOCUMENT_SCANNED_NOTICE, text)
         self.assertLessEqual(len(text.encode("utf-16-le")) // 2, TELEGRAM_TEXT_LIMIT)
 
     def test_help_availability_copy_matches_raw_only_deployment(self):
@@ -118,16 +118,11 @@ class MainAndHelpCopyTests(unittest.TestCase):
             texts.results_hub_empty(notes_configured=True), texts.RESULTS_HUB_EMPTY
         )
 
-    def test_help_explains_optional_third_party_ocr_when_enabled(self):
-        text = texts.help_screen(
-            office_enabled=False,
-            notes_configured=False,
-            ocr_enabled=True,
-        )
-        self.assertIn(texts.DOCUMENT_OCR_ON_NOTICE, text)
-        self.assertIn("سرویس بیرونی", text)
+    def test_help_explains_scan_limits_and_embedded_images(self):
+        text = texts.help_screen(office_enabled=False, notes_configured=False)
+        self.assertIn(texts.DOCUMENT_SCANNED_NOTICE, text)
         self.assertIn(texts.DOCUMENT_EMBEDDED_IMAGES_NOTICE, text)
-        self.assertNotIn(texts.DOCUMENT_OCR_OFF_NOTICE, text)
+        self.assertNotIn("سرویس بیرونی", text)
 
     def test_empty_states_and_learning_copy_match_feature_availability(self):
         self.assertNotIn("جزوه به‌صورت خودکار", texts.library_empty(notes_configured=False))

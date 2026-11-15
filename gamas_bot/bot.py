@@ -65,11 +65,9 @@ from .bot_ui import (
     CATEGORY_FILTER_LABELS,
     CURATION_GUIDANCE,
     CURATION_STALE_ALERT,
-    DEFAULT_INTAKE_SUFFIX,
     DOC_EXTRACTION_STOPPED,
     DOC_GENERATE_CARDS,
     DOC_GENERATE_QUESTIONS,
-    DOC_OCR_FAILED,
     DOC_PHOTO_HINT,
     DOC_UNSUPPORTED_HINT,
     FLASHCARD_ASK_BACK,
@@ -122,7 +120,6 @@ from .intake import (
     VIDEO_EXTENSIONS,
     _command_name,
     _document_metadata,
-    _image_metadata,
     _is_receipt_image,
     _is_safe_receipt_path,
     _is_unsupported_attachment,
@@ -144,7 +141,6 @@ from .jobs import JobQueue
 from .llm import complete_json
 from .media import extract_audio_track, needs_transcode, probe_media
 from .notes import structure_transcript
-from .ocr import I2OCRClient
 from .office import OfficeError, OfficeSession
 from .presentations import load_presentation, prepare_audio
 from .progress import JobProgress, WorkProgress, to_persian_digits
@@ -262,7 +258,6 @@ class GamasBot(
         self._broadcast_previews: dict[int, tuple[str, int | None]] = {}
         self._broadcast_resume: dict[int, int] = {}
         self._broadcast_stop = asyncio.Event()
-        self._ocr_client: I2OCRClient | None = None
         self._started_at = time.time()
 
         self.client = (
@@ -427,10 +422,6 @@ class GamasBot(
         self._prewarm_task = None
         self._office_session_cleanup_task = None
         self._membership_sweep_task = None
-
-        if self._ocr_client is not None:
-            await run_file_io(self._ocr_client.close)
-            self._ocr_client = None
 
         async def _fail_queued(job) -> None:
             try:
@@ -1343,7 +1334,6 @@ class GamasBot(
             texts.help_screen(
                 office_enabled=self.settings.office_enabled,
                 notes_configured=self.settings.note_configured,
-                ocr_enabled=self.settings.ocr_enabled,
             ),
             buttons=[[Button.inline(texts.BTN_BACK_MAIN, b"menu:main")]],
         )
@@ -1766,14 +1756,6 @@ class GamasBot(
                 )
                 return
 
-        if self.settings.ocr_enabled:
-            image_kind, image_name = _image_metadata(event.message)
-            if image_kind is not None:
-                if await self._is_duplicate_upload(event, user_id):
-                    return
-                await self._accept_document(event, user_id, image_kind, image_name)
-                return
-
         if _is_unsupported_attachment(event.message):
             if getattr(event.message, "photo", None) is not None:
                 await event.reply(DOC_PHOTO_HINT)
@@ -1796,11 +1778,9 @@ __all__ = [
     "CURATION_STALE_ALERT",
     "CallbackRouter",
     "ConversationStateStore",
-    "DEFAULT_INTAKE_SUFFIX",
     "DOC_EXTRACTION_STOPPED",
     "DOC_GENERATE_CARDS",
     "DOC_GENERATE_QUESTIONS",
-    "DOC_OCR_FAILED",
     "DOC_PHOTO_HINT",
     "DOC_UNSUPPORTED_HINT",
     "DiskSpaceError",
@@ -1852,7 +1832,6 @@ __all__ = [
     "_download_media_limited",
     "_download_media_ranges",
     "_ensure_disk_headroom",
-    "_image_metadata",
     "_is_receipt_image",
     "_is_safe_receipt_path",
     "_is_unsupported_attachment",
