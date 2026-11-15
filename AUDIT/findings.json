@@ -1,0 +1,151 @@
+{
+  "audit_date_utc": "2026-11-15",
+  "repository": "AmiraliGhamkhar/Gamas_bot",
+  "branch": {
+    "value": "arena/c4b817d1-gamas-bot",
+    "classification": "VERIFIED",
+    "evidence": ["git branch --show-current"]
+  },
+  "deployment_python": {
+    "repository_material_selection": {
+      "value": "Python 3.11",
+      "classification": "VERIFIED",
+      "evidence": ["README.md:29-39", "docs/CPANEL.md:14-26"]
+    },
+    "live_cpanel_selection": {
+      "value": null,
+      "classification": "UNVERIFIED",
+      "evidence": ["No cPanel host was available to the audit."]
+    }
+  },
+  "findings": [
+    {
+      "id": "F-001",
+      "title": "Pillow image-parser dependency floor allowed audited vulnerable releases",
+      "classification": "VERIFIED",
+      "severity": "HIGH",
+      "status": "REMEDIATED",
+      "evidence": {
+        "source_locations": [
+          "gamas_bot/doc_extract.py:540-544",
+          "gamas_bot/document/qa.py:285-293",
+          "gamas_bot/intake.py:269-285",
+          "pyproject.toml:45",
+          "requirements.txt:13",
+          "tests/test_dependency_security.py:13-20"
+        ],
+        "commands": [
+          ".venv/bin/python -m pip_audit -r requirements.txt --format json",
+          ".venv/bin/python -m pytest -p no:randomly -q"
+        ],
+        "outputs": [
+          "AUDIT/results/pip-audit.json: 42 Pillow advisories before remediation",
+          "AUDIT/results/pip-audit-after-preflight.json: no known vulnerabilities",
+          "AUDIT/results/pytest-after-preflight.log: 1894 passed, 510 subtests passed"
+        ],
+        "commit": "3bff030 security: require patched Pillow release"
+      },
+      "remediation": {
+        "classification": "VERIFIED",
+        "description": "Pillow>=13.0,<14.0 is declared in both package sources and the regression test pins that floor."
+      },
+      "residual_risk": {
+        "classification": "INFERRED",
+        "description": "Without a resolver lockfile, future dependency advisories still require periodic audit and update work."
+      }
+    },
+    {
+      "id": "F-002",
+      "title": "A 1 GiB filesystem cannot admit the shipped 1 GiB maximum under the two-working-copy rule",
+      "classification": "VERIFIED",
+      "severity": "HIGH",
+      "status": "REMEDIATED_TO_PREFLIGHT_FAILURE",
+      "evidence": {
+        "source_locations": [
+          "gamas_bot/config.py:210-220",
+          "gamas_bot/config.py:1289-1296",
+          "gamas_bot/config.py:1536-1542",
+          "gamas_bot/bot_jobs.py:807-828",
+          "gamas_bot/telegram_transfer.py:72-87",
+          "scripts/cpanel_preflight.py:173-216",
+          "scripts/cpanel_preflight.py:343-358",
+          "tests/test_cpanel_preflight.py:18-86"
+        ],
+        "before_command_output": "AUDIT/results/cpanel-disk-incoherence-repro.log: 1,073,741,824 free bytes; 2,214,592,512 required bytes for one 1 GiB default input; DiskSpaceError",
+        "after_command_output": "AUDIT/results/cpanel-preflight-capacity-after.log: level=FAIL; configured two slots require 4.12 GiB for a 1 GiB maximum input and a 64 MiB reserve per slot"
+      },
+      "remediation": {
+        "classification": "VERIFIED",
+        "description": "cPanel preflight now aggregates the larger media/document ceiling, two working copies, the temporary reserve, and every configured download slot against actual temp-dir free space. A shortfall is a FAIL returned by normal preflight."
+      },
+      "operator_effect": {
+        "classification": "VERIFIED",
+        "description": "The generic 1 GiB defaults are retained; a cPanel deployment with insufficient actual disk capacity is blocked instead of being represented as viable."
+      },
+      "residual_risk": {
+        "classification": "INFERRED",
+        "description": "Actual free space can shrink after preflight due to retained data or other processes; the existing per-download production guard remains the runtime fail-closed layer."
+      },
+      "commit": "12aa5ea fix: reject impossible cpanel download capacity"
+    },
+    {
+      "id": "F-003",
+      "title": "Presentation temporary-capacity example was ambiguous about code defaults",
+      "classification": "VERIFIED",
+      "severity": "MEDIUM",
+      "status": "REMEDIATED_IN_DEPLOYMENT_MATERIAL",
+      "evidence": {
+        "source_locations": [
+          "gamas_bot/config.py:216",
+          ".env.example:274-284",
+          "docs/FEATURES.md:86-100"
+        ],
+        "code_excerpt": "The unset presentation temp default is 2 * 1024**3; example values are now explicitly documented as conservative cPanel overrides."
+      },
+      "remediation": {
+        "classification": "VERIFIED",
+        "description": "The environment example and feature/deployment guidance distinguish unset defaults from the conservative cPanel override profile."
+      }
+    }
+  ],
+  "gates": [
+    {
+      "classification": "VERIFIED",
+      "command": ".venv/bin/python -m pytest -p no:randomly -q",
+      "result": "1894 passed, 510 subtests passed in 332.58s",
+      "evidence": "AUDIT/results/pytest-after-preflight.log"
+    },
+    {
+      "classification": "VERIFIED",
+      "command": ".venv/bin/python -m unittest discover -s tests -q",
+      "result": "1860 tests passed in 297.079s",
+      "evidence": "AUDIT/results/unittest-after-preflight.log"
+    },
+    {
+      "classification": "VERIFIED",
+      "command": ".venv/bin/python -m pip_audit -r requirements.txt --format json",
+      "result": "No known vulnerabilities",
+      "evidence": "AUDIT/results/pip-audit-after-preflight.json"
+    },
+    {
+      "classification": "VERIFIED",
+      "command": ".venv/bin/python -m scripts.concurrency_bench cpanel",
+      "result": "Six scripted jobs completed in 8.5834s; the scripted overflow/failover counts were Speechmatics-to-Deepgram=2 and AvalAI-to-Gemini=2.",
+      "evidence": "AUDIT/results/concurrency-after-preflight.log"
+    }
+  ],
+  "limitations": [
+    {
+      "classification": "UNVERIFIED",
+      "description": "No live Telegram, STT, LLM, OCR, cPanel, production database, cron, .env, or session was accessed."
+    },
+    {
+      "classification": "UNVERIFIED",
+      "description": "No Python 3.12, 3.13, or 3.14 interpreter was installed in the audit sandbox."
+    },
+    {
+      "classification": "VERIFIED",
+      "description": "The active workspace was not a newly created audit/<date> branch or a separately prepared fresh-clone audit worktree."
+    }
+  ]
+}
