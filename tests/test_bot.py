@@ -1488,7 +1488,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(admin_menu, user_menu | {b"adm:home"})
         more_menu = menu_payloads(self.bot._more_menu())
         self.assertIn(b"results", more_menu)
-        self.assertIn(b"board", more_menu)
+        self.assertNotIn(b"board", more_menu)
         self.assertIn(b"office:start", more_menu)
         self.assertIn(b"ref:home", more_menu)
         self.bot.settings = replace(self.settings, office_enabled=False)
@@ -1500,8 +1500,9 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         for section in (b"adm:home", b"adm:hub:pay", b"adm:hub:usr", b"adm:hub:sys"):
             self.assertIn(section, payloads)
         # …while the sections that belong to no merge group are unchanged.
-        for section in (b"adm:bcast", b"adm:audit", b"adm:sup", b"adm:board"):
+        for section in (b"adm:bcast", b"adm:audit", b"adm:sup"):
             self.assertIn(section, payloads)
+        self.assertNotIn(b"adm:board", payloads)
         # The nine old top-level entries are gone from the menu itself…
         for retired in (b"adm:users", b"adm:pay", b"adm:ph:0", b"adm:ovu:7d", b"adm:ovp:7d"):
             self.assertNotIn(retired, payloads)
@@ -1550,8 +1551,11 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
 
         board = FakeCallbackEvent(self.user_id, b"board")
         await self.bot._handle_callback(board)
-        self.assertIn("فعلاً فعال نیست", board.edits[-1][0])
-        self.assertNotIn("اولین آزمون", board.edits[-1][0])
+        self.assertFalse(board.edits)
+
+        admin_board = FakeCallbackEvent(self.admin_id, b"adm:board")
+        await self.bot._handle_callback(admin_board)
+        self.assertFalse(admin_board.edits)
 
     async def test_main_panel_asks_for_the_next_file_and_shows_the_balance(self):
         """One action, one number: the returning screen is not a brochure."""
@@ -2283,8 +2287,11 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         assert pdf is not None and docx is not None
         self.assertTrue(bytes(pdf["content"]).startswith(b"%PDF-"))
         self.assertIn("جزوهٔ خودکار", docx_text(bytes(docx["content"])))
-        items = await self.db.library_list(user_id, limit=6)
-        self.assertEqual([item["kind"] for item in items], ["booklet"])
+        # Library stays delivered-only until the user actually downloads an artifact;
+        # internal source text remains cached for quiz/flashcard generation.
+        self.assertEqual(await self.db.library_list(user_id, limit=6), [])
+        source = await self.db.library_submission_source_item(user_id, job.submission_id)
+        self.assertIsNotNone(source)
         row = await self.db.submission(job.submission_id)
         self.assertIsNotNone(row)
         self.assertEqual(row.status, "done")
@@ -2570,10 +2577,9 @@ class ResultsHubTests(BotPipelineTestCase):
         # A one-shot iterator is consumed by the later optional library lookup.
         # The persisted artifact registry remains the authority for the PDF
         # button; learning actions merely need the library item id.
-        snapshot = iter([book])
         with mock.patch.object(
-            self.bot.db, "library_list_kind",
-            new=mock.AsyncMock(return_value=snapshot),
+            self.bot.db, "library_submission_source_item",
+            new=mock.AsyncMock(return_value=book),
         ), mock.patch.object(
             self.bot.db, "artifact_kinds",
             new=mock.AsyncMock(return_value={"booklet"}),
@@ -2596,7 +2602,6 @@ class ReplyKeyboardRoutingTests(BotPipelineTestCase):
             texts.BTN_START_HERE: "فایل درس بعدی",
             texts.BTN_HELP: "راهنمای گاماس",
             texts.BTN_UPGRADE: "بسته را انتخاب کنید",
-            texts.BTN_LEADERBOARD: "لیدربورد",
             texts.BTN_LIBRARY: "کتابخانه",
             texts.BTN_WALLET: "اعتبار",
             texts.BTN_MORE: "بخش‌های دیگر",
@@ -2618,7 +2623,6 @@ class ReplyKeyboardRoutingTests(BotPipelineTestCase):
             (texts.BTN_WALLET_LEGACY, "_show_wallet"),
             (texts.BTN_WALLET_UPGRADE_LEGACY, "_show_wallet"),
             (texts.BTN_OFFICE_LEGACY, "_route_office_callback"),
-            (texts.BTN_LEADERBOARD_LEGACY, "_show_leaderboard"),
             (texts.BTN_SUPPORT_LEGACY, "_show_support_home"),
         ):
             event = FakeMessageEvent(USER_ID, old_label)

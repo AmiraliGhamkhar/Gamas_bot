@@ -67,8 +67,8 @@ APPLICATION_TABLES: frozenset[str] = frozenset(
         "diarization_reference_turns",
         "submission_artifacts",
         "submission_binary_artifacts",
-        "booklet_revisions",
-        "quiz_point_events",
+        # Interactive HTML learning & delivered library (migration 035)
+        "library_file_blobs",
     }
 )
 

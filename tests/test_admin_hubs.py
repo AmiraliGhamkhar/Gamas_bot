@@ -70,8 +70,9 @@ class AdminHubTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertNotIn(retired, payloads)
         # Sections belonging to no merge group stay.
-        for kept in (b"adm:sup", b"adm:bcast", b"adm:audit", b"adm:board"):
+        for kept in (b"adm:sup", b"adm:bcast", b"adm:audit"):
             self.assertIn(kept, payloads)
+        self.assertNotIn(b"adm:board", payloads)
 
     async def test_payments_hub_opens_the_pending_queue_with_history_and_stats(self):
         event = self.press(b"adm:hub:pay")

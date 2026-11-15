@@ -4,6 +4,16 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Leaderboard and remaining Mini App/Studio schema remnants removed.** The
+user leaderboard (`board` / «لیدربورد»), post-quiz rank display, admin top-users
+ranking and leaderboard-gift screens (`adm:board`, `adm:bg:*`, `adm:bgok:*`),
+and their repository/protocol methods (`leaderboard_top`, `leaderboard_rank`,
+`leaderboard_admin_top`) are removed; quizzes and flashcards remain intact.
+Migration `034_remove_leaderboard_and_studio_remnants.sql` drops the unused
+`booklet_revisions` and `quiz_point_events` tables together with
+`idx_users_quiz_points` while leaving historical migrations untouched so
+existing databases upgrade cleanly.
+
 **OCR removed; document ingestion is text-layer only.** The optional i2ocr.com
 integration is gone: `gamas_bot/ocr.py`, `scripts/ocr_smoke.py`, the `ocr` extra
 (`curl-cffi`), the `OCR_ENABLED`/`OCR_LANGUAGE`/`OCR_MAX_PAGES`/

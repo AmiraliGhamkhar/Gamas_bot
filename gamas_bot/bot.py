@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import io
 import logging
 import os
+from pathlib import Path
 import shutil
 import time
 from types import SimpleNamespace
@@ -39,6 +41,7 @@ import weakref
 import aiohttp
 from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, MessageIdInvalidError, MessageNotModifiedError
+from telethon.tl.types import DocumentAttributeFilename
 
 from .artifacts import (
     KIND_BOOKLET,
@@ -63,8 +66,6 @@ from .bot_support import SupportWorkflowMixin
 from .bot_ui import (
     ACTIVE_LIMIT_MESSAGE,
     CATEGORY_FILTER_LABELS,
-    CURATION_GUIDANCE,
-    CURATION_STALE_ALERT,
     DOC_EXTRACTION_STOPPED,
     DOC_GENERATE_CARDS,
     DOC_GENERATE_QUESTIONS,
@@ -76,8 +77,6 @@ from .bot_ui import (
     FREE_TRY_BADGE,
     FREE_TRY_RESTORED,
     FREE_TRY_USED_NOTICE,
-    LEADERBOARD_EMPTY,
-    LEADERBOARD_FALLBACK_NAME,
     LEARNING_BUSY_ALERT,
     LEARNING_CREDIT_RESTORED,
     LEARNING_DELIVERY_CTA,
@@ -93,7 +92,6 @@ from .bot_ui import (
     MAX_RAW_PREVIEW_LINES,
     OFFICE_UPLOAD_STOPPED,
     QUIZ_COUNTS,
-    QUIZ_POINTS_PER_ANSWER,
     QUIZ_START_GUIDANCE,
     RAW_FALLBACK_MAX_PAGES,
     RAW_PREVIEW_CHARS,
@@ -106,6 +104,7 @@ from .bot_wallet import WalletWorkflowMixin
 from .config import Settings, note_routes
 from .conversation_state import ConversationStateStore
 from .db import Database, iso
+from .db_core import BINARY_ARTIFACT_KINDS
 from .doc_extract import extract_document
 from .docx_export import jalali_date
 from .fileio import run_file_io
@@ -240,7 +239,6 @@ class GamasBot(
         self._pending_flashcard_front = self.conversations.pending_flashcard_front
         self._pending_user_search = self.conversations.pending_user_search
         self._pending_free_reset = self.conversations.pending_free_reset
-        self._curation = self.conversations.curation
         self._office_sessions: dict[int, OfficeSession] = self.conversations.office_sessions
 
         self._learning_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = (
@@ -248,8 +246,8 @@ class GamasBot(
         )
         self._learning_in_flight: set[int] = set()
         self._learning_global_semaphore = asyncio.Semaphore(settings.learning_global_concurrency)
-        self._curation_tasks: dict[int, asyncio.Task[Any]] = {}
         self._learning_tasks: dict[int, asyncio.Task[Any]] = {}
+        self._learning_commit_tasks: set[asyncio.Task[Any]] = set()
         self._admission_tasks: set[asyncio.Task[Any]] = set()
         self._intake_tasks: set[asyncio.Task[Any]] = set()
         self._pending_raw_text: set[int] = set()
@@ -383,6 +381,14 @@ class GamasBot(
         if learning:
             await asyncio.gather(*learning, return_exceptions=True)
 
+        commits = [
+            task
+            for task in list(self._learning_commit_tasks)
+            if task is not current and not task.done()
+        ]
+        if commits:
+            await asyncio.gather(*commits, return_exceptions=True)
+
         office = [
             task for task in self._office_tasks if task is not current and not task.done()
         ]
@@ -392,16 +398,6 @@ class GamasBot(
             await asyncio.gather(*office, return_exceptions=True)
         self._office_sessions.clear()
         self._office_last_use.clear()
-
-        timers = list(self._curation_tasks.values())
-        self._curation_tasks.clear()
-        for task in timers:
-            task.cancel()
-        if timers:
-            await asyncio.gather(*timers, return_exceptions=True)
-        for user_id, state in list(self._curation.items()):
-            async with self._learning_lock(user_id):
-                await self._release_curation(user_id, state)
 
         background = [
             task
@@ -642,7 +638,6 @@ class GamasBot(
             rows.append([Button.inline(texts.BTN_OFFICE, b"office:start")])
         rows.extend(
             [
-                [Button.inline(texts.BTN_LEADERBOARD, b"board")],
                 [Button.inline(texts.BTN_HELP, b"help"),
                  Button.inline(texts.BTN_REFERRALS, b"ref:home")],
                 [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
@@ -671,7 +666,6 @@ class GamasBot(
                 Button.inline(texts.BTN_ADMIN_BROADCAST, b"adm:bcast"),
                 Button.inline(texts.BTN_ADMIN_AUDIT, b"adm:audit"),
             ],
-            [Button.inline(texts.BTN_ADMIN_TOP_USERS, b"adm:board")],
             [Button.inline(texts.BTN_ADMIN_REFERRALS, b"adm:ref")],
             [Button.inline(texts.BTN_ADMIN_BACK_USER, b"menu:main")],
         ]
@@ -855,7 +849,7 @@ class GamasBot(
         return user_id is not None and user_id in self.settings.admin_ids
 
     async def _capture_sender_name(self, event) -> None:
-        """Best-effort leaderboard name capture; a lookup failure is invisible."""
+        """Best-effort sender identity capture; a lookup failure is invisible."""
         user_id = event.sender_id
         if user_id is None:
             return
@@ -890,28 +884,34 @@ class GamasBot(
         return 3600
 
     # --------------------------------------------------------------- library
+    @staticmethod
+    def _library_category_for_kind(kind: str) -> str:
+        if kind == "booklet":
+            return "booklet"
+        if kind == "quiz":
+            return "quiz"
+        if kind == "flashcards":
+            return "flashcards"
+        return "other"
+
     async def _show_library(self, event, *, page: int = 0) -> None:
-        """Show six newest Telegram artifacts; the user's id scopes every read."""
+        """Categorized delivered-only Library home screen with per-category counts."""
+        del page
         user_id = event.sender_id
         if user_id is None:
             return
-        page_size = 6
-        count = await self.db.library_count(user_id)
-        page = min(max(0, int(page)), max(0, (count - 1) // page_size))
-        items = await self.db.library_list(user_id, limit=page_size, offset=page * page_size)
-        if count == 0:
+        counts = await self.db.library_category_counts(user_id)
+        if counts["total"] == 0:
             text = texts.library_empty(notes_configured=self.settings.note_configured)
             await self._edit_or_reply(
                 event,
                 text,
                 [
+                    [Button.inline(texts.BTN_MANUAL_FLASHCARD, b"fc:man")],
                     [
-                        Button.inline(texts.BTN_BOOKLETS, b"library"),
-                        Button.inline(texts.BTN_DOCUMENTS, b"lib:docs:0"),
+                        Button.inline(texts.BTN_WALLET, b"wallet"),
+                        Button.inline(texts.BTN_BACK_MAIN, b"menu:main"),
                     ],
-                    [Button.inline(texts.BTN_FLASHCARDS, b"library:fc")],
-                    [Button.inline(texts.BTN_WALLET, b"wallet")],
-                    [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
                 ],
             )
             return
@@ -919,52 +919,155 @@ class GamasBot(
         lines = [
             texts.LIBRARY_TITLE,
             "",
-            texts.LIBRARY_COUNT_TEMPLATE.format(count=to_persian_digits(count)),
+            texts.LIBRARY_HOME_SUBTITLE,
+            "",
+            texts.LIBRARY_HOME_SUMMARY.format(
+                booklet=to_persian_digits(counts["booklet"]),
+                quiz=to_persian_digits(counts["quiz"]),
+                flashcards=to_persian_digits(counts["flashcards"]),
+                other=to_persian_digits(counts["other"]),
+            ),
         ]
-        buttons: list[list] = []
-        for item in items:
-            title = self._item_display_title(item)
-            label = f"{self._library_icon(str(item['kind']))} {title}"
-            buttons.append(
-                [
-                    Button.inline(
-                        button_label(label),
-                        f"lib:it:{item['item_id']}".encode("ascii"),
-                    )
-                ]
-            )
-        nav = []
-        if page > 0:
-            nav.append(Button.inline(texts.BTN_PREV, f"lib:{page - 1}".encode("ascii")))
-        if (page + 1) * page_size < count:
-            nav.append(Button.inline(texts.BTN_NEXT, f"lib:{page + 1}".encode("ascii")))
-        if nav:
-            buttons.append(nav)
-        buttons.extend(
+        buttons = [
             [
-                [
-                    Button.inline(texts.BTN_BOOKLETS, b"library"),
-                    Button.inline(texts.BTN_DOCUMENTS, b"lib:docs:0"),
-                ],
-                [Button.inline(texts.BTN_FLASHCARDS, b"library:fc")],
-                [Button.inline(texts.BTN_WALLET, b"wallet")],
-                [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
+                Button.inline(
+                    texts.BTN_LIB_BOOKLETS_TAB.format(
+                        count=to_persian_digits(counts["booklet"])
+                    ),
+                    b"lib:cat:booklet:0",
+                ),
+                Button.inline(
+                    texts.BTN_LIB_QUIZZES_TAB.format(
+                        count=to_persian_digits(counts["quiz"])
+                    ),
+                    b"lib:cat:quiz:0",
+                ),
+            ],
+            [
+                Button.inline(
+                    texts.BTN_LIB_FLASHCARDS_TAB.format(
+                        count=to_persian_digits(counts["flashcards"])
+                    ),
+                    b"lib:cat:flashcards:0",
+                ),
+                Button.inline(
+                    texts.BTN_LIB_OTHER_TAB.format(
+                        count=to_persian_digits(counts["other"])
+                    ),
+                    b"lib:cat:other:0",
+                ),
+            ],
+            [Button.inline(texts.BTN_MANUAL_FLASHCARD, b"fc:man")],
+            [
+                Button.inline(texts.BTN_WALLET, b"wallet"),
+                Button.inline(texts.BTN_BACK_MAIN, b"menu:main"),
+            ],
+        ]
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    async def _show_library_category(
+        self, event, category: str, *, page: int = 0
+    ) -> None:
+        """Show delivered files for one category with 1-click re-download."""
+        user_id = event.sender_id
+        if user_id is None:
+            return
+        if category not in texts.LIBRARY_CATEGORY_TITLES:
+            await self._ack(event, texts.LIBRARY_INVALID_PAGE, alert=True)
+            return
+        page_size = 6
+        count = await self.db.library_count_category(user_id, category)
+        page = min(max(0, int(page)), max(0, (count - 1) // page_size))
+        items = await self.db.library_list_category(
+            user_id, category, limit=page_size, offset=page * page_size
+        )
+        title_line = texts.LIBRARY_CATEGORY_TITLES[category]
+        buttons: list[list[Any]] = []
+        if count == 0:
+            lines = [
+                title_line,
+                "",
+                texts.library_category_empty(
+                    category, notes_configured=self.settings.note_configured
+                ),
+            ]
+        else:
+            hint = (
+                texts.LIBRARY_CATEGORY_BOOKLET_HINT
+                if category == "booklet"
+                else texts.LIBRARY_CATEGORY_TAP_HINT
+            )
+            lines = [
+                title_line,
+                "",
+                texts.LIBRARY_COUNT_TEMPLATE.format(count=to_persian_digits(count)),
+                hint,
+            ]
+            for item in items:
+                item_id = int(item["item_id"])
+                title = self._item_display_title(item)
+                label = button_label(f"{self._library_icon(str(item['kind']))} {title}")
+                if category == "booklet":
+                    buttons.append(
+                        [Button.inline(label, f"lib:it:{item_id}".encode("ascii"))]
+                    )
+                else:
+                    buttons.append(
+                        [
+                            Button.inline(label, f"lib:f:{item_id}".encode("ascii")),
+                            Button.inline(
+                                texts.BTN_DELETE_ICON,
+                                f"lib:del:{item_id}".encode("ascii"),
+                            ),
+                        ]
+                    )
+            nav: list[Any] = []
+            if page > 0:
+                nav.append(
+                    Button.inline(
+                        texts.BTN_PREV,
+                        f"lib:cat:{category}:{page - 1}".encode("ascii"),
+                    )
+                )
+            if (page + 1) * page_size < count:
+                nav.append(
+                    Button.inline(
+                        texts.BTN_NEXT,
+                        f"lib:cat:{category}:{page + 1}".encode("ascii"),
+                    )
+                )
+            if nav:
+                buttons.append(nav)
+
+        if category == "flashcards":
+            action_row: list[Any] = [
+                Button.inline(texts.BTN_MANUAL_FLASHCARD, b"fc:man")
+            ]
+            if self.settings.note_configured:
+                action_row.append(
+                    Button.inline(texts.BTN_AI_FC_FROM_BOOKLET, b"fc:pick:0")
+                )
+            buttons.append(action_row)
+        elif category == "quiz" and self.settings.note_configured:
+            buttons.append(
+                [Button.inline(texts.BTN_AI_QUIZ_FROM_BOOKLET, b"quiz:pick:0")]
+            )
+        buttons.append(
+            [
+                Button.inline(texts.BTN_BACK, b"library"),
+                Button.inline(texts.BTN_BACK_MAIN, b"menu:main"),
             ]
         )
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
     async def _show_library_item(self, event, item_id: int) -> None:
-        """Booklet/transcript detail: re-download plus learning entry points."""
+        """Delivered booklet detail: re-download, interactive quiz/flashcard HTML, delete."""
         user_id = event.sender_id
         if user_id is None:
             return
         item = await self.db.library_item_detail(user_id, item_id)
-        if item is None:
+        if item is None or int(item.get("delivered") or 0) != 1:
             await self._ack(event, texts.ITEM_UNAVAILABLE, alert=True)
-            return
-        document = await self.db.document_by_library_item(user_id, item_id)
-        if document:
-            await self._show_document_card(event, user_id, int(document["id"]))
             return
         title = self._item_display_title(item)
         try:
@@ -975,7 +1078,8 @@ class GamasBot(
             f"{self._library_icon(str(item['kind']))} {title}"
             + (f"\n📅 {date_label}" if date_label else "")
         )
-        buttons: list[list] = [
+        category = self._library_category_for_kind(str(item["kind"]))
+        buttons: list[list[Any]] = [
             [Button.inline(texts.BTN_REDOWNLOAD, f"lib:f:{item_id}".encode("ascii"))],
         ]
         if item["kind"] == "booklet":
@@ -985,43 +1089,96 @@ class GamasBot(
                         Button.inline(
                             texts.BTN_QUIZ_FROM_BOOKLET,
                             f"quiz:new:{item_id}".encode("ascii"),
-                        )
-                    ]
-                )
-                buttons.append(
-                    [
+                        ),
                         Button.inline(
                             texts.BTN_CARDS_FROM_BOOKLET,
                             f"fc:ai:{item_id}".encode("ascii"),
-                        )
+                        ),
                     ]
                 )
             elif item.get("content_text"):
                 header += "\n\n" + texts.LEARNING_GENERATION_UNAVAILABLE
             else:
                 header += "\n\n" + LEARNING_LEGACY_NOTICE
-        buttons.append([Button.inline(texts.BTN_BACK, b"lib:0")])
+        buttons.append(
+            [Button.inline(texts.BTN_DELETE_ITEM, f"lib:del:{item_id}".encode("ascii"))]
+        )
+        buttons.append(
+            [Button.inline(texts.BTN_BACK, f"lib:cat:{category}:0".encode("ascii"))]
+        )
         await self._edit(event, header, buttons)
 
     async def _forward_library_item(self, event, user_id: int, item_id: int) -> None:
-        """Re-forward one artifact only after an owner-scoped lookup."""
+        """Re-send one delivered file from SQLite blob, persisted booklet, or Telegram."""
         item = await self.db.library_item(user_id, item_id)
-        if item is None:
+        if item is None or int(item.get("delivered") or 0) != 1:
             await self._ack(event, texts.ITEM_UNAVAILABLE, alert=True)
             return
-        # New booklets are persisted byte artifacts, not automatically posted
-        # Telegram files.  Library re-download therefore sends the stored PDF
-        # directly; legacy rows continue through the forward path below.
+        category = self._library_category_for_kind(str(item["kind"]))
+
+        # 1. SQLite-persisted file blob (interactive quiz/flashcard HTML, TXT,
+        #    document booklets, and Free Office outputs). Never breaks if the
+        #    original Telegram message was deleted by the user.
+        blob = await self.db.library_file_blob(user_id, item_id)
+        if blob is not None and blob.get("content"):
+            raw_bytes = bytes(blob["content"])
+            filename = Path(str(blob.get("filename") or "file")).name
+            content_type = str(blob.get("content_type") or "")
+            title = self._item_display_title(item)
+            caption = f"{self._library_icon(str(item['kind']))} {title}"
+            extra: dict[str, Any] = (
+                {"mime_type": "text/html"}
+                if content_type.startswith("text/html") or filename.lower().endswith(".html")
+                else {}
+            )
+            try:
+                chat = await event.get_input_chat()
+            except Exception:
+                chat = event.chat_id or user_id
+            try:
+                stream = io.BytesIO(raw_bytes)
+                stream.name = filename
+                await self.client.send_file(
+                    chat,
+                    stream,
+                    caption=caption[:TELEGRAM_CAPTION_LIMIT],
+                    force_document=True,
+                    attributes=[DocumentAttributeFilename(filename)],
+                    **extra,
+                )
+            except Exception:
+                logger.warning("library blob delivery failed item=%s", item_id, exc_info=True)
+                await self._ack(event, texts.ITEM_FORWARD_FAILED, alert=True)
+                return
+            await self._ack(event, texts.ITEM_SENT_DONE)
+            return
+
+        # 2. Persisted submission binary artifact (PDF, Word, Review HTML).
         submission_id = int(item.get("submission_id") or 0)
         if item.get("kind") == "booklet" and submission_id:
+            artifact_kind = str(item.get("artifact_kind") or "")
             binary_kinds = await self.db.binary_artifact_kinds(submission_id, user_id)
-            kind = KIND_BOOKLET if KIND_BOOKLET in binary_kinds else KIND_DOCX
-            if kind in binary_kinds:
-                if await self._fetch_persisted_booklet(
-                    event, user_id, submission_id, kind, f"GMS-{submission_id}"
-                ):
-                    return
-        back = [[Button.inline(texts.BTN_BACK, f"lib:it:{item_id}".encode("ascii"))]]
+            chosen_kind = (
+                artifact_kind
+                if artifact_kind in BINARY_ARTIFACT_KINDS and artifact_kind in binary_kinds
+                else KIND_BOOKLET
+                if KIND_BOOKLET in binary_kinds
+                else KIND_DOCX
+                if KIND_DOCX in binary_kinds
+                else KIND_REVIEW_HTML
+                if KIND_REVIEW_HTML in binary_kinds
+                else ""
+            )
+            if chosen_kind and await self._fetch_persisted_booklet(
+                event, user_id, submission_id, chosen_kind, f"GMS-{submission_id}"
+            ):
+                return
+
+        # 3. Legacy pre-035 Telegram-message-backed items.
+        if not int(item.get("chat_id") or 0) or not int(item.get("message_id") or 0):
+            await self._ack(event, texts.ITEM_UNAVAILABLE, alert=True)
+            return
+        back = [[Button.inline(texts.BTN_BACK, f"lib:cat:{category}:0".encode("ascii"))]]
         progress = WorkProgress.for_editor(
             lambda text: self._edit(event, text, back),
             headline=texts.ITEM_FORWARD_HEADLINE,
@@ -1080,7 +1237,6 @@ class GamasBot(
         r.register_exact("library", lambda e, _u, _d: self._show_library(e))
         r.register_prefix("res:", self._cb_result_set)
         r.register_exact("library:fc", lambda e, _u, _d: self._show_flashcard_hub(e))
-        r.register_exact("board", lambda e, _u, _d: self._show_leaderboard(e))
         r.register_exact("wallet", lambda e, _u, _d: self._show_wallet(e))
         r.register_exact("support", self._handle_support_callback)
         r.register_exact("adm:home", lambda e, _u, _d: self._show_admin_overview(e))
@@ -1092,11 +1248,13 @@ class GamasBot(
         r.register_exact("adm:bccancel", self._cb_broadcast_cancel)
         r.register_prefix("adm:bcresume:", self._cb_broadcast_resume)
         r.register_exact("adm:audit", lambda e, _u, _d: self._show_admin_audit(e, 0))
-        r.register_exact("adm:board", lambda e, _u, _d: self._admin_board(e))
         r.register_exact("ref:home", lambda e, u, _d: self._show_referrals(e, u))
         r.register_exact("adm:ref", lambda e, _u, _d: self._show_admin_referrals(e))
         r.register_exact("adm:sup", self._handle_admin_support_callback)
 
+        r.register_prefix("lib:cat:", self._cb_lib_category)
+        r.register_prefix("lib:delok:", self._cb_lib_delete_confirm)
+        r.register_prefix("lib:del:", self._cb_lib_delete)
         r.register_prefix("lib:docs", self._cb_lib_docs)
         r.register_prefix("lib:doc:", self._cb_lib_doc)
         r.register_prefix("lib:f:", self._cb_lib_forward)
@@ -1116,8 +1274,6 @@ class GamasBot(
         r.register_prefix("adm:ph:", self._cb_admin_pay_history)
         r.register_prefix("adm:pd:", self._cb_admin_pay_detail)
         r.register_prefix("adm:audit:", self._cb_admin_audit_page)
-        r.register_prefix("adm:bgok:", self._cb_admin_gift_exec)
-        r.register_prefix("adm:bg:", self._cb_admin_gift)
         r.register_prefix("adm:rcpt:", lambda e, _u, d: self._show_receipt(e, d))
         for adm_sup_prefix in ("adm:sl:", "adm:sv:", "adm:sr:", "adm:sc:", "adm:so:"):
             r.register_prefix(adm_sup_prefix, self._handle_admin_support_callback)
@@ -1138,8 +1294,6 @@ class GamasBot(
             texts.BTN_WALLET: lambda e: self._show_wallet(e),
             texts.BTN_WALLET_LEGACY: lambda e: self._show_wallet(e),
             texts.BTN_WALLET_UPGRADE_LEGACY: lambda e: self._show_wallet(e),
-            texts.BTN_LEADERBOARD: lambda e: self._show_leaderboard(e),
-            texts.BTN_LEADERBOARD_LEGACY: lambda e: self._show_leaderboard(e),
             texts.BTN_OFFICE: lambda e: self._route_office_callback(e, user_id, "office:start"),
             texts.BTN_OFFICE_LEGACY: lambda e: self._route_office_callback(e, user_id, "office:start"),
             texts.BTN_SUPPORT: lambda e: self._show_support_home(e),
@@ -1236,7 +1390,9 @@ class GamasBot(
             await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
             return
         reference = f"GMS-{submission_id}"
-        books = await self.db.library_list_kind(user_id, "booklet", limit=50)
+        source_booklet = await self.db.library_submission_source_item(
+            user_id, submission_id
+        )
         transcript = await self.db.transcription(submission_id)
         has_text = bool(transcript and str(transcript.get("text") or "").strip())
         has_keypoints = bool(
@@ -1258,12 +1414,11 @@ class GamasBot(
         if not has_booklet:
             # Pre-027 Word booklets are Telegram-hosted library rows. Keep the
             # old file reachable, while new PDFs always come from stored bytes.
-            has_booklet = any(
-                int(item.get("submission_id") or 0) == submission_id
-                and int(item.get("chat_id") or 0)
-                and int(item.get("message_id") or 0)
-                and not item.get("unavailable")
-                for item in books
+            has_booklet = bool(
+                source_booklet is not None
+                and int(source_booklet.get("chat_id") or 0)
+                and int(source_booklet.get("message_id") or 0)
+                and not source_booklet.get("unavailable")
             )
             if has_booklet:
                 kinds.add(KIND_BOOKLET)
@@ -1277,17 +1432,8 @@ class GamasBot(
             kinds.discard(KIND_KEYPOINTS)
         item_id: int | None = None
         if has_booklet:
-            match = next(
-                (
-                    item
-                    for item in books
-                    if int(item.get("submission_id") or 0) == submission_id
-                    and not item.get("unavailable")
-                ),
-                None,
-            )
-            if match is not None:
-                item_id = int(match["item_id"])
+            if source_booklet is not None and not source_booklet.get("unavailable"):
+                item_id = int(source_booklet["item_id"])
             # The booklet is forwardable even if the optional library lookup
             # for learning buttons failed; only quiz/flashcards need item_id.
             kinds.add(KIND_BOOKLET)
@@ -1339,13 +1485,67 @@ class GamasBot(
             buttons=[[Button.inline(texts.BTN_BACK_MAIN, b"menu:main")]],
         )
 
-    async def _cb_lib_docs(self, event, _user_id: int, data: str) -> None:
+    async def _cb_lib_category(self, event, _user_id: int, data: str) -> None:
         parts = data.split(":")
-        page = _to_int(parts[2]) if len(parts) > 2 else 0
-        if page is None:
-            await self._ack(event, texts.DOCS_INVALID_PAGE, alert=True)
+        if len(parts) < 3:
+            await self._ack(event, texts.LIBRARY_INVALID_PAGE, alert=True)
             return
-        await self._show_documents(event, page=max(0, page))
+        category = parts[2]
+        page = _to_int(parts[3]) if len(parts) > 3 else 0
+        if page is None or page < 0:
+            await self._ack(event, texts.LIBRARY_INVALID_PAGE, alert=True)
+            return
+        await self._show_library_category(event, category, page=page)
+
+    async def _cb_lib_delete(self, event, user_id: int, data: str) -> None:
+        item_id = _to_int(data.rsplit(":", 1)[-1])
+        if item_id is None:
+            await self._ack(event, texts.ITEM_UNAVAILABLE, alert=True)
+            return
+        item = await self.db.library_item(user_id, item_id)
+        if item is None or int(item.get("delivered") or 0) != 1:
+            await self._ack(event, texts.ITEM_UNAVAILABLE, alert=True)
+            return
+        category = self._library_category_for_kind(str(item["kind"]))
+        title = self._item_display_title(item)
+        await self._edit(
+            event,
+            texts.LIBRARY_DELETE_CONFIRM.format(title=title),
+            [
+                [
+                    Button.inline(
+                        texts.BTN_CONFIRM_DELETE,
+                        f"lib:delok:{item_id}".encode("ascii"),
+                    )
+                ],
+                [
+                    Button.inline(
+                        texts.BTN_BACK,
+                        f"lib:cat:{category}:0".encode("ascii"),
+                    )
+                ],
+            ],
+        )
+
+    async def _cb_lib_delete_confirm(self, event, user_id: int, data: str) -> None:
+        item_id = _to_int(data.rsplit(":", 1)[-1])
+        if item_id is None:
+            await self._ack(event, texts.ITEM_UNAVAILABLE, alert=True)
+            return
+        item = await self.db.library_item(user_id, item_id)
+        if item is None or int(item.get("delivered") or 0) != 1:
+            await self._ack(event, texts.ITEM_UNAVAILABLE, alert=True)
+            return
+        category = self._library_category_for_kind(str(item["kind"]))
+        deleted = await self.db.library_delete(user_id, item_id)
+        if not deleted:
+            await self._ack(event, texts.ITEM_UNAVAILABLE, alert=True)
+            return
+        await self._ack(event, texts.LIBRARY_ITEM_DELETED)
+        await self._show_library_category(event, category, page=0)
+
+    async def _cb_lib_docs(self, event, _user_id: int, _data: str) -> None:
+        await self._show_library(event)
 
     async def _cb_lib_doc(self, event, user_id: int, data: str) -> None:
         document_id = _to_int(data.rsplit(":", 1)[-1])
@@ -1492,24 +1692,6 @@ class GamasBot(
         else:
             await self._show_admin_audit(event, page)
 
-    async def _cb_admin_gift_exec(self, event, user_id: int, data: str) -> None:
-        parts = data.split(":", 3)
-        target_id = _to_int(parts[2]) if len(parts) == 4 else None
-        if target_id is None:
-            await self._ack(event, texts.INVALID_GIFT, alert=True)
-        else:
-            await self._admin_gift_execute(event, user_id, target_id, parts[3])
-
-    async def _cb_admin_gift(self, event, _user_id: int, data: str) -> None:
-        parts = data.split(":")
-        target_id = _to_int(parts[2]) if len(parts) in (3, 4) else None
-        if target_id is None:
-            await self._ack(event, texts.INVALID_GIFT, alert=True)
-        elif len(parts) == 3:
-            await self._admin_gift_pick(event, target_id)
-        else:
-            await self._admin_gift_confirm(event, target_id, parts[3])
-
     # ------------------------------------------------------------- callbacks
     async def _handle_callback(self, event) -> None:
         """Answer each callback once, after specific alerts have had priority."""
@@ -1589,14 +1771,6 @@ class GamasBot(
                 if payload.lower().startswith("ref_"):
                     await self._apply_referral(event, user_id, payload[4:])
             await self._show_main(event, first_start=True)
-            pending = self._curation.get(user_id)
-            if pending and pending.get("delivery_failed") and not self._curation_stale(pending):
-                prefix = self._curation_prefix(str(pending["kind"]))
-                await event.respond(
-                    texts.CURATION_DELIVERY_RETRY,
-                    buttons=[[Button.inline(texts.CURATION_RESUME_BUTTON,
-                                            f"{prefix}:cur:resume".encode("ascii"))]],
-                )
             return
 
         # Reply-keyboard labels are navigation even while a text prompt is armed.
@@ -1804,8 +1978,6 @@ __all__ = [
     "AUDIO_EXTENSIONS",
     "BotDependencies",
     "CATEGORY_FILTER_LABELS",
-    "CURATION_GUIDANCE",
-    "CURATION_STALE_ALERT",
     "CallbackRouter",
     "ConversationStateStore",
     "DOC_EXTRACTION_STOPPED",
@@ -1826,8 +1998,6 @@ __all__ = [
     "FloodWaitError",
     "GamasBot",
     "JobProgress",
-    "LEADERBOARD_EMPTY",
-    "LEADERBOARD_FALLBACK_NAME",
     "LEARNING_BUSY_ALERT",
     "LEARNING_CREDIT_RESTORED",
     "LEARNING_DELIVERY_CTA",
@@ -1844,7 +2014,6 @@ __all__ = [
     "MAX_RECEIPT_IMAGE_PIXELS",
     "OFFICE_UPLOAD_STOPPED",
     "QUIZ_COUNTS",
-    "QUIZ_POINTS_PER_ANSWER",
     "QUIZ_START_GUIDANCE",
     "RAW_FALLBACK_MAX_PAGES",
     "RAW_PREVIEW_CHARS",

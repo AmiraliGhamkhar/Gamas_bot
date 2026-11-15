@@ -11,6 +11,7 @@ from datetime import datetime
 from unittest import mock
 from pathlib import Path
 
+from gamas_bot import texts
 from gamas_bot.bot import GamasBot
 from gamas_bot.db import MIGRATIONS_DIR, Database
 from gamas_bot.docx_export import DocumentMeta
@@ -104,14 +105,15 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
             plain_text=f"{lesson_title}. خلاصهٔ درس. محتوای آموزشی.",
         )
 
-        items = await self.db.library_list(OWNER, limit=10)
-        self.assertEqual([item["kind"] for item in items], ["booklet"])
-        # The virtual booklet row intentionally has no Telegram message: its
-        # primary PDF and editable DOCX are persisted artifacts instead.
-        self.assertEqual(items[0]["chat_id"], 0)
-        self.assertEqual(items[0]["message_id"], 0)
-        self.assertEqual(items[0]["title"], "جامع فیزیولوژی قلب")
-        self.assertIn(len(items[0]["title"].split()), (2, 3, 4))
+        # Before downloading, undownloaded virtual rows stay out of the user's
+        # delivered library while keeping internal source text cached.
+        self.assertEqual(await self.db.library_list(OWNER, limit=10), [])
+        source = await self.db.library_submission_source_item(OWNER, submission_id)
+        assert source is not None
+        self.assertEqual(source["chat_id"], 0)
+        self.assertEqual(source["message_id"], 0)
+        self.assertEqual(source["title"], "جامع فیزیولوژی قلب")
+        self.assertIn(len(source["title"].split()), (2, 3, 4))
         self.assertFalse(
             any(str(delivery["path"]).endswith((".pdf", ".docx")) for delivery in self.client.deliveries)
         )
@@ -133,47 +135,59 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         # label is shortened for a readable button/list row.
         self.assertIn(lesson_title, cover)
 
+        # Downloading the PDF registers it in the delivered-only Library.
+        dl_event = FakeCallbackEvent(OWNER, f"art:GMS-{submission_id}:booklet".encode())
+        dl_event.client = self.client
+        await self.bot._handle_callback(dl_event)
+        items = await self.db.library_list(OWNER, limit=10)
+        self.assertEqual([item["kind"] for item in items], ["booklet"])
+
     async def test_empty_library_uses_the_persian_empty_state(self):
         event = FakeCallbackEvent(OWNER, b"library")
         await self.bot._handle_callback(event)
         text, buttons = event.edits[-1]
-        self.assertEqual(
-            text,
-            "📚 کتابخانه من\n\n"
-            "کتابخانهٔ شما خالی است.\n"
-            "اولین فایل درس را بفرستید؛ متن و جزوه به‌صورت خودکار این‌جا ذخیره می‌شوند.",
-        )
-        self.assertIn(b"lib:docs:0", menu_payloads(buttons))
+        self.assertEqual(text, texts.LIBRARY_EMPTY)
+        self.assertIn(b"fc:man", menu_payloads(buttons))
 
     async def test_library_screen_paginates_six_newest_items_and_counts_in_persian(self):
         for index in range(8):
             await self._add_item(OWNER, f"درس {index}", message_id=100 + index)
         await self._add_item(OTHER, "خصوصی", message_id=999)
 
-        first = FakeCallbackEvent(OWNER, b"library")
+        # Library home shows direct category tabs with exact Persian counts.
+        home = FakeCallbackEvent(OWNER, b"library")
+        home.client = self.client
+        await self.bot._handle_callback(home)
+        home_text, home_buttons = home.edits[-1]
+        home_payloads = menu_payloads(home_buttons)
+        self.assertIn("📚 کتابخانه من", home_text)
+        self.assertIn("سایر فایل‌ها: ۸", home_text)
+        self.assertIn(b"lib:cat:booklet:0", home_payloads)
+        self.assertIn(b"lib:cat:quiz:0", home_payloads)
+        self.assertIn(b"lib:cat:flashcards:0", home_payloads)
+        self.assertIn(b"lib:cat:other:0", home_payloads)
+
+        # Opening the "other" category paginates six newest items with 1-click download.
+        first = FakeCallbackEvent(OWNER, b"lib:cat:other:0")
         first.client = self.client
         await self.bot._handle_callback(first)
         first_text, first_buttons = first.edits[-1]
         first_payloads = menu_payloads(first_buttons)
-        self.assertIn("📚 کتابخانه من", first_text)
         self.assertIn("تعداد موارد: ۸", first_text)
-        self.assertIn(b"lib:1", first_payloads)
-        self.assertEqual(sum(payload.startswith(b"lib:it:") for payload in first_payloads), 6)
-        # The flashcard tab toggle is part of every populated library screen.
-        self.assertIn(b"library:fc", first_payloads)
+        self.assertIn(b"lib:cat:other:1", first_payloads)
+        self.assertEqual(sum(payload.startswith(b"lib:f:") for payload in first_payloads), 6)
         first_labels = " ".join(button.text for row in first_buttons for button in row)
         self.assertIn("درس 7", first_text + " " + first_labels)
         self.assertNotIn("خصوصی", first_text + " " + first_labels)
 
-        second = FakeCallbackEvent(OWNER, b"lib:1")
+        second = FakeCallbackEvent(OWNER, b"lib:cat:other:1")
         second.client = self.client
         await self.bot._handle_callback(second)
         _second_text, second_buttons = second.edits[-1]
         second_payloads = menu_payloads(second_buttons)
-        self.assertIn(b"lib:0", second_payloads)
-        self.assertEqual(sum(payload.startswith(b"lib:it:") for payload in second_payloads), 2)
+        self.assertIn(b"lib:cat:other:0", second_payloads)
+        self.assertEqual(sum(payload.startswith(b"lib:f:") for payload in second_payloads), 2)
         labels = [button.text for row in second_buttons for button in row]
-        # Each row is labelled by what it is, not by one icon for everything.
         self.assertEqual(
             sum(label.startswith("📝 ") for label in labels), 2, labels
         )
@@ -332,7 +346,7 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"lib:f:{item_id}".encode(), payloads)
         self.assertIn(f"quiz:new:{item_id}".encode(), payloads)
         self.assertIn(f"fc:ai:{item_id}".encode(), payloads)
-        self.assertIn(b"lib:0", payloads)
+        self.assertIn(b"lib:cat:booklet:0", payloads)
 
     async def test_detail_screen_legacy_booklet_shows_notice_without_learning_buttons(self):
         item_id = await self._booklet(with_content=False)

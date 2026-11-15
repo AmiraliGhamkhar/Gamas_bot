@@ -179,8 +179,8 @@ class LearningBarTests(_LearningFixture):
         first = observed[0]
         self.assertIn("░", first)
         self.assertIn("٪", first)
-        self.assertIn("در حال ساخت محتوا", first)
-        self.assertIn(OWNER, self.bot._curation)
+        self.assertIn("در حال ساخت فایل تعاملی", first)
+        self.assertEqual(await self.db.library_count_kind(OWNER, "quiz"), 1)
 
     async def test_failed_generation_leaves_a_failure_bar_and_refunds(self):
         event = self.press(f"quiz:go:{self.item_id}:5".encode())
@@ -188,10 +188,10 @@ class LearningBarTests(_LearningFixture):
             "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value={"questions": []})
         ):
             await self.bot._handle_callback(event)
-        self.assertNotIn(OWNER, self.bot._curation)
+        self.assertEqual(await self.db.library_count_kind(OWNER, "quiz"), 0)
         self.assertEqual(await self.db.available_seconds(OWNER), 3600)
         frames = [text["text"] for text in self.client.texts]
-        self.assertTrue(any("ساخت محتوا ناموفق" in frame for frame in frames), frames)
+        self.assertTrue(any("ساخت فایل تعاملی ناموفق" in frame for frame in frames), frames)
 
     async def test_progress_frames_report_the_bar_and_the_chunk_count(self):
         from gamas_bot.doc_extract import DocChunk

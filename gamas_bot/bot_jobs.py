@@ -91,7 +91,6 @@ class JobPipelineMixin:
     _active_upload_keys: dict[tuple[int, str], str]
     _seen_messages: dict[tuple[int, int], float]
     _media_semaphore: asyncio.Semaphore
-    _protected_curation_items: Any
     _ack: Any
 
     async def _require_membership(
@@ -1526,17 +1525,8 @@ class JobPipelineMixin:
                 learning_source = document.llm_document() if document is not None else ""
                 learning_text = bound_content_text(learning_source)
                 try:
-                    existing = await self.db.library_list_kind(
-                        job.user_id, "booklet", limit=50
-                    )
-                    match = next(
-                        (
-                            row
-                            for row in existing
-                            if int(row.get("submission_id") or 0) == job.submission_id
-                            and not row.get("unavailable")
-                        ),
-                        None,
+                    match = await self.db.library_submission_source_item(
+                        job.user_id, job.submission_id
                     )
                     if match is None:
                         item_id = await self.db.library_add(
@@ -1546,11 +1536,15 @@ class JobPipelineMixin:
                             0,
                             job.submission_id,
                             title=booklet_title,
+                            delivered=False,
+                            artifact_kind="submission_source",
                         )
                         if learning_text:
                             await self.db.library_set_content(item_id, learning_text)
                     else:
                         item_id = int(match["item_id"])
+                        if learning_text:
+                            await self.db.library_set_content(item_id, learning_text)
                     # The structured model the renderers used, stored next to
                     # the text cache so it matches the persisted booklet
                     # structure (the submission's notes_json stays the
@@ -1828,10 +1822,11 @@ class JobPipelineMixin:
                 await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
                 return
             filename = f"{reference}-transcript.txt"
+            txt_bytes = body.encode("utf-8")
             try:
-                await self.client.send_file(
+                sent = await self.client.send_file(
                     chat,
-                    io.BytesIO(body.encode("utf-8")),
+                    io.BytesIO(txt_bytes),
                     caption=texts.DELIVERY_TRANSCRIPT_READY.format(reference=reference),
                     force_document=True,
                     attributes=[DocumentAttributeFilename(filename)],
@@ -1843,6 +1838,36 @@ class JobPipelineMixin:
                 )
                 await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
                 return
+            try:
+                sent_chat_id = int(
+                    getattr(sent, "chat_id", None)
+                    or getattr(event, "chat_id", None)
+                    or user_id
+                )
+                sent_msg_id = int(getattr(sent, "id", None) or 0)
+                base_title = short_title(
+                    Path(str(submission.filename or "")).stem or reference,
+                    fallback=reference,
+                )
+                await self.db.library_record_delivered_file(
+                    user_id,
+                    "transcript",
+                    title=f"{base_title} (متن خام TXT)",
+                    chat_id=sent_chat_id,
+                    message_id=sent_msg_id,
+                    submission_id=submission_id,
+                    artifact_kind=KIND_TXT,
+                    filename=filename,
+                    content_type="text/plain; charset=utf-8",
+                    content=txt_bytes,
+                )
+                await self.db.library_prune(user_id, self.settings.library_max_items)
+            except Exception:
+                logger.warning(
+                    "could not record delivered txt in library submission=%s",
+                    submission_id,
+                    exc_info=True,
+                )
             await self._ack(event)
             return
         if kind == KIND_TRANSCRIPT:
@@ -1941,7 +1966,7 @@ class JobPipelineMixin:
             {"mime_type": "text/html"} if kind == KIND_REVIEW_HTML else {}
         )
         try:
-            await self.client.send_file(
+            sent = await self.client.send_file(
                 await event.get_input_chat(),
                 io.BytesIO(content),
                 caption=f"{label} — {reference}",
@@ -1958,6 +1983,64 @@ class JobPipelineMixin:
             await self._ack(event, texts.DELIVERY_ARTIFACT_RETRY, alert=True)
             return True
         await finish_tracking(succeeded=True)
+        try:
+            raw_chat_id = getattr(sent, "chat_id", None)
+            if not isinstance(raw_chat_id, int) or isinstance(raw_chat_id, bool):
+                raw_chat_id = getattr(event, "chat_id", None)
+            sent_chat_id = (
+                raw_chat_id
+                if isinstance(raw_chat_id, int) and not isinstance(raw_chat_id, bool)
+                else int(user_id)
+            )
+            raw_msg_id = getattr(sent, "id", None)
+            sent_msg_id = (
+                raw_msg_id
+                if isinstance(raw_msg_id, int) and not isinstance(raw_msg_id, bool)
+                else 0
+            )
+            source_row = await self.db.library_submission_source_item(
+                user_id, submission_id
+            )
+            source_title = (
+                str(source_row.get("title") or "").strip()
+                if source_row is not None
+                else ""
+            )
+            source_text = (
+                str(source_row.get("content_text") or "")
+                if source_row is not None and source_row.get("content_text")
+                else await self.db.library_submission_source_text(
+                    user_id, submission_id
+                )
+            )
+            suffix_map = {
+                "booklet": "PDF",
+                "docx": "Word",
+                "review_html": "مرور HTML",
+            }
+            display_base = short_title(
+                source_title or Path(filename).stem,
+                fallback=FALLBACK_BOOKLET,
+            )
+            display_title = f"{display_base} ({suffix_map.get(kind, kind)})"
+            await self.db.library_record_delivered_file(
+                user_id,
+                "booklet",
+                title=display_title,
+                chat_id=sent_chat_id,
+                message_id=sent_msg_id,
+                submission_id=submission_id,
+                artifact_kind=kind,
+                content_text=source_text,
+            )
+            await self.db.library_prune(user_id, self.settings.library_max_items)
+        except Exception:
+            logger.warning(
+                "could not record delivered booklet in library submission=%s kind=%s",
+                submission_id,
+                kind,
+                exc_info=True,
+            )
         await self._ack(event)
         return True
 

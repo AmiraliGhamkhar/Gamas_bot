@@ -486,16 +486,17 @@ class CentralSubmissionTests(unittest.IsolatedAsyncioTestCase):
         names = {str(row[0]) for row in rows}
         self.assertTrue(
             {"submission_artifacts", "submission_binary_artifacts",
-             "booklet_revisions", "quiz_point_events", "speaker_names",
-             "diarization_reference_turns"} <= names
+             "speaker_names", "diarization_reference_turns"} <= names
         )
+        # Unused Mini App revision history and leaderboard event tables are dropped by 034.
+        self.assertNotIn("booklet_revisions", names)
+        self.assertNotIn("quiz_point_events", names)
 
     async def test_migration_028_and_030_columns_exist(self):
-        """The shared artifact/revision schema survives the Mini App removal."""
+        """The shared artifact schema survives the Mini App and leaderboard removal."""
         expected = {
             "speaker_names": "role",
             "library_items": "structured_json",
-            "booklet_revisions": "structured_json",
             "submission_binary_artifacts": "revision_id",
         }
         for table, column in expected.items():

@@ -114,7 +114,6 @@ class DocumentOfficeWorkflowMixin:
     _document_semaphore: asyncio.Semaphore
     # Supplied by the composed bot.
     conversations: Any
-    _protected_curation_items: Any
 
     async def _require_membership(
         self, event: Any, user_id: int, *, kind: str, callback_data: str = ""
@@ -336,7 +335,7 @@ class DocumentOfficeWorkflowMixin:
                     )
                 ]
             )
-        buttons.append([Button.inline("📚 کتابخانه", b"lib:docs:0")])
+        buttons.append([Button.inline("📚 کتابخانه", b"library")])
         return buttons
 
     def _office_sweep_sessions(self, now: float | None = None) -> None:
@@ -718,27 +717,52 @@ class DocumentOfficeWorkflowMixin:
         library_title = f"{document.title} — {label}"
         return filename, payload, caption, library_title
 
+    @staticmethod
+    def _office_content_type(filename: str) -> str:
+        suffix = Path(filename).suffix.lower()
+        return {
+            ".html": "text/html; charset=utf-8",
+            ".pdf": "application/pdf",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".txt": "text/plain; charset=utf-8",
+        }.get(suffix, "application/octet-stream")
+
     async def _save_office_library_item(
-        self, user_id: int, message: Message, title: str
+        self,
+        user_id: int,
+        message: Message,
+        title: str,
+        *,
+        kind: str = "office",
+        filename: str = "",
+        payload: bytes | None = None,
+        content_text: str | None = None,
     ) -> None:
         chat_id = getattr(message, "chat_id", None)
         message_id = getattr(message, "id", None)
-        if not isinstance(chat_id, int) or not isinstance(message_id, int):
+        if not isinstance(chat_id, int):
+            chat_id = int(user_id)
+        if not isinstance(message_id, int):
+            message_id = 0
+        if message_id == 0 and not payload:
             logger.warning("Office file delivered without a library message reference")
             return
         try:
-            await self.db.library_add(
+            await self.db.library_record_delivered_file(
                 user_id,
-                "office",
-                chat_id,
-                message_id,
-                None,
+                kind,
                 title=title[:200],
+                chat_id=chat_id,
+                message_id=message_id,
+                artifact_kind=kind,
+                content_text=content_text,
+                filename=filename,
+                content_type=self._office_content_type(filename) if filename else "",
+                content=payload,
             )
-            await self.db.library_prune(
-                user_id, self.settings.library_max_items,
-                protected_item_ids=self._protected_curation_items(user_id),
-            )
+            await self.db.library_prune(user_id, self.settings.library_max_items)
         except Exception as exc:
             logger.warning("could not index Office file error=%s", type(exc).__name__)
 
@@ -751,6 +775,8 @@ class DocumentOfficeWorkflowMixin:
         success_text: str,
         buttons: list[list],
         operation: Any,
+        library_kind: str = "office",
+        content_text: str | None = None,
     ) -> None:
         if not self.settings.office_enabled:
             await self._ack(  # type: ignore[attr-defined]
@@ -872,7 +898,15 @@ class DocumentOfficeWorkflowMixin:
                             "تلگرام فایل خروجی را تأیید نکرد؛ دوباره تلاش کنید."
                         )
                     delivered += 1
-                    await self._save_office_library_item(user_id, sent, library_title)
+                    await self._save_office_library_item(
+                        user_id,
+                        sent,
+                        library_title,
+                        kind=library_kind,
+                        filename=filename,
+                        payload=payload,
+                        content_text=content_text,
+                    )
             await self._edit(  # type: ignore[attr-defined]
                 event,
                 completed_progress_text(success_text, headline="✅ فایل آماده شد"),
@@ -1044,7 +1078,7 @@ class DocumentOfficeWorkflowMixin:
                     "↩️ بازگشت به سند", f"doc:show:{document_id}".encode("ascii")
                 )
             ],
-            [Button.inline("📚 بازگشت به کتابخانه", b"lib:docs:0")],
+            [Button.inline("📚 بازگشت به کتابخانه", b"library")],
         ]
         await self._office_run_operation(
             event,
@@ -1120,7 +1154,7 @@ class DocumentOfficeWorkflowMixin:
                     "↩️ بازگشت به سند", f"doc:show:{document_id}".encode("ascii")
                 )
             ],
-            [Button.inline("📚 بازگشت به کتابخانه", b"lib:docs:0")],
+            [Button.inline("📚 بازگشت به کتابخانه", b"library")],
         ]
 
         async def build(_workdir: Path, progress: WorkProgress) -> list[Any]:
@@ -1272,6 +1306,8 @@ class DocumentOfficeWorkflowMixin:
             ),
             buttons=buttons,
             operation=build,
+            library_kind="booklet",
+            content_text=bound_content_text(source_text),
         )
 
     async def _guard_file_intake(self, event: Any, operation: Any) -> None:
@@ -1560,7 +1596,7 @@ class DocumentOfficeWorkflowMixin:
         document = await self.db.document_meta(user_id, document_id)
         if document is None:
             await self._ack(event, "این سند پیدا نشد.", alert=True)  # type: ignore[attr-defined]
-            await self._show_documents(event)
+            await self._show_library(event)  # type: ignore[attr-defined]
             return
         await self._edit(  # type: ignore[attr-defined]
             event,
@@ -1699,11 +1735,6 @@ class DocumentOfficeWorkflowMixin:
                         max_active_hours=self.settings.quiz_max_active_hours,
                         max_sessions_per_hour=self.settings.quiz_max_sessions_per_hour,
                     )
-                    if reason == "active":
-                        await event.respond(
-                            "یک آزمون فعال دیگر دارید؛ ابتدا آن را تمام کنید."
-                        )
-                        return
                     if reason == "rate":
                         await event.respond(
                             "تعداد آزمون‌های شما در یک ساعت اخیر به حداکثر مجاز رسیده است."
@@ -1871,6 +1902,8 @@ class DocumentOfficeWorkflowMixin:
             ),
             buttons=self._office_format_keyboard(),
             operation=build,
+            library_kind="booklet",
+            content_text=bound_content_text(raw_text),
         )
 
     async def _route_office_callback(
