@@ -190,10 +190,17 @@ def _sample_review_plan_payload(notes: StructuredNotes) -> dict:
 
 
 def _extract_pdf_text(pdf_bytes: bytes) -> str:
-    import pymupdf
+    try:
+        import pymupdf
+    except ImportError:
+        from pypdf import PdfReader
 
-    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
-        raw = "\n".join(page.get_text("text") or "" for page in doc)
+        raw = "\n".join(
+            page.extract_text() or "" for page in PdfReader(io.BytesIO(pdf_bytes)).pages
+        )
+    else:
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+            raw = "\n".join(page.get_text("text") or "" for page in doc)
     return unicodedata.normalize("NFKC", raw).replace("\u0654", "").replace("لا", "ال")
 
 
