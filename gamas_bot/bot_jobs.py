@@ -100,6 +100,7 @@ class JobPipelineMixin:
         raise NotImplementedError
 
     _download_semaphore: asyncio.Semaphore
+    _download_reservations: Any
     _upload_semaphore: asyncio.Semaphore
 
     async def _guard_upload_admission(
@@ -813,23 +814,27 @@ class JobPipelineMixin:
             reported_bytes = _reported_upload_bytes(message, limit_bytes)
             if reported_bytes > limit_bytes:
                 raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
-            await run_file_io(
-                self.deps.ensure_disk_headroom,
+            reservation = await run_file_io(
+                self._download_reservations.reserve,
                 target.parent,
                 reported_bytes * 2,
                 reserve_bytes=self.settings.temp_min_free_bytes,
+                ensure_headroom=self.deps.ensure_disk_headroom,
             )
-            return await asyncio.wait_for(
-                self.deps.download_media_limited(
-                    message,
-                    target,
-                    limit_bytes,
-                    stall_seconds=self.settings.download_stall_seconds,
-                    client=self.client,
-                    connections=self.settings.telegram_download_connections,
-                ),
-                timeout=self.settings.download_timeout,
-            )
+            try:
+                return await asyncio.wait_for(
+                    self.deps.download_media_limited(
+                        message,
+                        target,
+                        limit_bytes,
+                        stall_seconds=self.settings.download_stall_seconds,
+                        client=self.client,
+                        connections=self.settings.telegram_download_connections,
+                    ),
+                    timeout=self.settings.download_timeout,
+                )
+            finally:
+                reservation.release()
 
     async def _settle(self, job: Job, duration: float | None) -> None:
         measured = int(math.ceil(duration)) if duration else 0
