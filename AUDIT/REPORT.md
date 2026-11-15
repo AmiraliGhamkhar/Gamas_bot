@@ -1,108 +1,105 @@
-# Gamas Bot audit report
+# Gamas Bot security and reliability audit — Second pass
 
 **Audit date:** 2026-11-15 UTC
-**Scope:** Telethon ingress, concurrent media/document pipelines, SQLite, cPanel resource constraints, STT/LLM fallback, booklet generation, and dependency security.
-**Evidence policy:** Each assessment is marked **VERIFIED**, **INFERRED**, or **UNVERIFIED**. Named `AUDIT/results/` files contain the local command output; no provider service, production data, `.env`, session, or cron job was intentionally accessed.
+
+**Branch:** `arena/357a91cc-gamas-bot` (Arena-managed; no branch switch)
+
+**Scope:** checkout source and tests only. No `.env`, Telegram session, cron entry, production data, or live Telegram/STT/LLM/OCR endpoint was accessed.
+
+## Evidence and claim policy
+
+Every conclusion below is marked **[VERIFIED]**, **[INFERRED]**, or **[UNVERIFIED]**. A `[VERIFIED]` item has both a current source/test citation and a named command log under `AUDIT/results/`; a scanner match alone is not a vulnerability. Logs containing a non-zero tool exit are evidence of the reported condition, never a pass.
 
 ## Executive result
 
-- **VERIFIED — remediated:** Pillow 12.3.0 was reachable from untrusted image-ingress paths and had 42 `pip-audit` advisories. Commit `3bff030` raises the declared floor to Pillow 13.0 and adds a regression test.
-- **VERIFIED — remediated to fail closed:** A 1 GiB cPanel filesystem cannot admit the shipped 1 GiB media/document maximum under the existing two-working-copy rule. Commit `12aa5ea` makes cPanel preflight fail rather than permit that impossible deployment profile, without changing generic upload defaults.
-- **VERIFIED — documentation clarified:** The 2 GiB unset presentation temporary default remains unchanged; `.env.example` now explicitly identifies its 128/256 MiB presentation values as cPanel overrides, not code defaults.
-- **VERIFIED:** The final suite passed 1,894 tests and 510 subtests; unittest discovery passed 1,860 tests; the dependency audit reported no known vulnerabilities.
-- **UNVERIFIED:** No live cPanel deployment was available, so its chosen interpreter and kernel-enforced RAM/process/disk/IO quotas could not be measured.
+- **[VERIFIED] F-002 is closed at runtime:** aggregate, process-local temporary-disk reservations make concurrent Telegram downloads account for every active two-working-copy budget, and the lease is released in a `finally` block. See `gamas_bot/telegram_transfer.py:82-134`, `gamas_bot/bot_jobs.py:808-837`, `tests/test_download_reservations.py:1-134`, and `AUDIT/results/b2-reservation-regression-after.log`.
+- **[VERIFIED] F-002 stream bounds are closed:** a declared Telegram size is an independent stream cap, generic and declared-size overflows delete the partial target, and a final declared-size mismatch is rejected. See `gamas_bot/telegram_transfer.py:295-408`, `tests/test_download_reservations.py:122-134`, and `AUDIT/results/b3-streaming-limit-regression-after.log`.
+- **[VERIFIED] Three randomized warning-as-error Python 3.11 runs passed before the final audit-only characterization test was added: each reports `1894 passed, 510 subtests passed`. See `AUDIT/results/a2-pytest-random-seed-104729.log`, `AUDIT/results/a2-pytest-random-seed-130363.log`, and `AUDIT/results/a2-pytest-random-seed-15485863.log`.
+- **[VERIFIED] Current offline dependency audit reported zero advisories.** `requirements.txt` was audited by `pip-audit`; see `AUDIT/results/c4-pip-audit-deduplicated.log` and `AUDIT/results/c4-pip-audit.json`.
+- **[VERIFIED] The clean current-source secret scan has five candidates, all manually disposed as non-secrets:** the referral character alphabet at `gamas_bot/db_referrals.py:25` and four explicitly synthetic benchmark configuration values at `scripts/concurrency_bench.py:260-270`. See `AUDIT/results/c3-detect-secrets-clean-source-summary.log`.
+- **[VERIFIED] The clean source/docs/config history scan found zero candidates across the three reachable commits while excluding tests, `AUDIT`, `.env`, session, cron, and data paths.** See `AUDIT/results/c3-git-history-detect-secrets-clean-summary.log`.
+- **[UNVERIFIED] Native execution on Python 3.12/3.13, a live cPanel quota profile, and provider behavior under live credentials were not available in this sandbox.** CI declares 3.11–3.13 at `.github/workflows/tests.yml:12-29`, while package metadata permits `>=3.11` at `pyproject.toml:18-28`.
 
-## Deployment runtime selection
+## Final-gate state
 
-- **VERIFIED:** The repository deployment material selects **Python 3.11**: `README.md:29-39` and `docs/CPANEL.md:14-26` create/select a 3.11 virtual environment. `pyproject.toml:23` requires Python `>=3.11`, and `.github/workflows/tests.yml:18` tests 3.11–3.13.
-- **UNVERIFIED:** The exact interpreter selected in a live cPanel Setup Python App is outside this checkout. The audit sandbox used Python 3.11.2.
+| Gate | Result | Evidence |
+|---|---|---|
+| Randomized `pytest`, warnings as errors, seeds 104729 / 130363 / 15485863 | **[VERIFIED]** 3 × `1894 passed, 510 subtests passed` before the audit characterization test | `a2-pytest-random-seed-*.log` |
+| Final post-commit `pytest -W error -q -p no:randomly` | **[VERIFIED]** 1,904 passed, 510 subtests passed | `AUDIT/results/final-pytest.log` |
+| Final post-commit `unittest discover -q` | **[VERIFIED]** 1,870 tests passed | `AUDIT/results/final-unittest.log` |
+| Final post-commit Ruff / mypy / compileall | **[VERIFIED]** all passed; mypy checked 74 source files | `final-ruff.log`, `final-mypy.log`, `final-compileall.log` |
+| Final post-commit package/worker checks | **[VERIFIED]** `pip check`, requirements synchronization, and media-worker self-check passed | `final-pip-check.log`, `final-requirements-sync.log`, `final-media-worker.log` |
+| Final post-commit dependency and citation checks | **[VERIFIED]** zero dependency advisories; 144 citations, zero invalid references | `final-pip-audit.log`, `final-citation-check.log` |
+| Pytest vs unittest collection reconciliation | **[VERIFIED]** 1,894 pytest nodes, 1,860 unittest methods, zero missing unittest methods before F-002/audit-only tests were added | `AUDIT/results/a3-runner-diff.log` |
+| F-002 reservation and stream regression tests | **[VERIFIED]** reservation 5 passed; selected stream/intake tests 12 passed | `b2-reservation-regression-after.log`, `b3-streaming-limit-regression-after.log` |
+| Offline Bandit | **[VERIFIED]** completed with 269 heuristic findings; dispositions below | `c1-bandit.json`, `c1-bandit-production-triage-candidates.log` |
+| Offline local-rule Semgrep | **[VERIFIED]** completed with four warnings in developer scripts; dispositions below | `c2-semgrep-offline-summary.log` |
+| Ruff security/style selection | **[VERIFIED]** completed with 392 mixed source/test diagnostics; not a clean security claim | `c2-ruff-security.txt` |
+| Clean source/history secret scans | **[VERIFIED]** no undisposed source/history credential candidates | `c3-detect-secrets-clean-source-summary.log`, `c3-git-history-detect-secrets-clean-summary.log` |
+| Document/media characterization | **[VERIFIED]** 169 passed, 12 subtests passed | `d3-document-media-characterization.log` |
+| LLM/render characterization | **[VERIFIED]** 441 passed, 122 subtests passed | `d4-llm-render-characterization.log` |
+| STT/capacity/job characterization | **[VERIFIED]** 114 passed | `d5-stt-capacity-job-characterization.log` |
+| Config/launcher characterization | **[VERIFIED]** 96 passed, 127 subtests passed | `d6-config-launcher-characterization.log` |
+| Database/learning characterization | **[VERIFIED]** 249 passed, 2 subtests passed | `d7-db-learning-characterization.log` |
 
-## Final gates
+## Finding F-002 — concurrent download admission and stream-size enforcement
 
-| Assessment | Command | Result | Evidence |
-| --- | --- | --- | --- |
-| **VERIFIED** | `.venv/bin/python -m pytest -p no:randomly -q` | 1,894 passed, 510 subtests passed in 332.58 s | `AUDIT/results/pytest-after-preflight.log` |
-| **VERIFIED** | `.venv/bin/python -m unittest discover -s tests -q` | 1,860 tests passed in 297.079 s | `AUDIT/results/unittest-after-preflight.log` |
-| **VERIFIED** | `.venv/bin/python -m ruff check gamas_bot scripts tests` | All checks passed | `AUDIT/results/ruff-after-preflight.log` |
-| **VERIFIED** | `.venv/bin/python -m mypy` and targeted preflight mypy | 74 production files and `scripts/cpanel_preflight.py` passed | `AUDIT/results/mypy-after-preflight-full.log`, `mypy-cpanel-preflight.log` |
-| **VERIFIED** | compileall, `pip check`, requirements-sync, media-worker self-check | All passed | `AUDIT/results/compileall-after-preflight.log`, `pip-check-after-preflight.log`, `requirements-sync-after-preflight.log`, `media-worker-check-after-preflight.log` |
-| **VERIFIED** | `.venv/bin/python -m pip_audit -r requirements.txt --format json` | No known vulnerabilities | `AUDIT/results/pip-audit-after-preflight.json` |
-| **VERIFIED** | `.venv/bin/python -m scripts.concurrency_bench cpanel` | Six scripted jobs completed in 8.5834 s; 121.86 MB peak RSS | `AUDIT/results/concurrency-after-preflight.log` |
+**Severity:** High (availability/resource exhaustion)
 
-- **VERIFIED:** `ruff format --check` reports pre-existing formatting drift in 151 files (`AUDIT/results/ruff-format-after-preflight.log`). The project explicitly does not enforce formatter output in CI (`pyproject.toml` Ruff comment); no formatter suppression, threshold relaxation, or unrelated mass reformat was made.
-- **UNVERIFIED:** The scripted benchmark models provider latency/429 events and does not measure actual cPanel 10 MB/s IO, 1024 IOPS, process accounting, or provider accounts.
+**Status:** **[VERIFIED] remediated in commits `198c073` and `251855f`**
 
-## F-001 — Pillow image-parser dependency floor
-
-**Severity:** HIGH security
-**Status:** **VERIFIED — REMEDIATED**
+**Trust boundary:** Telegram media bytes → temporary filesystem
 
 ### Evidence
 
-- **VERIFIED:** Potentially untrusted image processing reaches Pillow at `gamas_bot/doc_extract.py:540-544`, `gamas_bot/document/qa.py:285-293`, and `gamas_bot/intake.py:269-285`.
-- **VERIFIED:** Before the fix, `pyproject.toml:45` and `requirements.txt:13` allowed Pillow 12.3.0. `AUDIT/results/pip-audit.json` records 42 Pillow advisories in the resolved baseline.
-- **VERIFIED:** The saved baseline audit identifies Pillow 13.0.0 as the available fix for those advisories.
-
-### Remediation and verification
-
-- **VERIFIED:** Commit `3bff030 security: require patched Pillow release` changes the package metadata and generated requirements entry to `Pillow>=13.0,<14.0`.
-- **VERIFIED:** `tests/test_dependency_security.py:13-20` rejects a future regression below the protected range.
-- **VERIFIED:** The post-fix environment resolved Pillow 13.0.0, `pip check` passed, and `AUDIT/results/pip-audit-after-preflight.json` contains no vulnerable dependency.
+- **[VERIFIED]** The reservation ledger keys claims by filesystem device, combines existing reservations with a new request under a thread lock, and exposes idempotent release. See `gamas_bot/telegram_transfer.py:58-134` and `AUDIT/results/b2-reservation-regression-after.log`.
+- **[VERIFIED]** Download admission reserves `reported_bytes * 2` plus the configured free-space floor inside the bounded file-I/O path, then releases the lease in `finally`. See `gamas_bot/bot_jobs.py:808-837` and `AUDIT/results/b2-reservation-regression-after.log`.
+- **[VERIFIED]** The transfer helper treats the known declared size as a separate maximum, checks cumulative progress and final size, and removes the target for every `BaseException` path. See `gamas_bot/telegram_transfer.py:215-320` and `AUDIT/results/b3-streaming-limit-regression-after.log`.
+- **[VERIFIED]** The focused regressions exercise aggregate rejection, idempotent release, cancellation/failure cleanup, declared-size overflow, generic overflow, and target cleanup. See `tests/test_download_reservations.py:1-134`, `AUDIT/results/b2-reservation-regression-after.log`, and `AUDIT/results/b3-streaming-limit-regression-after.log`.
 
 ### Residual risk
 
-- **INFERRED:** A future Pillow advisory remains possible because the application uses bounded ranges rather than a resolver lockfile; recurring dependency audit is still required.
+- **[INFERRED]** Reservations are process-local by design; separate bot processes sharing a filesystem are protected operationally by the single-instance lock, not by an inter-process disk ledger. The lock uses an OS-held exclusive lock at `gamas_bot/instance_lock.py:37-115`; the claim has not been tested against a live shared-host process supervisor in this audit.
 
-## F-002 — 1 GiB disk profile versus 1 GiB upload defaults
+## Static-analysis dispositions
 
-**Severity:** HIGH availability/resource coherence
-**Status:** **VERIFIED — REMEDIATED TO PREFLIGHT FAILURE**
+### Bandit
 
-### Reproduction
+- **[VERIFIED]** Bandit found 72 production heuristics: 40 B608 SQL-construction alerts and 32 low-severity assertions, exception-handling, pseudo-random, subprocess, and XML-escaping alerts. See `AUDIT/results/c1-bandit-production-triage-candidates.log`.
+- **[VERIFIED]** The 40 B608 alerts are not a reproduced SQL injection: identifier interpolation is constrained to fixed maps/constants or generated `?` placeholder lists, while externally supplied values remain bound parameters. Representative controls are `gamas_bot/db_reporting.py:45-84`, `gamas_bot/db_support.py:27-58`, `gamas_bot/db_support.py:180-198`, `gamas_bot/db_users.py:75-100`, and `gamas_bot/db_users.py:440-500`; see `AUDIT/results/c1-bandit-production-triage-candidates.log` and `AUDIT/results/d7-db-learning-characterization.log`.
+- **[VERIFIED]** B311 concerns do not generate security tokens: it is retry jitter at `gamas_bot/db_core.py:99-105`, multipart boundary variation at `gamas_bot/ocr.py:373-381`, and backoff jitter at `gamas_bot/ocr.py:581-589`. See `AUDIT/results/c1-bandit-production-triage-candidates.log`.
+- **[VERIFIED]** The B404/B603 subprocess pair is a fixed vector `[sys.executable, "-m", "gamas_bot"]`, has no shell, redirects standard input, and starts a new session. See `gamas_bot/launcher.py:253-279` and `AUDIT/results/c2-targeted-grep.log`.
+- **[VERIFIED]** B406 flags imports of an XML escape function, not XML parsing; the output path escapes rendered text before ReportLab markup. See `gamas_bot/notes_pdf.py:120-150`, `gamas_bot/pdf_export.py:168-172`, and `AUDIT/results/c1-bandit-production-triage-candidates.log`.
+- **[INFERRED]** B101/B110/B112 remain code-quality/reliability review items rather than confirmed security vulnerabilities. Their listed sites either assert internal postconditions or use best-effort cleanup/logging; representative cleanup is `gamas_bot/media.py:130-157`. See `AUDIT/results/c1-bandit-production-triage-candidates.log`.
 
-- **VERIFIED:** `gamas_bot/config.py:210-216` defines a 1 GiB `DEFAULT_MAX_FILE_SIZE_BYTES` and a 64 MiB temporary reserve. `gamas_bot/config.py:1289-1296` applies that ceiling to `MAX_FILE_SIZE`, `DOC_MAX_BYTES`, and `DOC_UNPACKED_MAX_BYTES` when unset.
-- **VERIFIED:** `gamas_bot/bot_jobs.py:807-828` passes `reported_bytes * 2` plus `TEMP_MIN_FREE_BYTES` to the download admission guard before a Telegram transfer.
-- **VERIFIED:** `gamas_bot/telegram_transfer.py:72-87` raises `DiskSpaceError` when the temporary filesystem has less space than that requirement, failing closed before download.
-- **VERIFIED:** The original reproduction at `AUDIT/results/cpanel-disk-incoherence-repro.log` invoked that production guard with 1,073,741,824 bytes free. A default maximum input required 2,214,592,512 bytes for one admission and returned `result=REFUSED (DiskSpaceError)`.
-- **VERIFIED:** The default has two concurrent download slots (`gamas_bot/config.py:220`, `gamas_bot/config.py:1536-1542`). A capacity profile therefore must account for two independent two-working-copy admissions, not only one transfer.
+### Semgrep and targeted API inventory
 
-### Remediation
+- **[VERIFIED]** Offline Semgrep reported four interpolated-SQL warnings only in developer scripts: `scripts/admin_report_bench.py:154,212` and `scripts/import_v2.py:83,112`. The first iterates a literal table tuple; the second obtains migration table/column names from a restrictive migration regex before a local SQLite call. See `scripts/admin_report_bench.py:145-215`, `scripts/import_v2.py:70-120`, and `AUDIT/results/c2-semgrep-offline-summary.log`.
+- **[VERIFIED]** The targeted inventory matched no `eval`/`exec`, pickle, unsafe YAML, `mktemp`, archive extraction, `shell=True`, or direct `requests`/`httpx` usage in the scan scope. It did inventory the controlled subprocess sites and SQL construction. See `AUDIT/results/c2-targeted-grep.log`.
+- **[UNVERIFIED]** This was an offline local-rule Semgrep configuration, not the upstream hosted/default ruleset; it must not be interpreted as equivalent to a full remote Semgrep policy scan. See `AUDIT/results/c2-semgrep-status.log`.
 
-- **VERIFIED:** `scripts/cpanel_preflight.py:173-216` now calculates the maximum of the media/document input ceilings, two working copies, the configured temporary reserve, and every `MAX_CONCURRENT_DOWNLOADS` slot. It returns a **FAIL** result if actual `temp_dir` free space is below the aggregate requirement.
-- **VERIFIED:** `scripts/cpanel_preflight.py:343-358` includes this check in the normal preflight run, so `main()` returns a non-zero status whenever the new result is a failure.
-- **VERIFIED:** `tests/test_cpanel_preflight.py:18-59` reproduces a one-GiB-free/default-sized two-download failure, verifies the larger document ceiling is considered, and verifies an exact capacity boundary. `tests/test_cpanel_preflight.py:61-86` proves `run_all()` includes the failure.
-- **VERIFIED:** `AUDIT/results/cpanel-preflight-capacity-after.log` runs the effective default settings against a synthetic 1 GiB free-space result and records `level=FAIL` and a 4.12 GiB aggregate requirement.
-- **VERIFIED:** Commit `12aa5ea fix: reject impossible cpanel download capacity` contains this preflight guard, regression tests, and the deployment-material update.
+## Manual trust-boundary review
 
-### Operator effect
+- **[VERIFIED] Telegram callbacks require a private sender, reject banned users, and reject `adm:`/`payv:` callbacks before dispatch for non-administrators.** See `gamas_bot/bot.py:1523-1563` and `AUDIT/results/d6-config-launcher-characterization.log`.
+- **[VERIFIED] Document callbacks parse exact shapes/types and load document metadata through a user-scoped lookup before showing or exporting it.** See `gamas_bot/bot_documents.py:1544-1599`, `gamas_bot/bot_documents.py:1848-1910`, `tests/test_document_ingestion.py:489-518`, and `AUDIT/results/d3-document-media-characterization.log`.
+- **[VERIFIED] Admin hub parameters are allowlisted/validated after the central admin gate.** See `gamas_bot/bot_admin.py:1748-1845`, `tests/test_admin_hubs.py:123-144`, and `AUDIT/results/d6-config-launcher-characterization.log`.
+- **[VERIFIED] Billing reserves only an owned submission in one transaction, checks balance/ban state, records allocations, and payment review atomically updates payment, credit/referral, and audit data.** See `gamas_bot/db_billing.py:259-374`, `gamas_bot/db_payments.py:313-403`, `gamas_bot/db_referrals.py:64-199`, and `AUDIT/results/d7-db-learning-characterization.log`.
+- **[VERIFIED] Subscription denial is fail-closed only for a confirmed denial; an unavailable membership check presents an unavailable state rather than falsely calling a user a non-member.** See `gamas_bot/subscription.py:398-457` and `AUDIT/results/d7-db-learning-characterization.log`.
+- **[VERIFIED] Document/PPTX intake has image-pixel, OOXML expansion/text, ZIP member/path, XML parser, and subprocess timeout/kill controls.** See `gamas_bot/doc_extract.py:80-128`, `gamas_bot/doc_extract.py:290-315`, `gamas_bot/presentations.py:240-435`, `gamas_bot/media.py:102-180`, and `AUDIT/results/d3-document-media-characterization.log`.
+- **[INFERRED]** The absence of a compression-ratio cap is not recorded as a confirmed finding: extraction has explicit absolute expansion limits, ZIP entry/name checks, and bounded member reads. The deliberately stricter ratio-only characterization failed as expected (`AUDIT/results/d3-zip-compression-ratio-before.log`) but did not establish that a legitimate low-output-ratio file violates the current security contract. A human policy decision is required before adding a new rejection threshold.
+- **[VERIFIED] STT response bodies, transfer deadlines, capacity waits, job queues, and child-process lifetimes are explicitly bounded.** See `gamas_bot/stt.py:269-358`, `gamas_bot/capacity.py:75-178`, `gamas_bot/jobs.py:165-330`, and `AUDIT/results/d5-stt-capacity-job-characterization.log`.
+- **[VERIFIED] User-derived review HTML is escaped and delivered with a restrictive hashed-script CSP; DOCX/PDF text is made XML-safe before rendering.** See `gamas_bot/review_sheet_html.py:163-185`, `gamas_bot/review_sheet_html.py:322-351`, `gamas_bot/docx_export.py:261-302`, `gamas_bot/notes_pdf.py:120-150`, and `AUDIT/results/d4-llm-render-characterization.log`.
 
-- **VERIFIED:** Generic 1 GiB upload ceilings were intentionally retained, per the selected remediation option; a cPanel deployment with insufficient actual free space is now blocked at preflight rather than silently advertised as viable.
-- **VERIFIED:** `docs/CPANEL.md:44-73`, `docs/OPERATIONS.md:164-215`, and `.env.example:41-49` document the 4.125 GiB default two-download requirement and provide a 128 MiB cPanel override profile. That override requires 640 MiB free temporary space for its two slots before database, log, receipt, or virtual-environment usage.
-- **INFERRED:** A 1 GiB nominal account may still lack 640 MiB at runtime after application/runtime data is present. The actual `Temp download capacity` result is therefore the deployment gate, not the nominal account quota.
+## Characterization and benchmark evidence
 
-## F-003 — presentation capacity documentation drift
+- **[VERIFIED]** New direct characterization tests keep prompt source text out of the static system prompt, prove the composed bot includes the admin/document/billing mixins, exercise launcher early-exit classification, and check document callback IDs. See `tests/test_risky_module_characterization.py:1-58` and `AUDIT/results/e-risky-module-characterization.log`.
+- **[VERIFIED]** The offline one-minute synthetic PyAV matrix completed; the shipped Opus 32k VoIP configuration encoded at 80× real time and projected 12.7 MB/hour on this sandbox. See `AUDIT/results/f1-pyav-benchmark.log`.
+- **[VERIFIED]** The offline DOCX benchmark built a 30-section booklet in 0.283 s (36k-char source) and 0.251 s (108k-char source) on this sandbox. See `AUDIT/results/f2-docx-benchmark.log`.
+- **[VERIFIED]** The realistic Persian short, medical-long, and mixed RTL/LTR DOCX/PDF fixtures built and passed structural/raster QA: respectively 3/5/3 PDF pages with PDF build times of 0.249/0.274/0.238 s. See `AUDIT/results/f3-pdf-docx-realistic-render-benchmark.log` and `tests/test_booklet_rendering.py:1-60`.
+- **[INFERRED]** These offline timings are local ratios, not capacity commitments for cPanel or provider calls.
 
-**Severity:** MEDIUM operability/documentation
-**Status:** **VERIFIED — REMEDIATED IN DEPLOYMENT MATERIAL**
+## Open human items
 
-- **VERIFIED:** `gamas_bot/config.py:216` retains `DEFAULT_PRESENTATION_MAX_TEMP_BYTES = 2 * 1024**3`.
-- **VERIFIED:** Before the documentation clarification, `.env.example:273-280` displayed 128 MiB unpacked/256 MiB temporary presentation values without identifying them as explicit cPanel overrides; `docs/FEATURES.md:86-100` also displayed the 256 MiB profile.
-- **VERIFIED:** `.env.example:274-284` now says those values are conservative cPanel overrides rather than unset code defaults; `docs/FEATURES.md:86-92` points shared-host deployments to the capacity preflight and cPanel profile.
-- **INFERRED:** This removes the operator-facing ambiguity while preserving generic defaults and avoids an unapproved user-visible change to default presentation capability.
-
-## Focused concurrency, persistence, and security review
-
-- **VERIFIED:** SQLite enables WAL/NORMAL, foreign keys, bounded cache/journal settings, a query-only read connection, and serialized `BEGIN IMMEDIATE` writes at `gamas_bot/db_core.py:249-364`.
-- **VERIFIED:** `CapacityPool` provides immediate priority reservation/overflow and bounded waits at `gamas_bot/capacity.py:97-176`; STT uses it at `gamas_bot/stt.py:1291-1545` and LLM routing uses it at `gamas_bot/llm.py:2320-2533`.
-- **VERIFIED:** The post-fix scripted benchmark recorded two Speechmatics overflow skips and two Deepgram attempts/successes, plus two AvalAI rate-limit failovers to Gemini, without queue-wait counters (`AUDIT/results/concurrency-after-preflight.log`). This verifies the scripted fallback contract, not production provider quota behavior.
-- **VERIFIED:** Telegram transfer paths use declared-size checks, optional byte ranges, stall detection, positional writes, cleanup, and download semaphores at `gamas_bot/telegram_transfer.py:98-320` and `gamas_bot/bot_jobs.py:807-832`.
-- **VERIFIED:** Media worker subprocesses use argument vectors, no shell, timeout/cancellation cleanup, and POSIX process-group termination at `gamas_bot/media.py:102-186`.
-- **VERIFIED:** Reviewed Bandit B608 sites in `db_billing.py`, `db_library.py`, `db_payments.py`, `db_reporting.py`, `db_support.py`, and `db_users.py` interpolate only local/whitelisted schema identifiers or generated placeholder lists; user/data values use SQLite parameters. No SQL-injection reproduction was obtained.
-- **UNVERIFIED:** Static review and offline simulations cannot prove live provider response formats, quota exhaustion behavior, or cPanel kernel quota enforcement.
-
-## Audit-process limitations
-
-- **VERIFIED:** Work remained on `arena/c4b817d1-gamas-bot`. The supplied workspace was not a newly created `audit/2026-11-15` branch or separately prepared fresh-clone audit worktree.
-- **VERIFIED:** No migration, schema, production data, authentication control, admin flow, live cron entry, `.env`, or session was changed.
-- **UNVERIFIED:** Native execution on Python 3.12–3.14 did not occur because only Python 3.11.2 was installed in the audit sandbox.
-- **UNVERIFIED:** Semgrep did not fetch its remote rule pack due TLS EOF; its empty output was not treated as a successful scan.
+1. **[UNVERIFIED]** Run the full Python 3.12 and 3.13 matrix (and decide whether supported metadata should cap or test Python 3.14) in CI; this sandbox only has Python 3.11.2. See `pyproject.toml:18-28`, `.github/workflows/tests.yml:12-29`, and `AUDIT/results/a2-environment.log`.
+2. **[INFERRED]** Decide whether a compression-ratio limit is desired in addition to the existing absolute OOXML expansion and ZIP-member limits; doing so can reject highly compressible legitimate Office documents. See `gamas_bot/doc_extract.py:290-315`, `gamas_bot/presentations.py:401-425`, and `AUDIT/results/d3-zip-compression-ratio-before.log`.
+3. **[UNVERIFIED]** Validate live provider policies, cPanel disk/process/RAM/IO quotas, and the configured subscription channel with production-authorized operators only; those endpoints/data were intentionally not accessed here.
