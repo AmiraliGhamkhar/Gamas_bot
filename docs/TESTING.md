@@ -41,7 +41,7 @@ network-dependent advisory; never label it PASS without running it.
 ```bash
 python -m pytest tests/test_provider_allowlist.py tests/test_llm_task_routing.py tests/test_provider_contracts_and_quality.py tests/test_note_provider_compatibility.py tests/test_note_acceptance_and_prompt_safety.py -q
 python -m pytest tests/test_notes.py tests/test_note_evidence.py tests/test_bot.py -q
-python -m pytest tests/test_learning.py tests/test_document_ingestion.py -q
+python -m pytest tests/test_learning.py tests/test_document_ingestion.py tests/test_document_model.py -q
 python -m pytest tests/test_llm_quota.py tests/test_concurrency_and_failover.py -q
 ```
 
@@ -62,7 +62,12 @@ to the spec.
 render-boundary structure checks, result-notification failure and the HTML
 sheet's delivery, failure isolation and owner scope (`ReviewSheetDeliveryTests`), while
 `tests/test_workflow_regressions.py` covers failed/restarted jobs with and
-without a persisted transcript.
+without a persisted transcript. `tests/test_document_model.py` covers the
+canonical pipeline representations: complete-source `NormalizedDocument`
+adapters (extraction, plain text, transcript), `ContentPlan` topic ordering,
+coverage and integrity checks, `StructuredSection` ordering and
+`StructuredNotes` compatibility, provenance traces from source unit to note
+section, JSON round trips and long-source non-truncation.
 
 Provider HTTP is mocked. The default test settings have **no LLM credential**;
 generation fixtures opt into scoped fake approved keys only when their I/O is
