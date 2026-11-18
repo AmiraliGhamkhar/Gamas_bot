@@ -3,9 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlparse
 
+from gamas_bot import texts
+from gamas_bot.billing import format_seconds_as_credits
+from gamas_bot.bot import GamasBot
 from gamas_bot.db import Database
 from gamas_bot.db_referrals import REFERRAL_JOIN_SECONDS, REFERRAL_PAYMENT_SECONDS
+from tests.support import FakeCallbackEvent, FakeTelegramClient, make_settings
 from tests.test_db_billing import DatabaseTestCase
 
 
@@ -195,3 +205,96 @@ class PaymentRewardTests(DatabaseTestCase):
         self.assertEqual(rows[1]["referrer_id"], 100)
         self.assertEqual(rows[1]["invited"], 1)
         self.assertEqual(rows[1]["seconds"], REFERRAL_JOIN_SECONDS + REFERRAL_PAYMENT_SECONDS)
+
+
+class ReferralScreenTests(unittest.IsolatedAsyncioTestCase):
+    """The referral screen must render with a real bot username attached.
+
+    Regression: the share button's URL carried the Persian share text raw
+    (spaces and all). That is not a valid URL, Telegram rejected the whole
+    inline keyboard with BUTTON_URL_INVALID, and — because the respond
+    fallback used the same buttons — pressing «دعوت دوستان» did nothing at
+    all. No test saw it because the fake client has no username, so the
+    share button was never built.
+    """
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(
+            db_path=root / "bot.sqlite3",
+            temp_dir=root / "tmp",
+            receipt_dir=root / "receipts",
+            session_path=root / "session",
+        )
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.client = FakeTelegramClient()
+        self.client.get_me = AsyncMock(
+            return_value=SimpleNamespace(username="GamasTestBot")
+        )
+        self.bot = GamasBot(self.settings, db=self.db, client=self.client)
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        self._tmp.cleanup()
+
+    async def test_referral_screen_renders_with_a_share_button(self):
+        event = FakeCallbackEvent(self.client, data=b"ref:home")
+        await self.bot._handle_callback(event)
+
+        self.assertTrue(event.edits, "the referral screen never rendered")
+        screen = event.edits[-1]
+        self.assertIn("دعوت دوستان", screen["text"])
+        url_buttons = [
+            button
+            for row in screen["buttons"]
+            for button in row
+            if getattr(getattr(button, "type", None), "url", None)
+            or getattr(button, "url", None)
+        ]
+        self.assertEqual(len(url_buttons), 1)
+        share_url = getattr(url_buttons[0], "url", None) or url_buttons[0].type.url
+        # A URL button must be plain ASCII: every non-ASCII byte and every
+        # space must be percent-encoded or Telegram rejects the keyboard.
+        self.assertTrue(share_url.isascii(), share_url)
+        self.assertNotIn(" ", share_url)
+        parsed = urlparse(share_url)
+        params = parse_qs(parsed.query)
+        self.assertEqual(parsed.path, "/share/url")
+        code = await self.db.ensure_referral_code(event.sender_id)
+        self.assertEqual(
+            params["url"], [f"https://t.me/GamasTestBot?start=ref_{code}"]
+        )
+        self.assertEqual(params["text"], [texts.REFERRAL_SHARE_TEXT])
+        self.assertIn(f"start=ref_{code}", screen["text"])
+
+    async def test_rules_and_reward_templates_do_not_double_the_unit(self):
+        rules = texts.REFERRALS_RULES.format(
+            signup_credits=format_seconds_as_credits(REFERRAL_JOIN_SECONDS),
+            purchase_credits=format_seconds_as_credits(REFERRAL_PAYMENT_SECONDS),
+        )
+        self.assertNotIn("اعتبار اعتبار", rules)
+        reward = texts.REFERRAL_JOIN_REWARD_TEMPLATE.format(
+            seconds=format_seconds_as_credits(REFERRAL_JOIN_SECONDS)
+        )
+        self.assertNotIn("اعتبار اعتبار", reward)
+
+    async def test_invalid_buttons_never_blank_the_screen(self):
+        class RejectingEvent(FakeCallbackEvent):
+            async def edit(self, text: str = "", buttons=None):
+                raise RuntimeError("BUTTON_URL_INVALID")
+
+            async def respond(self, *args, **kwargs):
+                if kwargs.get("buttons") is not None:
+                    raise RuntimeError("BUTTON_URL_INVALID")
+                return await super().respond(*args, **kwargs)
+
+        event = RejectingEvent(self.client, data=b"ref:home")
+        await self.bot._handle_callback(event)
+        delivered = [m for m in self.client.texts if "دعوت دوستان" in m.get("text", "")]
+        self.assertTrue(delivered, "no fallback delivery without buttons")
+
+
+if __name__ == "__main__":
+    unittest.main()

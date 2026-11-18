@@ -574,7 +574,19 @@ class GamasBot(
             try:
                 await event.respond(text, buttons=buttons)
             except Exception:
-                logger.warning("callback screen could not be delivered", exc_info=True)
+                # An invalid button (e.g. a malformed URL) rejects the edit and
+                # the buttoned respond with the same error; deliver the screen
+                # text on its own rather than leaving the user with nothing.
+                logger.debug(
+                    "buttoned response failed; retrying without buttons",
+                    exc_info=True,
+                )
+                try:
+                    await event.respond(text)
+                except Exception:
+                    logger.warning(
+                        "callback screen could not be delivered", exc_info=True
+                    )
 
     # ----------------------------------------------------------------- menus
     def _reply_keyboard(self, *, is_admin: bool) -> Any:

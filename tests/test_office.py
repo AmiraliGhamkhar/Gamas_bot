@@ -22,12 +22,19 @@ from gamas_bot.office import (
     OfficeError,
     OfficeSession,
     OfficeSlide,
+    SLIDE_CATEGORY_DATA,
+    SLIDE_CATEGORY_LIST,
+    SLIDE_CATEGORY_MIXED,
+    SLIDE_CATEGORY_PROSE,
+    SLIDE_CATEGORY_TABLE,
     build_office_document,
+    categorize_slide,
     classify_text_file,
     build_office_pptx,
     build_office_xlsx,
     fallback_slides,
     fallback_table,
+    fit_slide_parts,
     office_filename,
     office_title_from_filename,
     read_text_file,
@@ -51,6 +58,15 @@ SAMPLE = (
     "سارا\t25\tشیراز\n"
 )
 SIMPLE_DECK_SOURCE = "## بخش اول\nاین متن عیناً در سند می‌آید.\n"
+
+#: Thirty distinct digit-free words for long-list fixtures.
+_PERSIAN_WORDS = (
+    "یکم", "دوم", "سوم", "چهارم", "پنجم", "ششم", "هفتم", "هشتم", "نهم", "دهم",
+    "یازدهم", "دوازدهم", "سیزدهم", "چهاردهم", "پانزدهم", "شانزدهم", "هفدهم",
+    "هجدهم", "نوزدهم", "بیستم", "بیست‌ویکم", "بیست‌ودوم", "بیست‌وسوم",
+    "بیست‌وچهارم", "بیست‌وپنجم", "بیست‌وششم", "بیست‌وهفتم", "بیست‌وهشتم",
+    "بیست‌ونهم", "سی‌اُم",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +416,181 @@ class PowerPointDocumentTests(unittest.TestCase):
         self.assertTrue(any("این متن عیناً در سند می‌آید." in note for note in notes))
         self.assertTrue(any("نام | سن | شهر" in note for note in notes))
         self.assertTrue(any("علی | ۲۰ | تهران" in note for note in notes))
+
+
+class PowerPointCategorizationTests(unittest.TestCase):
+    """Every content slide is styled by the category of its own lines."""
+
+    def test_categorize_slide_reads_the_content_shape(self):
+        self.assertEqual(
+            categorize_slide(
+                OfficeSlide(title="t", bullets=("نام | سن", "علی | ۲۰", "سارا | ۲۵"))
+            ),
+            SLIDE_CATEGORY_TABLE,
+        )
+        self.assertEqual(
+            categorize_slide(
+                OfficeSlide(
+                    title="t",
+                    bullets=("رشد فروش ۲۵٪", "تعداد کاربران ۱۲۰۰", "میانگین امتیاز ۴٫۵"),
+                )
+            ),
+            SLIDE_CATEGORY_DATA,
+        )
+        self.assertEqual(
+            categorize_slide(
+                OfficeSlide(
+                    title="t", bullets=("نکته یک", "نکته دو", "نکته سه", "نکته چهار")
+                )
+            ),
+            SLIDE_CATEGORY_LIST,
+        )
+        self.assertEqual(
+            categorize_slide(
+                OfficeSlide(
+                    title="t",
+                    bullets=(
+                        "این یک جملهٔ طولانی توضیحی است که بیشتر از هفتاد نویسه دارد و برای توضیح مفهوم نوشته شده است.",
+                    ),
+                )
+            ),
+            SLIDE_CATEGORY_PROSE,
+        )
+        self.assertEqual(
+            categorize_slide(
+                OfficeSlide(
+                    title="t",
+                    bullets=(
+                        "این خط اول بسیار طولانی است و بیشتر از هفتاد نویسه دارد تا مطمئن شویم کوتاه محسوب نمی‌شود.",
+                        "این خط دوم بسیار طولانی است و بیشتر از هفتاد نویسه دارد تا مطمئن شویم کوتاه محسوب نمی‌شود.",
+                        "این خط سوم بسیار طولانی است و بیشتر از هفتاد نویسه دارد تا مطمئن شویم کوتاه محسوب نمی‌شود.",
+                        "خط کوتاه",
+                        "خط کوتاه دیگر",
+                    ),
+                )
+            ),
+            SLIDE_CATEGORY_MIXED,
+        )
+        self.assertEqual(
+            categorize_slide(OfficeSlide(title="t", bullets=())), SLIDE_CATEGORY_PROSE
+        )
+
+    def test_table_sections_render_a_real_powerpoint_table(self):
+        document = build_office_document(SAMPLE)
+        payload = build_office_pptx(document, fallback_slides(document))
+        presentation = Presentation(io.BytesIO(payload))
+        tables = [
+            shape.table
+            for slide in presentation.slides
+            for shape in slide.shapes
+            if getattr(shape, "has_table", False)
+        ]
+        self.assertEqual(len(tables), 1)
+        grid = [[cell.text for cell in row.cells] for row in tables[0].rows]
+        # The header row is styled, never rewritten: the user's words stay.
+        self.assertEqual(grid[0], ["نام", "سن", "شهر"])
+        self.assertIn(["علی", "۲۰", "تهران"], grid)
+        self.assertIn(["سارا", "25", "شیراز"], grid)
+
+    def test_content_slides_carry_badge_and_persian_counter(self):
+        document = build_office_document(SAMPLE)
+        payload = build_office_pptx(document, fallback_slides(document))
+        presentation = Presentation(io.BytesIO(payload))
+        content_slides = list(presentation.slides)[2:-1]
+        self.assertTrue(content_slides)
+        labels = {"فهرست نکات", "جدول داده", "متن توضیحی", "داده و آمار", "بخش"}
+        for slide in content_slides:
+            joined = "\n".join(
+                shape.text_frame.text
+                for shape in slide.shapes
+                if shape.has_text_frame
+            )
+            self.assertTrue(any(label in joined for label in labels), joined)
+            self.assertRegex(joined, r"[۰-۹]+ / [۰-۹]+")
+
+    def test_agenda_marks_each_section_with_its_category_colour(self):
+        document = build_office_document(SAMPLE)
+        payload = build_office_pptx(document, fallback_slides(document))
+        agenda = list(Presentation(io.BytesIO(payload)).slides)[1]
+        colors = []
+        for shape in agenda.shapes:
+            if not shape.has_text_frame:
+                continue
+            for paragraph in shape.text_frame.paragraphs:
+                for run in paragraph.runs:
+                    if run.text.strip() == "●":
+                        colors.append(str(run.font.color.rgb))
+        # SAMPLE has two sections of two different categories (prose, table).
+        self.assertEqual(len(colors), 2)
+        self.assertNotEqual(colors[0], colors[1])
+
+
+class UnlimitedDeckTests(unittest.TestCase):
+    """Decks grow with the text; an explicit cap is still honoured."""
+
+    def _many_section_document(self, sections: int = 45):
+        text = "\n".join(
+            f"## بخش {index}\nنکتهٔ نخست بخش {index}\nنکتهٔ دوم بخش {index}"
+            for index in range(1, sections + 1)
+        )
+        return build_office_document(text)
+
+    def test_fallback_slides_have_no_cap_by_default(self):
+        document = self._many_section_document(45)
+        slides = fallback_slides(document)  # must not raise
+        self.assertEqual(len(slides), 45)
+        self.assertGreater(len(slides), 40)  # beyond the historical default cap
+
+    def test_build_pptx_has_no_cap_by_default(self):
+        document = self._many_section_document(45)
+        slides = fallback_slides(document)
+        payload = build_office_pptx(document, slides)
+        presentation = Presentation(io.BytesIO(payload))
+        self.assertEqual(len(presentation.slides), 45 + 3)
+
+    def test_explicit_cap_is_still_honoured(self):
+        document = self._many_section_document(10)
+        slides = fallback_slides(document)
+        with self.assertRaises(OfficeError):
+            build_office_pptx(document, slides, max_slides=10)
+        payload = build_office_pptx(document, slides[:5], max_slides=8)
+        self.assertEqual(len(Presentation(io.BytesIO(payload)).slides), 8)
+
+    def test_fallback_still_honours_an_explicit_cap(self):
+        document = self._many_section_document(10)
+        with self.assertRaises(OfficeError):
+            fallback_slides(document, max_slides=3)
+        self.assertEqual(len(fallback_slides(document, max_slides=10)), 10)
+
+    def test_overfull_sections_split_into_continuation_slides(self):
+        # No digits, no grid separators: a pure bulleted list section.
+        bullets = tuple(f"نکتهٔ آموزشی فهرست بلند — مورد {word}" for word in _PERSIAN_WORDS)
+        slide = OfficeSlide(title="فهرست بلند", bullets=bullets)
+        self.assertEqual(categorize_slide(slide), SLIDE_CATEGORY_LIST)
+        parts = fit_slide_parts(slide, SLIDE_CATEGORY_LIST)
+        self.assertGreater(len(parts), 1)
+        self.assertEqual(parts[1].title, "فهرست بلند (ادامه)")
+        kept = [line for part in parts for line in part.bullets]
+        self.assertEqual(kept, list(bullets))  # nothing lost, order preserved
+
+    def test_table_header_repeats_on_continuation_slides(self):
+        rows = ["نام | امتیاز"] + [f"ردیف {index} | {index}" for index in range(1, 25)]
+        slide = OfficeSlide(title="جدول", bullets=tuple(rows))
+        parts = fit_slide_parts(slide, SLIDE_CATEGORY_TABLE)
+        self.assertEqual(len(parts), 3)  # 24 data rows, 9 per slide
+        for part in parts:
+            self.assertEqual(part.bullets[0], "نام | امتیاز")
+
+    def test_progress_hook_reports_each_content_slide(self):
+        document = self._many_section_document(6)
+        slides = fallback_slides(document)
+        calls = []
+        build_office_pptx(
+            document, slides, on_progress=lambda done, total: calls.append((done, total))
+        )
+        self.assertEqual(calls[0], (0, 6))
+        self.assertEqual(calls[-1], (6, 6))
+        self.assertEqual(len(calls), 7)
 
 
 class ControlCharacterTests(unittest.TestCase):

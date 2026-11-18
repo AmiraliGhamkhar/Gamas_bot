@@ -94,7 +94,9 @@ TABLE_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-#: Bounds on what a model may answer with.
+#: Bounds on what a model may answer with. ``MAX_SECTIONS`` is no longer a
+#: default cap — decks are unlimited unless the caller passes ``max_sections``
+#: — it only documents the historical default for existing imports.
 MAX_SECTIONS = 40
 MAX_LINES_PER_SECTION = 30
 MAX_SECTION_TITLE_CHARS = 120
@@ -257,10 +259,16 @@ def _chunk_long_text(text: str, max_chars: int = MAX_DECK_CHUNK_CHARS) -> list[s
     return [c for c in result if c.strip()]
 
 
-def _slide_sections(payload: dict) -> list[tuple[str, list[str]]]:
-    """The ``(title, lines)`` pairs of a slide plan payload."""
+def _slide_sections(payload: dict, max_sections: int | None = None) -> list[tuple[str, list[str]]]:
+    """The ``(title, lines)`` pairs of a slide plan payload.
+
+    ``max_sections=None`` accepts as many sections as the model proposed;
+    the per-section line bound still applies so one answer stays reviewable.
+    """
     raw = payload.get("sections")
-    if not isinstance(raw, (list, tuple)) or len(raw) > MAX_SECTIONS:
+    if not isinstance(raw, (list, tuple)) or (
+        max_sections is not None and len(raw) > max_sections
+    ):
         return []
     if any(
         isinstance(entry, dict)
@@ -320,16 +328,23 @@ async def plan_deck(
     *,
     settings: Settings,
     session: Any,
-    max_sections: int = MAX_SECTIONS,
+    max_sections: int | None = None,
 ) -> list[OfficeSlide] | None:
     """Ask the model for the slide order of ``text``.
 
     Returns ``None`` when there is no model, when the request failed, or when
     the answer did not survive validation — in every case the caller falls
-    back to the user's own headings.
+    back to the user's own headings. ``max_sections=None`` (the default)
+    means the deck is not capped: it grows with the source text.
     """
     if not settings.note_configured:
         return None
+
+    sections_hint = (
+        f"حداکثر {max_sections} بخش."
+        if max_sections is not None
+        else "به ازای هر بخش معنادارِ متن یک بخش بساز؛ سقفی برای تعداد بخش‌ها نیست."
+    )
 
     async def _process_chunk(chunk_text: str) -> list[OfficeSlide] | None:
         user_prompt = (
@@ -339,7 +354,7 @@ async def plan_deck(
             "</text>\n\n"
             "خروجی JSON با این ساختار برگردان:\n"
             '{"sections": [{"title": "عنوان بخش", "lines": ["سطر اول", "سطر دوم"]}]}\n'
-            f"حداکثر {max_sections} بخش."
+            f"{sections_hint}"
         )
         try:
             payload = await complete_json(
@@ -356,7 +371,7 @@ async def plan_deck(
                 type(exc).__name__,
             )
             return None
-        sections = _slide_sections(payload)
+        sections = _slide_sections(payload, max_sections)
         if not sections:
             return None
         proposed = sum(len(lines) for _title, lines in sections)
@@ -384,7 +399,9 @@ async def plan_deck(
             > MAX_DROPPED_LINE_RATIO
         ):
             return None
-        return chunk_slides if len(chunk_slides) <= max_sections else None
+        if max_sections is not None and len(chunk_slides) > max_sections:
+            return None
+        return chunk_slides
 
     # For very long messages or .txt / .markdown uploads, split at headings
     # so the model never receives more context than it can handle.
@@ -417,7 +434,7 @@ async def plan_deck(
                 )
             else:
                 ordered.append(slide)
-        if len(ordered) > max_sections:
+        if max_sections is not None and len(ordered) > max_sections:
             return None
         if not _plan_covers_source(text, ordered):
             logger.warning("office deck plan dropped source lines; using the complete deterministic fallback")
