@@ -2,7 +2,6 @@ from types import SimpleNamespace
 
 from gamas_bot.llm import (
     _ordered_routes,
-    _sensitivity_eligible_routes,
     _task_ordered_routes,
 )
 from gamas_bot.config import APPROVED_LLM_PROVIDERS, NOTE_PROVIDER_SLUGS
@@ -30,18 +29,6 @@ def test_task_routes_ignore_global_order():
         "avalai", "gemini", "openrouter"
     ]
 
-
-def test_unknown_data_never_routes_to_openrouter_and_sensitive_needs_approval():
-    available = routes("avalai", "gemini", "openrouter")
-    settings = SimpleNamespace(
-        avalai_allow_sensitive_data=False,
-        gemini_free_allow_sensitive_data=False,
-        openrouter_free_allow_sensitive_data=False,
-    )
-    assert [r.slug for r in _sensitivity_eligible_routes(available, settings, "UNKNOWN")] == [
-        "avalai", "gemini"
-    ]
-    assert _sensitivity_eligible_routes(available, settings, "PHI_OR_PII") == ()
 
 
 def test_reference_model_profiles_keep_context_and_output_distinct():

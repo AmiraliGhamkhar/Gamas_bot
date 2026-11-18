@@ -144,7 +144,7 @@ class ApprovedRoutingEntryPointTests(unittest.IsolatedAsyncioTestCase):
         values.update(overrides)
         return make_settings(**values)
 
-    async def assert_route_order(self, entry, expected, *, task="", prefer="", sensitivity="STANDARD_EDUCATIONAL", **overrides):
+    async def assert_route_order(self, entry, expected, *, task="", prefer="", **overrides):
         settings = self.settings(**overrides)
         text = '{"ok": true}'
         if expected[-1] == "gemini":
@@ -156,14 +156,14 @@ class ApprovedRoutingEntryPointTests(unittest.IsolatedAsyncioTestCase):
             for _ in expected[:-1]
         ] + [_FakeHTTPResponse(200, json_body=answer)]
         session = _FakeHTTPSession(responses)
-        kwargs = {"system": "Synthetic instruction", "user": "Synthetic lesson", "task": task, "data_sensitivity": sensitivity}
+        kwargs = {"system": "Synthetic instruction", "user": "Synthetic lesson", "task": task}
         if entry == "complete_json":
             kwargs["prefer_provider"] = prefer
         result = await getattr(llm, entry)(session, settings, **kwargs)
         self.assertEqual(result, {"ok": True} if entry == "complete_json" else text)
         self.assertEqual([self.HOSTS[urlsplit(c["url"]).hostname] for c in session.calls], list(expected))
         # Each endpoint gets only its own credential; the removed slot's key
-        # cannot leak through either preference or classification.
+        # cannot leak through provider preferences or routing.
         for call in session.calls:
             slug = self.HOSTS[urlsplit(call["url"]).hostname]
             headers = call["headers"]
@@ -198,27 +198,14 @@ class ApprovedRoutingEntryPointTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_route_order("complete_json", ("avalai", "gemini", "openrouter"), prefer="avalai")
         await self.assert_route_order("complete", ("gemini", "avalai", "openrouter"))
 
-    async def test_unknown_content_never_uses_openrouter_even_with_sensitive_opt_in(self):
+    async def test_all_configured_routes_remain_eligible_for_content(self):
         for entry in ("complete", "complete_json"):
-            for label in ("UNKNOWN", "unrecognized-label"):
-                with self.subTest(entry=entry, sensitivity=label):
-                    await self.assert_route_order(
-                        entry, ("gemini", "avalai"), sensitivity=label, prefer="openrouter",
-                        openrouter_free_allow_sensitive_data=True,
-                    )
-
-    async def test_sensitive_content_requires_individual_provider_approval(self):
-        flags = {"avalai": "avalai_allow_sensitive_data", "gemini": "gemini_free_allow_sensitive_data",
-                 "openrouter": "openrouter_free_allow_sensitive_data"}
-        for entry in ("complete", "complete_json"):
-            for label in ("INTERNAL", "SENSITIVE", "PHI_OR_PII"):
-                session = _FakeHTTPSession([])
-                with self.subTest(entry=entry, label=label, approved="none"), self.assertRaises(llm.LLMAuthError):
-                    await getattr(llm, entry)(session, self.settings(), system="S", user="Synthetic lesson", data_sensitivity=label)
-                self.assertEqual(session.calls, [])
-                for provider, flag in flags.items():
-                    with self.subTest(entry=entry, label=label, approved=provider):
-                        await self.assert_route_order(entry, (provider,), sensitivity=label, **{flag: True})
+            with self.subTest(entry=entry):
+                await self.assert_route_order(
+                    entry,
+                    ("avalai", "gemini", "openrouter"),
+                    task="BOOKLET_GENERATION",
+                )
 
     async def test_removed_programmatic_slots_cannot_build_or_send_requests(self):
         for slug in ("nara", "deepseek", "groq", "cerebras", "anthropic", "openai_compatible"):
@@ -771,9 +758,9 @@ class LearningRobustnessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(bot._learning_max_chars(), 56_000)
                 calls: list[dict] = []
 
-                async def fake_complete_json(_session, _settings, *, system, user, schema=None, max_output_tokens=None, wait_for_capacity=True, task="", data_sensitivity=""):
+                async def fake_complete_json(_session, _settings, *, system, user, schema=None, max_output_tokens=None, wait_for_capacity=True, task=""):
                     batch_no = len(calls)
-                    calls.append({"system": system, "user": user, "schema": schema, "task": task, "data_sensitivity": data_sensitivity})
+                    calls.append({"system": system, "user": user, "schema": schema, "task": task})
                     start = batch_no * 10
                     return {
                         "cards": [

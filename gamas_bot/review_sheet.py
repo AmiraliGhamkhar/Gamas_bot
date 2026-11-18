@@ -8,7 +8,7 @@ organises the *validated* booklet for a timed revision session:
   stable reference (``s2.b3`` = section 2, bullet 3). The model receives these
   references, never raw HTML, and selects/organises them.
 * The planning model (one call per booklet, through the existing provider
-  routing and sensitivity policy) returns JSON that refers to those units and
+  routing) returns JSON that refers to those units and
   adds the generated study material: section roles, exam traps, self-test
   questions and comparison pairs.
 * :func:`parse_review_plan` is the deterministic gate. Unknown references are
@@ -42,7 +42,6 @@ from .notes import (
     QUALITY_VERIFIED,
     NoteSection,
     StructuredNotes,
-    resolve_note_sensitivity,
 )
 from .notes_evidence import content_words
 from .textnorm import normalize_digits
@@ -656,9 +655,6 @@ async def plan_review_sheet(
     if len(document) > MAX_PLANNING_CHARS:
         logger.info("review plan skipped: booklet too large for one planning request")
         return None
-    sensitivity = resolve_note_sensitivity(
-        settings, "\n".join(unit.text for unit in units)
-    )
     schema = (
         review_plan_response_schema()
         if getattr(settings, "note_structured_output", False)
@@ -671,7 +667,6 @@ async def plan_review_sheet(
         user=document,
         schema=schema,
         task=REVIEW_PLAN_TASK,
-        data_sensitivity=sensitivity,
         sampling_temperature=0.1,
     )
     return parse_review_plan(payload, notes, duration_minutes=duration_minutes)

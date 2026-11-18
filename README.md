@@ -55,14 +55,16 @@ generation is restricted to **AvalAI** (`deepseek-v4.1-flash`), **Gemini**
 (`nvidia/nemotron-3.5-super-vl:free`). The default available chain is
 `avalai,gemini,openrouter`; booklet work and large/difficult quizzes prefer
 AvalAI, while smaller learning and Office tasks prefer Gemini. OpenRouter is
-always the last fallback, never promoted by preferences, and is excluded for
-unclassified (`UNKNOWN`) content. Missing credentials skip a route; stale
-removed-provider settings are ignored safely without logging their values.
-Each booklet's source is classified once (`NOTE_DATA_SENSITIVITY`, `auto` by
-default and failing closed to `UNKNOWN`) and that label is reused for repair and
-compilation. A booklet that still contains numbers or terms the transcript never
-said is rejected by a deterministic final gate: the user keeps the transcript
-and the submission is reported as `partial`, never as a delivered booklet.
+always the last fallback, never promoted by preferences. Every configured,
+approved route may receive educational source text; task-specific ordering and
+provider failover determine the attempt chain. Missing credentials skip a route;
+stale removed-provider settings are ignored safely without logging their values.
+Configured technical credentials and credential-shaped values are removed at
+the prompt boundary; ordinary educational source text is not sensitivity-filtered
+or de-identified. A booklet that still contains numbers or terms the transcript
+never said is rejected by a deterministic final gate: the user keeps the
+transcript and the submission is reported as `partial`, never as a delivered
+booklet.
 
 Operating defaults remain 131,072 context tokens, 64,000 characters per chunk
 and 16,384 output tokens, with `NOTE_COMPILE=false` and no hedged requests.

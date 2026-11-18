@@ -77,7 +77,6 @@ from .learning_html import (
     render_quiz_html,
 )
 from .llm import LLMContextOverflowError, LLMOutputBudgetError
-from .notes import SENSITIVITY_UNKNOWN, resolve_note_sensitivity
 from .progress import (
     WORK_PROGRESS_HEADLINE,
     WorkProgress,
@@ -97,15 +96,6 @@ if TYPE_CHECKING:
     from .bot_deps import BotDependencies
 
 logger = logging.getLogger("gamas_bot.bot.learning")
-
-
-def _resolve_learning_sensitivity(
-    settings: Any, sensitivity_text: object, chunks: list[DocChunk]
-) -> str:
-    """Build one source view and classify it without logging source material."""
-    if not isinstance(sensitivity_text, str) or not sensitivity_text.strip():
-        sensitivity_text = "\n".join(str(chunk.text) for chunk in chunks)
-    return resolve_note_sensitivity(settings, sensitivity_text)
 
 
 def _log_quiz_dedupe_diagnostics(
@@ -224,7 +214,6 @@ class LearningWorkflowMixin:
                 str(document.get("title") or ""), fallback=FALLBACK_DOCUMENT
             ),
             "chunks": chunks,
-            "sensitivity_text": str(document.get("text") or ""),
         }
 
     async def _claim_generation_budget(
@@ -364,7 +353,6 @@ class LearningWorkflowMixin:
         placeholder: Any,
         stage: str = "در حال تولید محتوا",
         requested_count: int | None = None,
-        data_sensitivity: str = SENSITIVITY_UNKNOWN,
     ) -> tuple[list[dict[str, Any]], int]:
         job_requested_count = max(
             1,
@@ -408,7 +396,6 @@ class LearningWorkflowMixin:
                     return
                 await progress_changed.wait()
 
-        max_input_chars = self._learning_max_chars()
         dedupe = dedupe_cards if kind == "deck" else dedupe_questions
         stem_key = "front" if kind == "deck" else "question"
 
@@ -417,7 +404,6 @@ class LearningWorkflowMixin:
             target_count: int,
             *,
             chunk_idx: int,
-            split_depth: int = 0,
             prior_items: list[dict[str, Any]] | None = None,
         ) -> list[dict[str, Any]]:
             allowed = tuple(
@@ -449,8 +435,12 @@ class LearningWorkflowMixin:
                     if kind == "deck"
                     else quiz_system_prompt(batch, sources=allowed)
                 )
+                # ``target_chunk`` is already semantically bounded by the
+                # learning chunker. Never slice source text here: if an unusual
+                # caller supplies an oversized chunk, the provider's actual
+                # overflow signal triggers the split-and-process recovery below.
                 user_prompt = learning_user_prompt(
-                    kind, batch, allowed, target_chunk.text[:max_input_chars]
+                    kind, batch, allowed, target_chunk.text
                 )
                 if had_shortfall:
                     user_prompt += (
@@ -477,7 +467,6 @@ class LearningWorkflowMixin:
                         user=user_prompt,
                         schema=schema,
                         task=job_task,
-                        data_sensitivity=data_sensitivity,
                         max_output_tokens=min(
                             int(self.settings.learning_max_output_tokens),
                             (2000 if batch <= 10 else 4000)
@@ -533,7 +522,7 @@ class LearningWorkflowMixin:
                 except asyncio.CancelledError:
                     raise
                 except (LLMContextOverflowError, LLMOutputBudgetError):
-                    if split_depth < 2 and len(target_chunk.text) >= 1_600:
+                    if len(target_chunk.text) >= 1_600:
                         sub_raw = await run_file_io(
                             chunk_text,
                             target_chunk.text,
@@ -550,13 +539,28 @@ class LearningWorkflowMixin:
                                 )
                                 for idx, sc in enumerate(sub_raw)
                             ]
-                            sub_counts = distribute_counts(
-                                missing,
-                                [
-                                    topic_importance_weight(sc.text)
-                                    for sc in sub_chunks
-                                ],
+                            # Even a one-item request must map every source
+                            # part after an overflow. The generic distributor
+                            # concentrates small totals on a few chunks, so
+                            # guarantee one candidate per part first and only
+                            # distribute the slack by topic weight; the final
+                            # merge/dedupe retains just the requested number.
+                            sub_weights = [
+                                topic_importance_weight(sc.text)
+                                for sc in sub_chunks
+                            ]
+                            sub_counts = [1] * len(sub_chunks)
+                            remainder = max(missing, len(sub_chunks)) - len(
+                                sub_chunks
                             )
+                            if remainder > 0:
+                                extras = distribute_counts(remainder, sub_weights)
+                                sub_counts = [
+                                    base + extra
+                                    for base, extra in zip(
+                                        sub_counts, extras, strict=True
+                                    )
+                                ]
                             for sc, sc_count in zip(
                                 sub_chunks, sub_counts, strict=True
                             ):
@@ -566,7 +570,6 @@ class LearningWorkflowMixin:
                                     sc,
                                     sc_count,
                                     chunk_idx=chunk_idx,
-                                    split_depth=split_depth + 1,
                                     prior_items=prior_items,
                                 )
                                 items = (
@@ -664,24 +667,6 @@ class LearningWorkflowMixin:
             await event.respond("متنی برای ساخت محتوا پیدا نشد. فایل دیگری بفرستید.")
             return
         requested_count = max(1, int(wanted))
-        data_sensitivity = await run_file_io(
-            _resolve_learning_sensitivity,
-            self.settings,
-            source.get("sensitivity_text"),
-            source["chunks"],
-        )
-        logger.info(
-            "learning source sensitivity resolved kind=%s sensitivity=%s chunks=%d",
-            kind,
-            data_sensitivity,
-            len(chunks),
-            extra={
-                "event": "learning_source_sensitivity",
-                "learning_kind": kind,
-                "sensitivity": data_sensitivity,
-                "chunk_count": len(chunks),
-            },
-        )
         await self._ack(event)
         budget_task = asyncio.create_task(
             self._claim_generation_budget(event, user_id, kind, cost, note)
@@ -739,7 +724,6 @@ class LearningWorkflowMixin:
                     placeholder=progress,
                     stage=texts.LEARNING_PRODUCING.format(label=label),
                     requested_count=requested_count,
-                    data_sensitivity=data_sensitivity,
                 )
             generated_count = len(items)
             items = await run_file_io(
@@ -1151,7 +1135,6 @@ class LearningWorkflowMixin:
                 "doc_id": None,
                 "title": self._item_display_title(item),
                 "chunks": await run_file_io(self._learning_chunks, content),
-                "sensitivity_text": content,
             },
             wanted=int(count),
             cost=int(count) * self.settings.quiz_cost_seconds_per_question,
@@ -1346,7 +1329,6 @@ class LearningWorkflowMixin:
                 "doc_id": None,
                 "title": item_title,
                 "chunks": await run_file_io(self._learning_chunks, content),
-                "sensitivity_text": content,
             },
             wanted=size,
             cost=cost,

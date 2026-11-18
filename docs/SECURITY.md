@@ -16,7 +16,7 @@
 | Data | Where |
 | --- | --- |
 | Audio/video | The configured STT chain (Speechmatics, Deepgram and/or an OpenAI-compatible transcription API) |
-| Transcript text for booklets, AI quizzes and AI flashcards | Approved note-generation routes only: Gemini and AvalAI; OpenRouter is a fallback only when sensitivity policy permits it |
+| Transcript text for booklets, AI quizzes and AI flashcards | Configured approved note-generation routes in task-specific order; OpenRouter remains the last fallback |
 | Transcripts, notes, billing, tickets | Local SQLite (`data/gamas_v3.db` by default; configurable with `DB_PATH`) |
 | Media-submission booklet PDF, DOCX and review HTML | Validated bytes stored in SQLite and sent to Telegram on request |
 | Library | References to delivered Telegram files; document text may also be cached locally |
@@ -27,16 +27,15 @@ the same audio or text to the next configured route. Model IDs and the code-
 default chains are listed in [Providers](PROVIDERS.md); they do not identify a
 live server's actual configuration.
 
-Unclassified (`UNKNOWN`) text never goes to OpenRouter. Explicit `INTERNAL`,
-`SENSITIVE` and `PHI_OR_PII` labels require per-provider approval; all three
-opt-ins default to false. `STANDARD_EDUCATIONAL` is an explicit caller assertion,
-not an automatic classification of uploaded content. Gemini/AvalAI eligibility
-for `UNKNOWN` is not proof of consent or suitability for patient data. Legacy
-provider variables do not activate additional routes.
-
-Review each provider's current terms and get the consent your jurisdiction
-requires before processing sensitive material. No third-party deletion or
-confidentiality guarantee is made by this project.
+There is no document-content classifier that filters names, identifiers, case
+narratives or other educational source text from the configured provider chain.
+Prompt construction strips configured technical credentials, secret-named
+environment values, common API/bearer/Telegram token patterns, and explicitly
+labelled password/key/secret assignments; it does not de-identify user content.
+A provider failure can send the same sanitized prompt to the next configured
+route. Review each provider's current terms and obtain any consent your
+jurisdiction requires. No third-party deletion or confidentiality guarantee is
+made by this project.
 
 ## Controls that are already in place
 
@@ -48,10 +47,13 @@ confidentiality guarantee is made by this project.
   storage; paths are validated before reads and deletions.
 - Media runs with fixed arguments, no shell and bounded child processes; document
   parsing uses bounded threads (no OS-level memory sandbox).
-- Uploads, source text, drafts, response bodies, timeouts and outputs are all
-  bounded; overflow is refused, never truncated.
+- Uploads, source text, drafts, response bodies, timeouts and outputs have
+  explicit resource bounds. Educational source is not silently truncated for
+  model context: context overflow is semantically split and every part is
+  processed/merged, or the operation fails visibly.
 - Logs contain metadata and references only, and are redacted against configured
-  secrets. Never add transcript text or receipts to a log.
+  secrets. LLM prompts also strip technical credential values at the request
+  boundary. Never add transcript text or receipts to a log.
 
 ## Reporting
 

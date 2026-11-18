@@ -478,10 +478,8 @@ class LLMCapacityAndFailoverTests(unittest.IsolatedAsyncioTestCase):
                 ),
             }
         )
-        # Unclassified booklet content is UNKNOWN sensitivity: the fail-closed
-        # policy excludes OpenRouter Free from it. Overflow must therefore pick
-        # the *next eligible* provider — Gemini on the default chain
-        # (avalai/gemini/openrouter).
+        # Booklet task priority is AvalAI -> Gemini -> OpenRouter. An overflow
+        # fails over to the next provider in that configured order.
         settings = _dual_llm_settings(
             note_providers=("avalai", "gemini", "openrouter"),
             gemini_api_key="g-key",
@@ -547,7 +545,6 @@ class LLMCapacityAndFailoverTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("asyncio.sleep", new=record_sleep):
             answer = await llm.complete(
                 session, settings, system="S", user="U",
-                data_sensitivity="STANDARD_EDUCATIONAL",
             )
         self.assertEqual(answer, "پاسخ فوری پشتیبان")
         # Zero local sleep despite Retry-After: 45 header because fallback route existed!

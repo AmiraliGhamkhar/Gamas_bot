@@ -79,7 +79,6 @@ failure. Their keys are never lent to an approved provider.
 | `GEMINI_RPM_LIMIT` / `GEMINI_TPM_LIMIT` / `GEMINI_RPD_LIMIT` / `GEMINI_MAX_IN_FLIGHT` | 0 / 0 / 0 / 1 |
 | `NOTE_STRUCTURED_OUTPUT` / `NOTE_STRICT_GROUNDING` / `NOTE_QUALITY_GATE` | 1 / false / repair |
 | `NOTE_PDF_ENGINE` | typst |
-| `NOTE_DATA_SENSITIVITY` | auto |
 | `NOTE_MAX_REPAIR_ATTEMPTS` / `NOTE_ENABLE_DETERMINISTIC_FALLBACK` | 2 / true |
 | `NOTE_COMPILE` / `NOTE_PROGRESSIVE_BOOKLET` | false / false |
 | `NOTE_HEDGE_AFTER_SECONDS` | 0 (legacy knob; dispatch never hedges even if nonzero) |
@@ -108,35 +107,11 @@ while `NOTE_STRICT_GROUNDING=true`.
 ## Interactive HTML review sheet
 
 The review sheet adds **no environment variables**. It reuses the note-provider
-settings (`NOTE_*`, the provider chain and the allowlists) and the same
-`NOTE_DATA_SENSITIVITY` decision as the booklet, and its one planning call
-follows the same timeouts and failover. Its 30-minute duration is a default of
-the renderer and planner API, not a deployment setting.
+settings (`NOTE_*`, the provider chain and the allowlists), and its one planning
+call follows the same timeouts and provider failover. Its 30-minute duration is
+a default of the renderer and planner API, not a deployment setting.
 
-## Sensitivity and validation
-
-`NOTE_DATA_SENSITIVITY` decides who may see a booklet's source. `auto` (the
-default) classifies each submission once, before any provider call, and is an
-identifier heuristic rather than de-identification: a source naming a
-patient/file number, national ID, mobile number or e-mail, or reading like a
-case narrative (`شرح حال`, `بستری شد`, `case report`), is treated as `UNKNOWN`
-rather than assumed safe, and a named person after an honorific becomes
-`SENSITIVE`, which no provider may receive without its approval flag.
-`standard_educational`, `internal`, `sensitive` and `phi_or_pii` are explicit
-operator declarations for material that was reviewed; an unusable value falls
-back to `auto` instead of failing startup. The resolved label is
-passed to booklet generation, repair, coverage fill and **every** compile
-request (single, grouped and the second-level merge), so one booklet never mixes
-policies, and it is logged once per request. Restart after changing it —
-settings are read at startup.
-
-Unclassified calls default to `UNKNOWN` and cannot use OpenRouter. `INTERNAL`,
-`SENSITIVE` and `PHI_OR_PII` require the corresponding
-`AVALAI_ALLOW_SENSITIVE_DATA`, `GEMINI_FREE_ALLOW_SENSITIVE_DATA` or
-`OPENROUTER_FREE_ALLOW_SENSITIVE_DATA` setting (all false by default). An
-OpenRouter opt-in still does not admit `UNKNOWN`. Only mark reviewed, synthetic
-or otherwise justified material `STANDARD_EDUCATIONAL`; the task name alone
-never supplies that assertion.
+## Learning validation
 
 Generated quizzes require a nonempty source and valid `medium`/`hard`
 difficulty by default, matching `QUIZ_SCHEMA` and the strict learning caller.

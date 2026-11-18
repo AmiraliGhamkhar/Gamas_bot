@@ -1046,7 +1046,6 @@ class AvalaiRouterContractTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession([truncated_answer('{"title": "cu'), chat_answer('{"ok": true}')])
         result = await complete_json(
             session, routed_settings(), system="S", user="Synthetic lesson",
-            data_sensitivity="STANDARD_EDUCATIONAL",
         )
         self.assertEqual(result, {"ok": True})
         self.assertEqual([c["url"] for c in session.calls], [
@@ -1059,7 +1058,6 @@ class AvalaiRouterContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(LLMOutputBudgetError) as caught:
             await complete_json(
                 session, routed_settings(), system="S", user="Synthetic lesson",
-                data_sensitivity="STANDARD_EDUCATIONAL",
             )
         self.assertEqual(len(session.calls), 2)
         self.assertIn("AvalAI", str(caught.exception))
@@ -1070,7 +1068,6 @@ class AvalaiRouterContractTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession([chat_answer("   "), chat_answer('{"ok": true}')])
         result = await complete_json(
             session, routed_settings(), system="S", user="Synthetic lesson",
-            data_sensitivity="STANDARD_EDUCATIONAL",
         )
         self.assertEqual(result, {"ok": True})
         self.assertEqual([c["url"] for c in session.calls], [
@@ -1084,7 +1081,7 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_avalai_answers_first_with_its_own_documented_request(self):
         session = FakeSession([chat_answer("avalai-answer")])
-        result = await complete(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+        result = await complete(session, routed_settings(), system="S", user="U")
         self.assertEqual(result, "avalai-answer")
         self.assertEqual(len(session.calls), 1)
         call = session.calls[0]
@@ -1097,7 +1094,7 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
             FakeResponse(401, {"error": {"message": "invalid api key"}}),
             chat_answer("openrouter-answer"),
         ])
-        result = await complete(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+        result = await complete(session, routed_settings(), system="S", user="U")
         self.assertEqual(result, "openrouter-answer")
         self.assertEqual(len(session.calls), 2)
         self.assertEqual(
@@ -1107,14 +1104,14 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_context_overflow_fails_over_to_the_next_provider(self):
         session = FakeSession([context_overflow(), chat_answer("smaller")])
-        result = await complete(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+        result = await complete(session, routed_settings(), system="S", user="U")
         self.assertEqual(result, "smaller")
         self.assertEqual(len(session.calls), 2)
 
     async def test_every_provider_failing_keeps_the_first_error_class(self):
         session = FakeSession([context_overflow(), context_overflow()])
         with self.assertRaises(LLMContextOverflowError) as caught:
-            await complete(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+            await complete(session, routed_settings(), system="S", user="U")
         message = str(caught.exception)
         self.assertIn("AvalAI", message)
         self.assertIn("OpenRouter", message)
@@ -1125,7 +1122,7 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_transient_failure_is_retried_on_the_same_provider(self):
         session = FakeSession([FakeResponse(503, {}), chat_answer("recovered")])
         with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
-            result = await complete(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+            result = await complete(session, routed_settings(), system="S", user="U")
         self.assertEqual(result, "recovered")
         self.assertEqual(
             [call["url"] for call in session.calls],
@@ -1137,7 +1134,7 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
         bad = FakeResponse(400, {"error": {"message": "unsupported parameter"}})
         session = FakeSession([bad, FakeResponse(400, {"error": {"message": "unsupported parameter"}})])
         with self.assertRaises(LLMResponseError):
-            await complete(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+            await complete(session, routed_settings(), system="S", user="U")
         self.assertEqual(len(session.calls), 2)
         self.assertEqual(
             [call["url"] for call in session.calls],
@@ -1156,7 +1153,7 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
         """
         session = FakeSession([asyncio.TimeoutError(), chat_answer("second-answer")])
         with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
-            result = await complete(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+            result = await complete(session, routed_settings(), system="S", user="U")
         self.assertEqual(result, "second-answer")
         self.assertEqual(
             [call["url"] for call in session.calls],
@@ -1171,7 +1168,7 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession([asyncio.TimeoutError(), chat_answer("late-answer")])
         with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
             result = await complete(
-                session, routed_settings(note_providers=("avalai",)), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL",
+                session, routed_settings(note_providers=("avalai",)), system="S", user="U",
             )
         self.assertEqual(result, "late-answer")
         self.assertEqual(len(session.calls), 2)
@@ -1195,13 +1192,13 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_configured_deadline_is_used_for_the_request(self):
         session = FakeSession([chat_answer("answer")])
         settings = routed_settings(note_request_timeout=900.0)
-        await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+        await complete(session, settings, system="S", user="U")
         self.assertEqual(session.calls[0]["timeout"].total, 900.0)
 
     async def test_a_settings_object_without_a_deadline_uses_the_fallback(self):
         session = FakeSession([chat_answer("answer")])
         settings = routed_settings(note_request_timeout=0.0)
-        await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+        await complete(session, settings, system="S", user="U")
         self.assertEqual(
             session.calls[0]["timeout"].total, llm.LLM_REQUEST_TIMEOUT_SECONDS
         )
@@ -1210,7 +1207,6 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession([asyncio.TimeoutError(), chat_answer('{"ok": true}')])
         payload = await complete_json(
             session, routed_settings(), system="S", user="U",
-            data_sensitivity="STANDARD_EDUCATIONAL",
         )
         self.assertEqual(payload, {"ok": True})
         self.assertEqual([call["url"] for call in session.calls], [
@@ -1241,7 +1237,7 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
             chat_answer('{"ok": true}'),
         ])
         with self.assertRaises(LLMResponseError) as caught:
-            await complete_json(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+            await complete_json(session, routed_settings(), system="S", user="U")
         message = str(caught.exception)
         self.assertIn("AvalAI", message)
         self.assertIn("OpenRouter", message)
@@ -1257,7 +1253,7 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
         )
         session = FakeSession([])
         with self.assertRaises(LLMAuthError):
-            await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+            await complete(session, settings, system="S", user="U")
         self.assertEqual(session.calls, [])
 
 
@@ -1556,7 +1552,6 @@ class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
         ])
         result = await complete_json(
             session, settings, system="S", user="U",
-            data_sensitivity="STANDARD_EDUCATIONAL",
         )
         self.assertEqual(result, {"ok": True})
         self.assertEqual(len(session.calls), 2)
