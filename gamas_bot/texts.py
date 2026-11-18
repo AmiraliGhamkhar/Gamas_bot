@@ -610,8 +610,8 @@ BTN_SHARE_INVITE: Final = "📤 اشتراک لینک دعوت"
 REFERRALS_TITLE: Final = "🤝 دعوت دوستان"
 REFERRALS_RULES: Final = (
     "با هر دعوت موفق اعتبار هدیه بگیرید:\n"
-    "• ورود دوست جدید با لینک شما: {signup_credits} اعتبار\n"
-    "• اولین خرید تأییدشدهٔ او: {purchase_credits} اعتبار\n"
+    "• ورود دوست جدید با لینک شما: {signup_credits}\n"
+    "• اولین خرید تأییدشدهٔ او: {purchase_credits}\n"
     "کد دعوت فقط هنگام نخستین ورود دوست به ربات ثبت می‌شود."
 )
 REFERRALS_LINK_TEMPLATE: Final = "لینک اختصاصی شما:\n{link}"
@@ -620,8 +620,9 @@ REFERRALS_STATS_TEMPLATE: Final = "دعوت‌شده‌ها: {invited} | اعت�
 REFERRALS_SELF: Final = "نمی‌توانید با لینک خودتان دعوت شوید."
 REFERRALS_DUPLICATE: Final = "این دعوت قبلاً ثبت شده است."
 REFERRAL_JOIN_REWARD_TEMPLATE: Final = (
-    "🎁 هدیهٔ دعوت ثبت شد: {seconds} اعتبار به دوست شما اضافه شد."
+    "🎁 هدیهٔ دعوت ثبت شد: {seconds} به دوست شما اضافه شد."
 )
+REFERRAL_SHARE_TEXT: Final = "به گاماس بپیوندید:"
 ADMIN_REFERRALS_HEADER: Final = "🤝 آمار دعوت"
 ADMIN_REFERRALS_TOTALS_TEMPLATE: Final = (
     "مجموع هدیه‌ها: {rewards} | اعتبار پرداخت‌شده: {seconds}"

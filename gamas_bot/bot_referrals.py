@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlencode
 
 from telethon import Button
 
@@ -12,6 +13,19 @@ from .db_referrals import REFERRAL_JOIN_SECONDS, REFERRAL_PAYMENT_SECONDS
 from .billing import format_seconds_as_credits
 
 logger = logging.getLogger("gamas_bot.bot.referrals")
+
+
+def _share_url(link: str) -> str:
+    """A Telegram share URL with both parameters fully percent-encoded.
+
+    Hand-rolled escaping left the Persian share text (spaces included) raw,
+    which is not a valid URL: Telegram rejects the whole inline keyboard with
+    ``BUTTON_URL_INVALID``, and the screen never renders. ``urlencode`` keeps
+    every byte legal.
+    """
+    return "https://t.me/share/url?" + urlencode(
+        {"url": link, "text": texts.REFERRAL_SHARE_TEXT}
+    )
 
 
 class ReferralWorkflowMixin:
@@ -74,13 +88,7 @@ class ReferralWorkflowMixin:
         )
         buttons: list[list[Any]] = []
         if link:
-            share = (
-                "https://t.me/share/url?url="
-                + link.replace(":", "%3A").replace("/", "%2F").replace("?", "%3F")
-                + "&text="
-                + "به گاماس بپیوند"
-            )
-            buttons.append([Button.url(texts.BTN_SHARE_INVITE, share)])
+            buttons.append([Button.url(texts.BTN_SHARE_INVITE, _share_url(link))])
         buttons.append([Button.inline(texts.BTN_BACK_MAIN, b"menu:main")])
         await self._edit_or_reply(  # type: ignore[attr-defined]
             event, "\n".join(lines), buttons

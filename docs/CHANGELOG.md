@@ -4,6 +4,19 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Fix: the «دعوت دوستان» referral screen never rendered.** The share button's
+URL embedded the Persian invite text raw — spaces included — which is not a
+valid URL; Telegram rejected the whole inline keyboard with
+`BUTTON_URL_INVALID`, the buttoned fallback respond failed for the same
+reason, and both failures were swallowed, so pressing «🤝 دعوت دوستان» did
+nothing. The share URL is now fully percent-encoded (`urlencode`), and the
+edit-fallback chain ends with a text-only respond so an invalid button can
+never blank a screen again. Also fixed the doubled «اعتبار اعتبار» unit in
+the referral rules and join-reward templates (the formatter already appends
+the unit), and the share text moved to `texts.py`. Regression tests cover the
+rendered screen with a real bot username — the fake client's missing
+`get_me` is what hid this.
+
 **Document booklets: same visible quality pipeline as lecture notes.** The
 📘 جزوهٔ کامل / ⚡ مرور سریع actions on an uploaded PDF/DOCX/PPTX now wire the
 note pipeline's stage callbacks through to the chat progress bar, so the user
