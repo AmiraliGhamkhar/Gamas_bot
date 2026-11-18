@@ -39,16 +39,15 @@ network-dependent advisory; never label it PASS without running it.
 ## Focused regressions
 
 ```bash
-python -m pytest tests/test_provider_allowlist.py tests/test_llm_task_routing.py tests/test_provider_contracts_and_quality.py tests/test_note_provider_compatibility.py tests/test_note_sensitivity_and_acceptance.py -q
+python -m pytest tests/test_provider_allowlist.py tests/test_llm_task_routing.py tests/test_provider_contracts_and_quality.py tests/test_note_provider_compatibility.py tests/test_note_acceptance_and_prompt_safety.py -q
 python -m pytest tests/test_notes.py tests/test_note_evidence.py tests/test_bot.py -q
 python -m pytest tests/test_learning.py tests/test_document_ingestion.py -q
 python -m pytest tests/test_llm_quota.py tests/test_concurrency_and_failover.py -q
 ```
 
-`tests/test_note_sensitivity_and_acceptance.py` covers sensitivity
-classification and propagation (including every compile path: single, grouped
-and second-level), case-narrative and named-person classification, route-policy
-and failure logging, provider-text redaction, the bounded repair loop, the final
+`tests/test_note_acceptance_and_prompt_safety.py` covers unmasked educational
+source routing, configured-secret and credential-pattern stripping at the LLM
+prompt boundary, provider-failure logging, the bounded repair loop, the final
 acceptance gate (fact, prose claim and `warn` mode), local salvage, incomplete
 delivery and the new job stages; `tests/test_note_evidence.py` pins original
 number/term spans and evidence windows; `tests/test_booklet_recovery.py` covers
@@ -69,8 +68,8 @@ Provider HTTP is mocked. The default test settings have **no LLM credential**;
 generation fixtures opt into scoped fake approved keys only when their I/O is
 scripted. Do not use live keys, paid quota or real patient data. Test behavior:
 actual routed endpoints, task/preference policy, credential isolation,
-sensitivity denials, strict/permissive parsing, bounded retries, cancellation
-and slot release. Do not replace those assertions with source-string searches,
+source-preserving overflow recovery, strict/permissive parsing, bounded retries,
+cancellation and slot release. Do not replace those assertions with source-string searches,
 skips or placeholder settings checks.
 
 Quota tests use temporary SQLite/WAL databases, covering request/token limits,

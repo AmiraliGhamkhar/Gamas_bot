@@ -62,7 +62,7 @@ from .docx_export import (
 from .fileio import run_file_io, run_file_io_resource
 from .intake import _presentation_metadata, _to_int
 from .jobs import Job
-from .learning import MAX_MODEL_INPUT_CHARS, SIZE_PRESETS, bound_content_text, preset_cards
+from .learning import MAX_MODEL_INPUT_CHARS, SIZE_PRESETS, normalize_content_text, preset_cards
 from .media import MediaToolError, convert_to_pptx
 from .notes import StructuringError
 from .notes_pdf import build_notes_pdf, notes_pdf_filename
@@ -136,7 +136,7 @@ class DocumentOfficeWorkflowMixin:
         existing = document.get("library_item_id")
         if existing:
             return int(existing)
-        content = await run_file_io(bound_content_text, str(document.get("text") or ""))
+        content = await run_file_io(normalize_content_text, str(document.get("text") or ""))
         return await self.db.document_ensure_library_item(
             user_id,
             int(document["id"]),
@@ -1427,7 +1427,7 @@ class DocumentOfficeWorkflowMixin:
             buttons=buttons,
             operation=build,
             library_kind="booklet",
-            content_text=bound_content_text(source_text),
+            content_text=normalize_content_text(source_text),
         )
 
     async def _guard_file_intake(self, event: Any, operation: Any) -> None:
@@ -2023,7 +2023,7 @@ class DocumentOfficeWorkflowMixin:
             buttons=self._office_format_keyboard(),
             operation=build,
             library_kind="booklet",
-            content_text=bound_content_text(raw_text),
+            content_text=normalize_content_text(raw_text),
         )
 
     async def _route_office_callback(

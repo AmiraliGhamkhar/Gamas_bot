@@ -40,8 +40,8 @@ python -m gamas_bot.media_worker check
 With a note provider configured, a finished transcript also produces a Persian
 RTL booklet. Booklets, AI quizzes and AI flashcards use the same note-provider
 allowlist: AvalAI, Gemini and OpenRouter. The default chain is
-`avalai,gemini,openrouter`; task-specific priorities and sensitivity policy
-apply before dispatch, and OpenRouter is always a fallback. The optional
+`avalai,gemini,openrouter`; task-specific priorities apply before dispatch,
+and OpenRouter is always a fallback. The optional
 editorial compile pass is off by default; bounded chunking, deterministic
 merge, split/repair and grounding gates remain enabled as configured. See
 [Providers](PROVIDERS.md) for models, quotas and safe probes.

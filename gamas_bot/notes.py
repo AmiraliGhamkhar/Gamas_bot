@@ -99,7 +99,7 @@ from .notes_evidence import (
     validate_tip,
 )
 from .progress import to_persian_digits
-from .textnorm import normalize_digits, normalize_for_compare
+from .textnorm import normalize_for_compare
 from .transcript import split_transcript
 
 logger = logging.getLogger(__name__)
@@ -290,161 +290,6 @@ class NoteQualityError(StructuringError):
         super().__init__(message)
         self.reason = reason
         self.fabricated = fabricated
-
-
-# ===========================================================================
-# Data sensitivity
-# ===========================================================================
-
-#: Labels the LLM router understands (see ``llm._sensitivity_eligible_routes``).
-SENSITIVITY_STANDARD_EDUCATIONAL = "STANDARD_EDUCATIONAL"
-SENSITIVITY_UNKNOWN = "UNKNOWN"
-
-#: Wording that makes lecture material *identifiable* rather than merely
-#: medical. Plain teaching about a patient is ordinary educational content; a
-#: record that carries a national id, a contact detail or a file number is not,
-#: and the router must not send it to the community OpenRouter route.
-_PATIENT_IDENTIFIER_MARKERS = (
-    "کد ملی",
-    "شماره ملی",
-    "شماره پرونده",
-    "شمارهٔ پرونده",
-    "پرونده بیمار",
-    "پروندهٔ بیمار",
-    "شماره بیمه",
-    "تاریخ تولد",
-    "شماره تماس",
-    "شمارهٔ تماس",
-    "شماره همراه",
-    "شمارهٔ همراه",
-    "آدرس بیمار",
-    "نام بیمار",
-    "medical record",
-    "patient id",
-    "patient name",
-    "date of birth",
-    "national id",
-    "insurance number",
-    "phone number",
-    "home address",
-)
-#: Folded with the same comparison form used on the material, so letter and
-#: ZWNJ variants cannot hide a marker.
-_NORMALIZED_IDENTIFIER_MARKERS = tuple(
-    normalize_for_compare(marker) for marker in _PATIENT_IDENTIFIER_MARKERS
-)
-#: A named person in the material. ``آقای رضایی`` or ``Ms. Ahmadi`` in a
-#: lecture is not a teaching example: it is somebody's record, and no provider
-#: may receive it without an explicit approval flag for sensitive data. Only an
-#: explicit honorific counts: ``بیمار با نارسایی کلیوی`` is ordinary teaching,
-#: and guessing names from bare Persian words would block half the curriculum.
-_PERSON_NAME_PATTERNS = (
-    # An honorific is always followed by the person it names.
-    re.compile(
-        r"(?:آقای|خانم|سرکار|جناب|دکتر)\s+[\u0600-\u06FF]{2,}(?:\s+[\u0600-\u06FF]{2,})?"
-    ),
-    re.compile(r"\b(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?\s+[A-Z][a-z]{2,}"),
-)
-#: Wording that marks a *case narrative* rather than general teaching: a
-#: complaint, an admission, an examination, a history. Such material may carry
-#: unmarked personal information, so ``auto`` classifies it as ``UNKNOWN``
-#: rather than asserting that it is safe to share. This is a conservative
-#: heuristic, not de-identification; see ``docs/PROVIDERS.md``.
-_CASE_NARRATIVE_MARKERS = (
-    "شرح حال",
-    "سابقهٔ بیماری",
-    "سابقه بیماری",
-    "سابقهٔ پزشکی",
-    "سابقه پزشکی",
-    "بستری شد",
-    "بستری بود",
-    "مراجعه کرد",
-    "مراجعه کرده",
-    "معاینه شد",
-    "معاینه کرد",
-    "تاریخ پذیرش",
-    "case report",
-    "case presentation",
-    "chief complaint",
-    "past medical history",
-    "was admitted",
-    "presented with",
-    "patient presented",
-)
-_NORMALIZED_CASE_MARKERS = tuple(
-    normalize_for_compare(marker) for marker in _CASE_NARRATIVE_MARKERS
-)
-_EMAIL_SIGNAL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-#: An 11-digit Iranian mobile number, or a 10-digit national id, in either digit
-#: shape (``normalize_digits`` folds them first). A dosage, a year or a quiz
-#: number cannot match: both patterns require at least ten consecutive digits.
-_MOBILE_SIGNAL = re.compile(r"(?<!\d)09\d{9}(?!\d)")
-_NATIONAL_ID_SIGNAL = re.compile(r"(?<!\d)\d{10}(?!\d)")
-
-#: ``NOTE_DATA_SENSITIVITY`` -> router label. ``auto`` runs the classifier.
-_SETTING_SENSITIVITY_LABELS = {
-    "standard_educational": SENSITIVITY_STANDARD_EDUCATIONAL,
-    "internal": "INTERNAL",
-    "sensitive": "SENSITIVE",
-    "phi_or_pii": "PHI_OR_PII",
-}
-
-
-def classify_note_sensitivity(text: str) -> str:
-    """Classify lecture material for provider routing, failing closed.
-
-    ``STANDARD_EDUCATIONAL`` is returned only when nothing looks
-    patient-identifiable: no e-mail address, no 10/11-digit identifier run, none
-    of the explicit identifier markers and no case narrative. Everything else is
-    conservative:
-
-    * a named person (``بیمار آقای رضایی``, ``Ms. Ahmadi``) is ``SENSITIVE``, so
-      no route is eligible without its explicit sensitive-data approval;
-    * any other identifier or a case-narrative marker (``شرح حال``, ``بستری
-      شد``, ``case report``) is ``UNKNOWN``, which the router treats as
-      ineligible for the community OpenRouter route;
-    * empty material is ``UNKNOWN``.
-
-    This is an **identifier heuristic, not de-identification**: it cannot prove
-    that a narrative carries no personal information. Case material should be
-    declared explicitly (``NOTE_DATA_SENSITIVITY=sensitive|phi_or_pii``) after
-    review; ``auto`` only refuses to call it safe by default.
-    """
-    folded = normalize_digits(text or "")
-    lowered = normalize_for_compare(folded)
-    if not lowered.strip():
-        return SENSITIVITY_UNKNOWN
-    if any(pattern.search(folded) for pattern in _PERSON_NAME_PATTERNS):
-        return "SENSITIVE"
-    if any(marker and marker in lowered for marker in _NORMALIZED_IDENTIFIER_MARKERS):
-        return SENSITIVITY_UNKNOWN
-    if (
-        _EMAIL_SIGNAL.search(folded)
-        or _MOBILE_SIGNAL.search(folded)
-        or _NATIONAL_ID_SIGNAL.search(folded)
-    ):
-        return SENSITIVITY_UNKNOWN
-    if any(marker and marker in lowered for marker in _NORMALIZED_CASE_MARKERS):
-        return SENSITIVITY_UNKNOWN
-    return SENSITIVITY_STANDARD_EDUCATIONAL
-
-
-def resolve_note_sensitivity(settings: Settings, document: str) -> str:
-    """The sensitivity label carried by every request of one booklet.
-
-    ``NOTE_DATA_SENSITIVITY=auto`` (the default) classifies the material with
-    :func:`classify_note_sensitivity`; an explicit value declares the
-    deployment's own policy and is used verbatim. Resolution happens once, in
-    :func:`structure_document`, and the label travels through generation, repair
-    and compile so no stage can reach a provider another stage rejects.
-    """
-    declared = (
-        getattr(settings, "note_data_sensitivity", "auto") or "auto"
-    ).strip().lower()
-    declared_label = _SETTING_SENSITIVITY_LABELS.get(declared)
-    if declared_label is not None:
-        return declared_label
-    return classify_note_sensitivity(document)
 
 
 # ===========================================================================
@@ -2001,7 +1846,6 @@ async def fill_coverage_gaps(
     notes: StructuredNotes,
     *,
     semaphore: asyncio.Semaphore | None = None,
-    data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> StructuredNotes:
     """Fill all detected coverage gaps in one grounded, bounded request.
 
@@ -2027,7 +1871,6 @@ async def fill_coverage_gaps(
                     user=message,
                     schema=_response_schema(settings),
                     task="BOOKLET_REPAIR",
-                    data_sensitivity=data_sensitivity,
                     sampling_temperature=0.0,
                 )
         else:
@@ -2037,7 +1880,6 @@ async def fill_coverage_gaps(
                 user=message,
                 schema=_response_schema(settings),
                 task="BOOKLET_REPAIR",
-                data_sensitivity=data_sensitivity,
                 sampling_temperature=0.0,
             )
         filled = _load_json_payload(payload)
@@ -3503,7 +3345,6 @@ async def _structure_piece(
     depth: int = 0,
     presentation: bool = False,
     render: Callable[[str], str],
-    data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> StructuredNotes:
     """One note request, with bounded recovery from an oversized or dense input.
 
@@ -3527,7 +3368,6 @@ async def _structure_piece(
                 user=render(document),
                 schema=_response_schema(settings),
                 task="BOOKLET_GENERATION",
-                data_sensitivity=data_sensitivity,
             )
         return _load_json_payload(payload, mode=mode)
     except (LLMContextOverflowError, LLMOutputBudgetError) as exc:
@@ -3558,7 +3398,6 @@ async def _structure_piece(
                     system_prompt=system_prompt, mode=mode,
                     semaphore=semaphore, depth=depth + 1,
                     presentation=presentation, render=render,
-                    data_sensitivity=data_sensitivity,
                 )
             )
             for piece in pieces
@@ -3587,7 +3426,6 @@ async def _audit_and_repair(
     presentation: bool,
     semaphore: asyncio.Semaphore,
     source_locators: bool = False,
-    data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> tuple[StructuredNotes, NoteQualityReport]:
     """Run ordered, bounded repairs and preserve the best known-safe artifact."""
     notes = ensure_structured_booklet(notes, source)
@@ -3623,7 +3461,7 @@ async def _audit_and_repair(
                 candidate, candidate_report = await _repair_once(
                     gated, report, source, settings, session,
                     mode=mode, presentation=presentation, semaphore=semaphore,
-                    source_locators=source_locators, data_sensitivity=data_sensitivity,
+                    source_locators=source_locators,
                     issues=issues, pass_name=pass_name,
                 )
                 if candidate is gated and candidate_report is report:
@@ -3813,7 +3651,6 @@ async def _repair_once(
     presentation: bool,
     semaphore: asyncio.Semaphore,
     source_locators: bool = False,
-    data_sensitivity: str = SENSITIVITY_UNKNOWN,
     issues: Sequence[RepairIssue] | None = None,
     pass_name: str = "claim_repair",
 ) -> tuple[StructuredNotes, NoteQualityReport]:
@@ -3839,7 +3676,6 @@ async def _repair_once(
                 user=repair_document,
                 schema=_response_schema(settings),
                 task="BOOKLET_REPAIR",
-                data_sensitivity=data_sensitivity,
                 sampling_temperature=0.0,
             )
         candidate = _load_json_payload(payload, mode=mode)
@@ -3892,7 +3728,6 @@ async def _compile_once(
     presentation: bool,
     budget: int,
     source_locators: bool = False,
-    data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> StructuredNotes | None:
     """One editorial compile request, or ``None`` when it cannot be sent.
 
@@ -3920,7 +3755,6 @@ async def _compile_once(
             schema=_response_schema(settings),
             task="BOOKLET_COMPILE",
             prefer_provider=getattr(settings, "note_compile_provider", ""),
-            data_sensitivity=data_sensitivity,
             sampling_temperature=0.1,
         )
         compiled = _load_json_payload(payload, mode=mode)
@@ -4004,7 +3838,6 @@ async def _compile_in_groups(
     budget: int,
     semaphore: asyncio.Semaphore | None = None,
     source_locators: bool = False,
-    data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> StructuredNotes:
     """Level 1: compile whole-section groups concurrently; keep any group that fails."""
     groups = compile_groups(merged, context, budget=budget)
@@ -4022,7 +3855,6 @@ async def _compile_in_groups(
                 session, settings, context, group,
                 mode=mode, presentation=presentation, budget=budget,
                 source_locators=source_locators,
-                data_sensitivity=data_sensitivity,
             )
 
     tasks = [asyncio.create_task(compile_group(group)) for group in groups]
@@ -4117,7 +3949,6 @@ async def _compile_pass(
     presentation: bool,
     semaphore: asyncio.Semaphore | None = None,
     source_locators: bool = False,
-    data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> StructuredNotes:
     """The editorial pass: one request when it fits, whole-section groups when not.
 
@@ -4158,7 +3989,6 @@ async def _compile_pass(
             session, settings, context, merged,
             mode=mode, presentation=presentation, budget=budget,
             source_locators=source_locators,
-            data_sensitivity=data_sensitivity,
         )
         accepted = _gate_compiled(
             compiled, merged, merged_report, document, settings, mode=mode
@@ -4173,7 +4003,6 @@ async def _compile_pass(
         mode=mode, presentation=presentation, budget=budget,
         semaphore=semaphore,
         source_locators=source_locators,
-        data_sensitivity=data_sensitivity,
     )
     accepted = _gate_compiled(
         assembled if assembled is not merged else None,
@@ -4196,7 +4025,6 @@ async def _compile_pass(
             session, settings, context, accepted,
             mode=mode, presentation=presentation, budget=budget,
             source_locators=source_locators,
-            data_sensitivity=data_sensitivity,
         )
         merged_final = _gate_compiled(
             final, merged, merged_report, document, settings, mode=mode
@@ -4262,17 +4090,6 @@ async def _structure_booklet(
     if not document:
         raise StructuringError("متن ورودی خالی بود.")
     resolved_mode = resolve_note_mode(mode)
-    # Resolved once for the whole booklet: generation, repair and compile then
-    # send the same label, so no later stage can reach a provider the first
-    # stage's policy rejected.
-    data_sensitivity = resolve_note_sensitivity(settings, document)
-    logger.info(
-        "note data sensitivity=%s declared=%s chars=%d",
-        data_sensitivity,
-        getattr(settings, "note_data_sensitivity", "auto"),
-        len(document),
-    )
-
     async def notify(stage: str) -> None:
         """Report a pipeline stage without ever failing the booklet."""
         if on_stage is None:
@@ -4310,7 +4127,6 @@ async def _structure_booklet(
             if getattr(settings, "note_completeness_fill", False):
                 result = await fill_coverage_gaps(
                     session, settings, document, result, semaphore=semaphore,
-                    data_sensitivity=data_sensitivity,
                 )
             preserved_quality = result.quality_state
             result = ensure_structured_booklet(result, document)
@@ -4334,7 +4150,6 @@ async def _structure_booklet(
             if getattr(settings, "note_completeness_fill", False):
                 result = await fill_coverage_gaps(
                     session, settings, document, result, semaphore=semaphore,
-                    data_sensitivity=data_sensitivity,
                 )
         result = ensure_structured_booklet(result, document)
         gated, report = gate_notes(result, document, strict=True, mode=resolved_mode)
@@ -4379,7 +4194,6 @@ async def _structure_booklet(
                 chunks[0],
                 system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
                 presentation=presentation, render=single_render,
-                data_sensitivity=data_sensitivity,
             )
         except (LLMError, StructuringError) as exc:
             if not getattr(settings, "note_enable_deterministic_fallback", True):
@@ -4398,7 +4212,6 @@ async def _structure_booklet(
                     single, document, settings, session,
                     mode=resolved_mode, presentation=presentation, semaphore=semaphore,
                     source_locators=source_locators,
-                    data_sensitivity=data_sensitivity,
                 )
             )[0]
         except NoteQualityError:
@@ -4457,7 +4270,6 @@ async def _structure_booklet(
                 session, settings, chunk,
                 system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
                 presentation=presentation, render=render,
-                data_sensitivity=data_sensitivity,
             )
         except (LLMError, StructuringError) as exc:
             if getattr(settings, "note_enable_deterministic_fallback", True):
@@ -4553,7 +4365,6 @@ async def _structure_booklet(
                 merged, document, settings, session,
                 mode=resolved_mode, presentation=presentation, semaphore=semaphore,
                 source_locators=source_locators,
-                data_sensitivity=data_sensitivity,
             )
         except NoteQualityError:
             # Do not discard a merely incomplete draft before the bounded
@@ -4586,7 +4397,6 @@ async def _structure_booklet(
         merged, merged_report, document, context, settings, session,
         mode=resolved_mode, presentation=presentation, semaphore=semaphore,
         source_locators=source_locators,
-        data_sensitivity=data_sensitivity,
     )
     compiled = await finalize(compiled)
     if (

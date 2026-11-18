@@ -26,9 +26,6 @@ from .progress import to_persian_digits
 
 logger = logging.getLogger("gamas_bot.learning")
 
-#: Generated booklet mirrors retain a bounded preview in the legacy library.
-#: Uploaded documents retain their full extracted text and chunk cache instead.
-MAX_CONTENT_CHARS = 60_000
 #: Each learning chunk leaves room for the prompt envelope inside the model's
 #: context budget; the generator can process multiple such chunks concurrently.
 MAX_MODEL_INPUT_CHARS = 56_000
@@ -176,28 +173,9 @@ def dedupe_questions(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
 OPTION_LABELS = ("الف", "ب", "ج", "د")
 
 
-def bound_content_text(text: str | None, *, limit: int = MAX_CONTENT_CHARS) -> str:
-    """Trim archived text to ``limit`` chars on a paragraph boundary.
-
-    Cutting at the last blank line (falling back to the last whitespace, then a
-    hard slice) never leaves a half-written paragraph as the quiz source.
-    """
-    if not text:
-        return ""
-    normalized = str(text).strip()
-    if len(normalized) <= limit:
-        return normalized
-    window = normalized[:limit]
-    paragraph_cut = window.rfind("\n\n")
-    if paragraph_cut >= limit // 2:
-        return window[:paragraph_cut].rstrip()
-    line_cut = window.rfind("\n")
-    if line_cut >= limit // 2:
-        return window[:line_cut].rstrip()
-    word_cut = window.rfind(" ")
-    if word_cut >= limit // 2:
-        return window[:word_cut].rstrip()
-    return window.rstrip()
+def normalize_content_text(text: str | None) -> str:
+    """Normalize archived study text without clipping any educational content."""
+    return str(text or "").strip()
 
 
 # ---------------------------------------------------------------------------

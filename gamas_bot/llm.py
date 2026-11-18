@@ -28,6 +28,7 @@ from dataclasses import replace
 import json
 import logging
 import math
+import os
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -48,6 +49,7 @@ from .http_util import (
     retry_after_seconds as _retry_after_seconds,
     sanitize_error_text as _sanitize_error_text,
 )
+from .logging_config import collect_configured_secrets
 from .llm_profiles import (
     fold_system_into_user,
     get_provider_profile,
@@ -332,6 +334,58 @@ _SECRET_TOKEN_RE = re.compile(
     r"(?:Bearer\s+[A-Za-z0-9._\-]+|sk-nry-[A-Za-z0-9_\-]+|sk-or-v1-[A-Za-z0-9_\-]+|sk-[A-Za-z0-9_\-]{16,}|AIza[0-9A-Za-z_\-]{20,})",
     re.IGNORECASE,
 )
+
+# Credential-bearing values in user-supplied material are removed at the one
+# provider-request boundary. This is deliberately a technical-secret filter,
+# not a content-sensitivity classifier: names, case narratives, emails and
+# ordinary educational text are otherwise passed through unchanged.
+_PROMPT_SECRET_ENV_NAME_RE = re.compile(
+    r"(?:^|_)(?:API[_-]?(?:KEY|HASH|TOKEN)|ACCESS[_-]?(?:KEY|TOKEN|KEY_ID)|"
+    r"SECRET(?:[_-]ACCESS[_-]?KEY)?|PASSWORD|PASSWD|PASS|TOKEN|CREDENTIALS?|"
+    r"AUTH(?:ORIZATION)?|PRIVATE[_-]?KEY|CLIENT[_-]?SECRET|KEY|"
+    r"(?:DATABASE|DB|REDIS|POSTGRES|MYSQL|MONGO)[_-]?(?:URL|URI|DSN))$",
+    re.IGNORECASE,
+)
+_PROMPT_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    r"(?P<prefix>\b(?:[A-Z0-9_.-]+[_-])*(?:API[_-]?(?:KEY|HASH|TOKEN)|"
+    r"ACCESS[_-]?(?:KEY|TOKEN|KEY_ID)|REFRESH[_-]?TOKEN|"
+    r"SECRET(?:[_-]ACCESS[_-]?KEY)?|PASSWORD|PASSWD|PASS|TOKEN|CREDENTIALS?|"
+    r"AUTH(?:ORIZATION)?|PRIVATE[_-]?KEY|CLIENT[_-]?SECRET|KEY|"
+    r"(?:DATABASE|DB|REDIS|POSTGRES|MYSQL|MONGO)[_-]?(?:URL|URI|DSN))\b"
+    r"""\s*[:=]\s*)(?P<value>"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)""",
+    re.IGNORECASE,
+)
+_PROMPT_SECRET_TOKEN_RE = re.compile(
+    r"(?:Bearer\s+[A-Za-z0-9._~+/=-]{8,}|"
+    r"(?:bot)?\d{5,}:[A-Za-z0-9_-]{20,}|"
+    r"sk-(?:nry-|or-v1-)?[A-Za-z0-9_-]{16,}|"
+    r"AIza[0-9A-Za-z_-]{20,}|"
+    r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|"
+    r"A(?:KIA|SIA)[0-9A-Z]{16})",
+    re.IGNORECASE,
+)
+
+
+def _prompt_secret_values(settings: Settings) -> tuple[str, ...]:
+    """Configured credentials plus secret-named environment values, longest first."""
+    values = set(collect_configured_secrets(settings))
+    for name, raw_value in os.environ.items():
+        value = raw_value.strip()
+        if _PROMPT_SECRET_ENV_NAME_RE.search(name) and len(value) >= 4:
+            values.add(value)
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def _sanitize_prompt_text(text: str, settings: Settings) -> str:
+    """Remove credential values without classifying or masking lesson content."""
+    sanitized = str(text or "")
+    for secret in _prompt_secret_values(settings):
+        sanitized = sanitized.replace(secret, "[REDACTED]")
+    sanitized = _PROMPT_SECRET_TOKEN_RE.sub("[REDACTED]", sanitized)
+    return _PROMPT_CREDENTIAL_ASSIGNMENT_RE.sub(
+        lambda match: match.group("prefix") + "[REDACTED]", sanitized
+    )
 
 
 def is_context_overflow(detail: str) -> bool:
@@ -1184,9 +1238,11 @@ def _build_request_for(
     *,
     schema: dict | None = None,
 ) -> tuple[str, dict[str, str], dict]:
-    """Build one provider's POST request from its own route dialect."""
+    """Build one provider request, filtering technical secrets at the prompt edge."""
+    safe_system = _sanitize_prompt_text(system, settings)
+    safe_user = _sanitize_prompt_text(user, settings)
     return get_dialect(route.style).build_post_request(
-        route, settings, system, user, schema=schema
+        route, settings, safe_system, safe_user, schema=schema
     )
 
 
@@ -2628,28 +2684,12 @@ async def complete(
     system: str,
     user: str,
     task: str = "",
-    data_sensitivity: str = "UNKNOWN",
 ) -> str:
-    """Text completion through the same allowlist, task policy and quota ledger."""
+    """Text completion through the configured provider chain and quota ledger."""
     configured_routes = note_routes(settings)
-    eligible_routes = _sensitivity_eligible_routes(
-        configured_routes, settings, data_sensitivity
-    )
-    _log_route_policy(configured_routes, eligible_routes, data_sensitivity, task)
-    routes = _task_ordered_routes(eligible_routes, task)
+    routes = _task_ordered_routes(configured_routes, task)
     if not routes:
-        if configured_routes and (data_sensitivity or "UNKNOWN").strip().upper() in {
-            "INTERNAL", "SENSITIVE", "PHI_OR_PII",
-        }:
-            raise LLMAuthError(
-                "هیچ ارائه‌دهندهٔ مجازی برای سطح حساسیت این داده تأیید نشده است."
-            )
-        reason = (
-            "هیچ ارائه‌دهندهٔ پیکربندی‌شده‌ای برای سطح حساسیت این داده مجاز نیست."
-            if configured_routes else
-            "هیچ ارائه‌دهندهٔ مجاز و دارای کلید پیکربندی نشده است."
-        )
-        raise LLMAuthError(reason)
+        raise LLMAuthError("هیچ ارائه‌دهندهٔ مجاز و دارای کلید پیکربندی نشده است.")
 
     async def _call(route: NoteRoute, is_last: bool) -> str:
         return await _complete_on_route(
@@ -2840,39 +2880,6 @@ TASK_PROVIDER_ORDER = {
 }
 
 
-def _sensitivity_eligible_routes(
-    routes: tuple[NoteRoute, ...], settings: Settings, sensitivity: str
-) -> tuple[NoteRoute, ...]:
-    """Apply a fail-closed provider policy for explicitly sensitive material.
-
-    Unclassified data is never sent to OpenRouter Free. Gemini/AvalAI remain
-    available for ordinary educational jobs; sensitive classes require explicit
-    operator approval for each provider.
-    """
-    label = (sensitivity or "UNKNOWN").strip().upper()
-    if label not in {"STANDARD_EDUCATIONAL", "INTERNAL", "SENSITIVE", "PHI_OR_PII"}:
-        label = "UNKNOWN"
-    eligible: list[NoteRoute] = []
-    for route in routes:
-        if route.slug not in APPROVED_LLM_PROVIDERS:
-            continue
-        if label == "STANDARD_EDUCATIONAL":
-            eligible.append(route)
-        elif label == "UNKNOWN":
-            if route.slug != "openrouter":
-                eligible.append(route)
-        elif route.slug == "openrouter":
-            if getattr(settings, "openrouter_free_allow_sensitive_data", False):
-                eligible.append(route)
-        elif route.slug == "gemini":
-            if getattr(settings, "gemini_free_allow_sensitive_data", False):
-                eligible.append(route)
-        elif route.slug == "avalai":
-            if getattr(settings, "avalai_allow_sensitive_data", False):
-                eligible.append(route)
-    return tuple(eligible)
-
-
 def _task_ordered_routes(routes: tuple[NoteRoute, ...], task: str) -> tuple[NoteRoute, ...]:
     """Enforce the allowlist and task priorities; OpenRouter is always last."""
     by_slug = {route.slug: route for route in routes if route.slug in APPROVED_LLM_PROVIDERS}
@@ -2881,54 +2888,6 @@ def _task_ordered_routes(routes: tuple[NoteRoute, ...], task: str) -> tuple[Note
         return tuple(by_slug[slug] for slug in order if slug in by_slug)
     return tuple(route for slug, route in by_slug.items() if slug != "openrouter") + (
         (by_slug["openrouter"],) if "openrouter" in by_slug else ()
-    )
-
-
-def _log_route_policy(
-    configured: tuple[NoteRoute, ...],
-    eligible: tuple[NoteRoute, ...],
-    sensitivity: str,
-    task: str,
-) -> None:
-    """Log why each configured route is or is not part of this request.
-
-    Slugs and reasons only: no prompt, transcript or credential reaches this
-    function. ``sensitivity`` is the label the caller classified the material
-    with; a route excluded because of it is reported as such instead of
-    disappearing silently from the chain.
-    """
-    label = (sensitivity or "UNKNOWN").strip().upper()
-    allowed = {route.slug for route in eligible}
-    reasons: list[str] = []
-    for route in configured:
-        if route.slug in allowed:
-            reasons.append(f"{route.slug}:eligible")
-        elif route.slug not in APPROVED_LLM_PROVIDERS:
-            reasons.append(f"{route.slug}:unapproved")
-        else:
-            reasons.append(f"{route.slug}:blocked_by_{label.lower() or 'unknown'}")
-    task_label = (task or "UNSPECIFIED").strip().upper() or "UNSPECIFIED"
-    logger.info(
-        "LLM route policy task=%s sensitivity=%s routes=%s",
-        task_label,
-        label,
-        ", ".join(reasons) or "none",
-        extra={
-            "event": "llm_route_policy",
-            "llm_task": task_label,
-            "data_sensitivity": label,
-            "configured_provider_count": len(configured),
-            "eligible_provider_count": len(eligible),
-            "eligible_providers": ",".join(
-                route.slug for route in eligible
-            ),
-            "route_gemini_eligible": "gemini" in allowed,
-            "route_avalai_eligible": "avalai" in allowed,
-            "route_openrouter_eligible": "openrouter" in allowed,
-            "blocked_provider_reasons": ",".join(
-                reason for reason in reasons if ":blocked_by_" in reason
-            ),
-        },
     )
 
 
@@ -2958,7 +2917,6 @@ async def complete_json(
     max_output_tokens: int | None = None,
     wait_for_capacity: bool = True,
     task: str = "",
-    data_sensitivity: str = "UNKNOWN",
     sampling_temperature: float | None = None,
 ) -> dict:
     """A completion parsed as strict JSON, with bounded per-provider recovery.
@@ -2975,20 +2933,8 @@ async def complete_json(
             raise ValueError("max_output_tokens must be positive")
         settings = replace(settings, note_max_output_tokens=int(max_output_tokens))
     configured_routes = note_routes(settings)
-    eligible_routes = _sensitivity_eligible_routes(
-        configured_routes, settings, data_sensitivity
-    )
-    _log_route_policy(configured_routes, eligible_routes, data_sensitivity, task)
-    routes = _ordered_routes(eligible_routes, prefer_provider, task=task)
+    routes = _ordered_routes(configured_routes, prefer_provider, task=task)
     if not routes:
-        if configured_routes:
-            raise LLMAuthError(
-                "هیچ ارائه‌دهندهٔ پیکربندی‌شده‌ای برای سطح حساسیت این داده مجاز نیست."
-            )
-        if (data_sensitivity or "UNKNOWN").strip().upper() in {"INTERNAL", "SENSITIVE", "PHI_OR_PII"}:
-            raise LLMAuthError(
-                "هیچ ارائه‌دهندهٔ مجازی برای سطح حساسیت این داده تأیید نشده است."
-            )
         raise LLMAuthError(
             "هیچ ارائه‌دهندهٔ مجاز و دارای کلید پیکربندی نشده است "
             "(GEMINI_API_KEY / AVALAI_API_KEY / OPENROUTER_API_KEY)."

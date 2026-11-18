@@ -254,7 +254,6 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         ])
         result = await complete(
             session, settings, system="S", user="U",
-            data_sensitivity="STANDARD_EDUCATIONAL",
         )
         self.assertEqual(result, "backup")
         avalai_calls = [c for c in session.calls if "api.avalai.ir" in c["url"]]
@@ -342,7 +341,6 @@ class NoHedgingTests(unittest.IsolatedAsyncioTestCase):
     def invoke(entry, settings):
         return getattr(llm, entry)(
             object(), settings, system="Synthetic instruction", user="Synthetic lesson",
-            data_sensitivity="STANDARD_EDUCATIONAL",
         )
 
     async def test_slow_healthy_primary_is_not_hedged_with_default_or_stale_knob(self):
@@ -609,7 +607,7 @@ class PipelinePerfOptimizationsTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_compile_once(
             _session, _settings, _context, group, *, mode, presentation, budget,
-            source_locators=None, data_sensitivity=None,
+            source_locators=None,
         ):
             nonlocal active, max_active
             active += 1

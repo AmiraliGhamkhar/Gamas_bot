@@ -38,7 +38,6 @@ from gamas_bot.notes import (
     NoteSection,
     NoteTable,
     StructuredNotes,
-    resolve_note_sensitivity,
 )
 from gamas_bot.review_sheet import (
     DEFAULT_REVIEW_MINUTES,
@@ -316,7 +315,7 @@ class ReviewPlanTests(unittest.TestCase):
 
 
 class PlanningCallTests(unittest.IsolatedAsyncioTestCase):
-    async def test_one_planning_call_uses_the_review_task_and_the_booklet_sensitivity(self):
+    async def test_one_planning_call_uses_the_review_task_without_content_filtering(self):
         settings = make_settings()
         notes = sample_notes()
         complete = mock.AsyncMock(return_value=sample_payload())
@@ -327,10 +326,6 @@ class PlanningCallTests(unittest.IsolatedAsyncioTestCase):
         kwargs = complete.await_args.kwargs
         self.assertEqual(kwargs["task"], REVIEW_PLAN_TASK)
         self.assertEqual(REVIEW_PLAN_TASK, "BOOKLET_REVIEW_PLAN")
-        self.assertEqual(
-            kwargs["data_sensitivity"],
-            resolve_note_sensitivity(settings, "\n".join(u.text for u in build_review_units(notes))),
-        )
         self.assertIn("s1.p1 | جذب دارو", kwargs["user"])
         self.assertIn("JSON", kwargs["system"])
 

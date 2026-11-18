@@ -44,7 +44,7 @@ from .intake import (
     classify_failure,
 )
 from .jobs import Job, QueueFullError
-from .learning import bound_content_text
+from .learning import normalize_content_text
 from .logging_config import log_job_id
 from .media import MediaInfo, convert_to_pptx
 from .metrics import METRICS
@@ -1523,7 +1523,7 @@ class JobPipelineMixin:
             # re-download routes use the persisted PDF rather than message ids.
             if pdf_ready or docx_ready:
                 learning_source = document.llm_document() if document is not None else ""
-                learning_text = bound_content_text(learning_source)
+                learning_text = normalize_content_text(learning_source)
                 try:
                     match = await self.db.library_submission_source_item(
                         job.user_id, job.submission_id

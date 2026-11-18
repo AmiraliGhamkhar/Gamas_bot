@@ -431,7 +431,6 @@ class GeminiCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(LLMRequestError):
             await complete(
                 session, settings, system="S", user="U",
-                data_sensitivity="STANDARD_EDUCATIONAL",
             )
         self.assertEqual(len(session.calls), llm.MAX_COMPATIBILITY_ADJUSTMENTS + 1)
 
@@ -454,7 +453,7 @@ class OpenRouterTests(unittest.IsolatedAsyncioTestCase):
     async def test_valid_json_is_accepted_without_a_response_schema(self):
         settings = deployed_settings(note_providers=("openrouter",))
         session = _Session([openai_answer(VALID_NOTES_JSON)])
-        payload = await complete_json(session, settings, system="S", user="U", schema=SCHEMA, data_sensitivity="STANDARD_EDUCATIONAL")
+        payload = await complete_json(session, settings, system="S", user="U", schema=SCHEMA)
         self.assertEqual(len(_load_json_payload(payload).sections), 4)
         self.assertNotIn("response_format", session.calls[0]["json"])
 
@@ -467,7 +466,7 @@ class OpenRouterTests(unittest.IsolatedAsyncioTestCase):
             '{"title": "فیزیولوژی کلیه", "sections": [', finish_reason="length"
         )
         session = _Session([gemini_truncated, openai_answer(VALID_NOTES_JSON)])
-        payload = await complete_json(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+        payload = await complete_json(session, settings, system="S", user="U")
         self.assertEqual(payload["title"], "فیزیولوژی کلیه")
         # Gemini was abandoned after one truncated reply, not retried as bad
         # JSON; OpenRouter served the complete answer.
@@ -482,7 +481,7 @@ class OpenRouterTests(unittest.IsolatedAsyncioTestCase):
         settings = deployed_settings(note_providers=("openrouter",))
         session = _Session([openai_answer("ok")])
         with self.assertLogs("gamas_bot.llm", level="INFO") as logs:
-            await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+            await complete(session, settings, system="S", user="U")
         usage_lines = [line for line in logs.output if "note provider usage" in line]
         self.assertTrue(usage_lines)
         self.assertIn("requested_output_tokens=32768", usage_lines[0])
@@ -504,7 +503,7 @@ class FailoverRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_gemini_is_attempted_before_openrouter(self):
         settings = deployed_settings()
         session = _Session([gemini_answer("gemini-answer")])
-        result = await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+        result = await complete(session, settings, system="S", user="U")
         self.assertEqual(result, "gemini-answer")
         self.assertEqual(len(session.calls), 1)
         self.assertIn("/models/", session.calls[0]["url"])
@@ -515,7 +514,7 @@ class FailoverRoutingTests(unittest.IsolatedAsyncioTestCase):
         rejection = _Response(503, {"error": {"message": "temporarily unavailable"}})
         session = _Session([rejection, rejection, openai_answer("openrouter-answer")])
         with mock.patch("gamas_bot.llm.asyncio.sleep", new=_noop):
-            result = await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+            result = await complete(session, settings, system="S", user="U")
         self.assertEqual(result, "openrouter-answer")
         self.assertEqual(len(session.calls), llm.MAX_TRANSIENT_RETRIES + 2)
         self.assertTrue(all("generativelanguage.googleapis.com" in c["url"] for c in session.calls[:-1]))
@@ -526,7 +525,7 @@ class FailoverRoutingTests(unittest.IsolatedAsyncioTestCase):
         settings = deployed_settings()
         rejection = _Response(400, {"error": {"message": "Bad request"}})
         session = _Session([rejection, openai_answer("openrouter-answer")])
-        result = await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+        result = await complete(session, settings, system="S", user="U")
         self.assertEqual(result, "openrouter-answer")
         self.assertEqual(len(session.calls), 2)
 
@@ -537,5 +536,5 @@ class FailoverRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         session = _Session([rejection(), rejection()])
         with self.assertRaises(LLMRequestError):
-            await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+            await complete(session, settings, system="S", user="U")
         self.assertEqual(len(session.calls), 2)

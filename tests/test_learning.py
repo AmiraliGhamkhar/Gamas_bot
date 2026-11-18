@@ -25,15 +25,14 @@ from gamas_bot.bot import (
 )
 from gamas_bot.db import Database
 from gamas_bot.learning import (
-    MAX_CONTENT_CHARS,
     MAX_QUESTION_CHARS,
     QUIZ_SCHEMA,
-    bound_content_text,
+    normalize_content_text,
     parse_flashcard_payload,
     parse_quiz_payload,
     quiz_system_prompt,
 )
-from gamas_bot.llm import LLMError
+from gamas_bot.llm import LLMContextOverflowError, LLMError
 from tests.support import (
     FakeCallbackEvent,
     FakeTelegramClient,
@@ -68,15 +67,15 @@ def quiz_payload(count: int = 5, *, source: str = "بخش ۱") -> dict:
 
 
 class LearningHelperTests(unittest.TestCase):
-    def test_bound_content_text_cuts_on_paragraph_boundary(self):
-        text = "پاراگراف نخست.\n\n" + ("کلمه " * 20_000)
-        bounded = bound_content_text(text)
-        self.assertLessEqual(len(bounded), MAX_CONTENT_CHARS)
-        self.assertTrue(bounded.startswith("پاراگراف نخست."))
+    def test_archived_content_normalization_never_truncates_a_long_source(self):
+        text = "ابتدای متن آموزشی.\n\n" + ("کلمهٔ کامل " * 12_000) + "انتهای منبع."
+        normalized = normalize_content_text(text)
+        self.assertEqual(normalized, text)
+        self.assertTrue(normalized.endswith("انتهای منبع."))
 
-    def test_bound_content_text_passes_short_text_through(self):
-        self.assertEqual(bound_content_text("  متن کوتاه  "), "متن کوتاه")
-        self.assertEqual(bound_content_text(None), "")
+    def test_archived_content_normalization_passes_short_text_through(self):
+        self.assertEqual(normalize_content_text("  متن کوتاه  "), "متن کوتاه")
+        self.assertEqual(normalize_content_text(None), "")
 
     def test_quiz_parser_diagnostics_are_count_only(self):
         private_question = "private-question-should-not-be-logged"
@@ -990,7 +989,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
     def _labels(buttons) -> list[str]:
         return [button.text for row in buttons for button in row]
 
-    async def test_quiz_task_uses_original_requested_count_and_propagates_sensitivity(self):
+    async def test_quiz_task_uses_original_requested_count(self):
         from gamas_bot.doc_extract import DocChunk
 
         requests = []
@@ -1008,66 +1007,53 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
                     counts=[1],
                     placeholder=mock.AsyncMock(),
                     requested_count=count,
-                    data_sensitivity="STANDARD_EDUCATIONAL",
                 )
 
         self.assertEqual(
             [request["task"] for request in requests],
             ["QUIZ_GENERATION", "QUIZ_GENERATION", "QUIZ_20"],
         )
-        self.assertEqual(
-            [request["data_sensitivity"] for request in requests],
-            ["STANDARD_EDUCATIONAL"] * 3,
+    async def test_actual_context_overflow_splits_and_processes_every_source_part(self):
+        from gamas_bot.doc_extract import DocChunk, chunk_text
+
+        source = "SOURCE_START " + "alpha " * 300 + "SPLIT_MIDDLE " + "beta " * 300 + "SOURCE_END"
+        expected_parts = chunk_text(
+            source,
+            max_chars=max(800, len(source) // 2),
+            label_prefix="درس طولانی",
         )
+        requests: list[str] = []
 
-    async def test_source_sensitivity_is_resolved_once_and_passed_to_generation(self):
-        from gamas_bot.doc_extract import DocChunk
+        async def provider(_session, _settings, *, user, **_kwargs):
+            requests.append(user)
+            if len(requests) == 1:
+                raise LLMContextOverflowError("synthetic context overflow")
+            locator = user.split("«", 1)[1].split("»", 1)[0]
+            payload = quiz_payload(1, source=locator)
+            payload["questions"][0]["question"] = f"سؤال بخش {len(requests)}؟"
+            return payload
 
-        private_text = "private-source-sentinel شماره پروندهٔ ۱۲۳"
-        source = {
-            "item_id": self.item_id,
-            "doc_id": None,
-            "title": "جزوه",
-            "chunks": [DocChunk(0, "بخش ۱", ("بخش ۱",), "محتوای آموزشی")],
-            "sensitivity_text": private_text,
-        }
-        questions = [
-            {
-                "question": f"سؤال {index}",
-                "options": ["الف", "ب", "ج", "د"],
-                "correct_index": 0,
-                "explanation": "توضیح معتبر",
-                "source": "بخش ۱",
-                "difficulty": "medium",
-            }
-            for index in range(5)
-        ]
-        with mock.patch(
-            "gamas_bot.bot_learning.resolve_note_sensitivity",
-            return_value="SENSITIVE",
-        ) as resolve, mock.patch.object(
-            self.bot,
-            "_claim_generation_budget",
-            new=mock.AsyncMock(return_value=(False, False, None)),
-        ), mock.patch.object(
-            self.bot,
-            "_generate_chunks",
-            new=mock.AsyncMock(return_value=(questions, 0)),
-        ) as generate, mock.patch("gamas_bot.bot_learning.logger.info") as log_info:
-            await self.bot._generate_learning(
-                self._event(b"quiz:hub"),
-                user_id=OWNER,
+        deps = self.bot.deps
+        self.bot.deps = deps.__class__(complete_json_fn=provider)
+        try:
+            items, failed = await self.bot._generate_chunks(
                 kind="quiz",
-                source=source,
-                wanted=5,
-                cost=0,
-                note="test",
-                title="جزوه",
+                chunks=[DocChunk(0, "درس طولانی", ("درس طولانی",), source)],
+                counts=[1],
+                placeholder=mock.AsyncMock(),
+                requested_count=1,
             )
+        finally:
+            self.bot.deps = deps
 
-        resolve.assert_called_once_with(self.settings, private_text)
-        self.assertEqual(generate.await_args.kwargs["data_sensitivity"], "SENSITIVE")
-        self.assertNotIn(private_text, repr(log_info.call_args_list))
+        self.assertEqual(len(requests), 1 + len(expected_parts))  # overflow plus every recovered split part
+        recovered = []
+        for prompt in requests[1:]:
+            body = prompt.split("متن منبع:\n", 1)[1]
+            recovered.append(body.split("\n", 1)[1])  # drop the generated locator header
+        self.assertEqual(" ".join(" ".join(recovered).split()), " ".join(source.split()))
+        self.assertEqual(failed, 0)
+        self.assertEqual(len(items), 1)
 
     async def test_paid_quiz_generation_shortfall_refunds_pro_rata_automatically(self):
         from gamas_bot.doc_extract import DocChunk

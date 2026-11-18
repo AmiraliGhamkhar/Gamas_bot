@@ -51,15 +51,11 @@ Useful lines:
   failover with the HTTP status and a sanitized provider message.
 - `every configured note provider failed task=… categories=… detail=…` — the
   whole eligible chain failed; `categories` are exception classes.
-- `LLM route policy task=… sensitivity=… routes=…` — why each configured
-  provider was eligible, blocked by policy or skipped.
 - `note acceptance rejected stage=… reason=unsupported_facts|unsupported_claims
   fabricated=<n>` — the final booklet gate refused delivery; the transcript
   stays available.
 - `note delivered incomplete reason=missing_numbers|missing_terms …` — the
   booklet was accepted and delivered, but the job is reported `partial`.
-- `note data sensitivity=… declared=… chars=<n>` — the one label every request
-  of this booklet carries.
 - `note repair left unresolved after N attempt(s) …` — bounded repair reached
   its limit without removing every unsupported signal.
 - `STT provider … failing over provider=… category=… detail=…` — transcription
