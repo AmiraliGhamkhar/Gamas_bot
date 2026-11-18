@@ -12,7 +12,12 @@ rules as the lecture booklet:
 * **Excel** — a real ``.xlsx`` with a right-to-left sheet, a navy header row
   that repeats on every page, frozen headings and zebra rows.
 * **PowerPoint** — a real ``.pptx`` in 16:9, with a title slide, an agenda,
-  one slide per section and a closing slide.
+  and one visually *categorized* slide group per section: the renderer reads
+  each section's lines, classifies them (grid, statistics, list, prose) and
+  styles the slide accordingly — category ribbon, badge, colour-coded rule,
+  real tables for grids and card rows for statistics. Decks have **no slide
+  cap** by default; an over-full section is split into readable «(ادامه)»
+  continuation slides instead of being refused or truncated.
 * **PDF** — handed to :mod:`gamas_bot.pdf_export`: cover, optional topic
   list, the same palette, all right-to-left, shaped with Vazirmatn.
 
@@ -34,12 +39,15 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import math
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .document.theme import THEME
 from .docx_export import ACCENT_HEX, ACCENT_SOFT_HEX, portable_text, sanitize_filename_part
 from .mdblocks import TextBlock, parse_blocks
 from .progress import to_persian_digits
@@ -78,10 +86,12 @@ _TEXT_MIME_TYPES = {
 #: The title of a document that has no better one.
 DEFAULT_TITLE = "سند"
 
-#: Ceilings that keep one document inside what a reader (and a phone) can use.
+#: Ceilings that keep one document inside what a reader (and a phone) can
+#: use. There is deliberately **no slide ceiling** here: decks grow with the
+#: text, and the renderer keeps slides readable by splitting over-full
+#: sections. A deployment that still wants a cap sets ``OFFICE_MAX_SLIDES``.
 MAX_TABLE_ROWS = 2000
 MAX_TABLE_COLUMNS = 40
-MAX_SLIDES = 40
 MAX_OFFICE_SESSION_PARTS = 200
 #: Lines per slide when the text has no headings of its own.
 FALLBACK_LINES_PER_SLIDE = 6
@@ -286,12 +296,15 @@ def build_office_document(
 # ---------------------------------------------------------------------------
 
 
-def fallback_slides(document: OfficeDocument, *, max_slides: int = MAX_SLIDES) -> list[OfficeSlide]:
+def fallback_slides(
+    document: OfficeDocument, *, max_slides: int | None = None
+) -> list[OfficeSlide]:
     """Slides built from the user's own headings — no model involved.
 
     Each heading starts a slide and the lines under it become its bullets. A
     text without headings is cut into fixed-size slides, so a deck always
-    exists for every text.
+    exists for every text. ``max_slides=None`` (the default) means the deck
+    grows with the text without any cap.
     """
     slides: list[OfficeSlide] = []
     current_title = document.title or DEFAULT_TITLE
@@ -361,6 +374,8 @@ def fallback_slides(document: OfficeDocument, *, max_slides: int = MAX_SLIDES) -
     if not slides:
         # No headings and no lines: one slide carrying the whole text.
         return [OfficeSlide(title=document.title or DEFAULT_TITLE, bullets=(), notes=document.text)]
+    if max_slides is None:
+        return slides
     if max_slides < 1:
         raise OfficeError("حد مجاز اسلاید باید دست‌کم یک باشد.")
     if len(slides) > max_slides:
@@ -574,6 +589,185 @@ def build_office_xlsx(document: OfficeDocument, tables: list[OfficeTable]) -> by
 SLIDE_WIDTH_INCHES = 13.333
 SLIDE_HEIGHT_INCHES = 7.5
 
+#: Cool slate grey from the Gamas palette: slide counters and captions.
+MUTED_HEX = THEME.ooxml(THEME.palette.muted)
+#: Cream paper tone used as the content-slide background.
+PAPER_HEX = THEME.ooxml(THEME.palette.paper)
+
+
+@dataclass(frozen=True, slots=True)
+class SlideCategory:
+    """The visual identity of one content slide, derived from its own lines.
+
+    The category decides only *how the slide looks* — ribbon and rule colour,
+    badge label, body layout. The words on the slide stay the user's own,
+    exactly as written; every colour token comes from the Gamas design system
+    (:mod:`gamas_bot.document.theme`), not from a hard-coded hex value.
+    """
+
+    key: str
+    #: Persian label shown on the slide's badge chip.
+    label: str
+    #: Ribbon, badge fill and title-rule colour (OOXML hex).
+    accent: str
+    #: Soft body-panel tint (OOXML hex).
+    tint: str
+    #: Marker glyph used for bullets / card rows.
+    glyph: str
+
+
+SLIDE_CATEGORY_TABLE = "table"
+SLIDE_CATEGORY_DATA = "data"
+SLIDE_CATEGORY_LIST = "list"
+SLIDE_CATEGORY_PROSE = "prose"
+SLIDE_CATEGORY_MIXED = "mixed"
+
+_PALETTE = THEME.palette
+
+#: The five visual treatments a content slide can take, keyed by category.
+SLIDE_CATEGORIES: dict[str, SlideCategory] = {
+    SLIDE_CATEGORY_TABLE: SlideCategory(
+        key=SLIDE_CATEGORY_TABLE,
+        label="جدول داده",
+        accent=THEME.ooxml(_PALETTE.navy_800),
+        tint=THEME.ooxml(_PALETTE.summary_fill),
+        glyph="▦",
+    ),
+    SLIDE_CATEGORY_DATA: SlideCategory(
+        key=SLIDE_CATEGORY_DATA,
+        label="داده و آمار",
+        accent=THEME.ooxml(_PALETTE.success),
+        tint=THEME.ooxml(_PALETTE.example_fill),
+        glyph="◆",
+    ),
+    SLIDE_CATEGORY_LIST: SlideCategory(
+        key=SLIDE_CATEGORY_LIST,
+        label="فهرست نکات",
+        accent=THEME.ooxml(_PALETTE.teal_700),
+        tint=THEME.ooxml(_PALETTE.note_fill),
+        glyph="▪",
+    ),
+    SLIDE_CATEGORY_PROSE: SlideCategory(
+        key=SLIDE_CATEGORY_PROSE,
+        label="متن توضیحی",
+        accent=THEME.ooxml(_PALETTE.navy_700),
+        tint=THEME.ooxml(_PALETTE.quote_fill),
+        glyph="❝",
+    ),
+    SLIDE_CATEGORY_MIXED: SlideCategory(
+        key=SLIDE_CATEGORY_MIXED,
+        label="بخش",
+        accent=ACCENT_SOFT_HEX,
+        tint=THEME.ooxml(_PALETTE.definition_fill),
+        glyph="▪",
+    ),
+}
+
+#: A grid row as the deterministic fallback renders it: cells joined by " | ".
+_TABLE_SEPARATOR = re.compile(r"\s\|\s")
+#: ASCII and Persian digits both count as «numeric» content.
+_DIGIT = re.compile(r"[0-9۰-۹]")
+
+
+def categorize_slide(slide: OfficeSlide) -> str:
+    """Classify a slide's *content* so the renderer can style it.
+
+    Order matters: a grid is the most specific shape, prose the least. The
+    classification only reads the user's lines; it never changes them.
+    """
+    lines = [line.strip() for line in slide.bullets if line.strip()]
+    if not lines:
+        return SLIDE_CATEGORY_PROSE
+    table_like = sum(1 for line in lines if _TABLE_SEPARATOR.search(line))
+    if table_like >= 2 and table_like * 2 >= len(lines):
+        return SLIDE_CATEGORY_TABLE
+    numeric = sum(1 for line in lines if _DIGIT.search(line) and len(line) <= 90)
+    if numeric >= 2 and numeric * 5 >= len(lines) * 3:
+        return SLIDE_CATEGORY_DATA
+    short = sum(1 for line in lines if len(line) <= 70)
+    if len(lines) >= 4 and short * 2 >= len(lines):
+        return SLIDE_CATEGORY_LIST
+    if len(lines) <= 3:
+        return SLIDE_CATEGORY_PROSE
+    return SLIDE_CATEGORY_MIXED
+
+
+#: Visual-fit bounds for one content slide. Text is never dropped to make a
+#: slide fit: an over-full section is split into «(ادامه)» continuation
+#: slides, so removing the slide cap cannot produce unreadable walls of text.
+LIST_LINES_COMFORTABLE = 8
+LIST_LINES_COMPACT = 12
+DATA_CARDS_PER_SLIDE = 8
+TABLE_ROWS_PER_SLIDE = 9
+PROSE_RENDER_LINES = 10
+_LIST_CHARS_PER_LINE = 76
+_PROSE_CHARS_PER_LINE = 62
+
+
+def _wrapped_lines(text: str, chars_per_line: int) -> int:
+    """Estimate the rendered line count of one string in a fixed-width box."""
+    return max(1, math.ceil(len(text) / max(1, chars_per_line)))
+
+
+def _split_lines_by_budget(
+    lines: list[str], chars_per_line: int, budget: int
+) -> list[list[str]]:
+    """Group lines so each group's estimated rendered height fits ``budget``."""
+    groups: list[list[str]] = []
+    current: list[str] = []
+    used = 0
+    for line in lines:
+        cost = _wrapped_lines(line, chars_per_line)
+        if current and used + cost > budget:
+            groups.append(current)
+            current, used = [], 0
+        current.append(line)
+        used += cost
+    if current:
+        groups.append(current)
+    return groups or [[]]
+
+
+def fit_slide_parts(slide: OfficeSlide, category: str) -> list[OfficeSlide]:
+    """Split one logical section into slides that stay readable on a phone.
+
+    Splitting is arrangement, not editing: every line re-appears verbatim and
+    in order, each part carries its own lines in the notes pane, and
+    continuation slides repeat the section title with a «(ادامه)» suffix. A
+    grid keeps its header row on every part, so a long table never strands a
+    data row under the wrong heading.
+    """
+    lines = [line for line in slide.bullets if line.strip()]
+    if not lines:
+        return [slide]
+    if category == SLIDE_CATEGORY_TABLE:
+        grid = [line for line in lines if _TABLE_SEPARATOR.search(line)]
+        plain = [line for line in lines if not _TABLE_SEPARATOR.search(line)]
+        header, rest = grid[0], grid[1:]
+        groups = [
+            [header, *rest[index : index + TABLE_ROWS_PER_SLIDE]]
+            for index in range(0, len(rest), TABLE_ROWS_PER_SLIDE)
+        ] or [[header]]
+        if plain:
+            groups[0] = [*plain, *groups[0]]
+    elif category == SLIDE_CATEGORY_DATA:
+        groups = [
+            lines[index : index + DATA_CARDS_PER_SLIDE]
+            for index in range(0, len(lines), DATA_CARDS_PER_SLIDE)
+        ]
+    elif category == SLIDE_CATEGORY_PROSE:
+        groups = _split_lines_by_budget(lines, _PROSE_CHARS_PER_LINE, PROSE_RENDER_LINES)
+    else:
+        groups = _split_lines_by_budget(lines, _LIST_CHARS_PER_LINE, LIST_LINES_COMPACT)
+    return [
+        OfficeSlide(
+            title=slide.title if index == 0 else f"{slide.title} (ادامه)",
+            bullets=tuple(group),
+            notes="\n".join(group).strip(),
+        )
+        for index, group in enumerate(groups)
+    ]
+
 
 def _hex_rgb(value: str):
     from pptx.dml.color import RGBColor
@@ -691,18 +885,253 @@ def _add_notes(slide, text: str) -> None:
         _rtl_paragraph(paragraph, align="r")
 
 
+def _add_badge(slide, label: str, color: str) -> None:
+    """A small rounded chip naming the slide's category (top-left corner)."""
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.enum.text import MSO_ANCHOR
+    from pptx.util import Inches
+
+    width = 0.45 + len(label) * 0.14
+    chip = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE,
+        Inches(0.55),
+        Inches(0.45),
+        Inches(width),
+        Inches(0.42),
+    )
+    chip.fill.solid()
+    chip.fill.fore_color.rgb = _hex_rgb(color)
+    chip.line.fill.background()
+    chip.shadow.inherit = False
+    frame = chip.text_frame
+    frame.word_wrap = False
+    frame.margin_left = frame.margin_right = Inches(0.05)
+    frame.margin_top = frame.margin_bottom = 0
+    frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+    paragraph = frame.paragraphs[0]
+    _rtl_paragraph(paragraph, align="ctr", space_after=0)
+    run = paragraph.add_run()
+    run.text = label
+    _set_run_font(run, name=OFFICE_FONT, size=12, bold=True, color=ON_ACCENT_HEX)
+
+
+def _content_slide_scaffold(
+    prs, section: OfficeSlide, style: SlideCategory, slide_no: int, deck_total: int
+):
+    """The shared frame of every content slide.
+
+    A full-height category ribbon on the right edge (the «start» edge in
+    RTL), the category badge, the section title with a category-coloured
+    rule, and a small Persian slide counter at the bottom corner.
+    """
+    slide = _blank_slide(prs)
+    _paint_background(slide, PAPER_HEX)
+    _add_rectangle(
+        slide,
+        left=SLIDE_WIDTH_INCHES - 0.22,
+        top=0.0,
+        width=0.22,
+        height=SLIDE_HEIGHT_INCHES,
+        color=style.accent,
+    )
+    _add_badge(slide, style.label, style.accent)
+    heading = _add_textbox(slide, left=0.9, top=0.98, width=11.9, height=0.95)
+    _write_lines(heading, [(section.title, 27, True, ACCENT_HEX, "r")])
+    _add_rectangle(slide, left=0.9, top=1.92, width=11.9, height=0.035, color=style.accent)
+    counter = _add_textbox(slide, left=0.55, top=7.02, width=1.7, height=0.34)
+    _write_lines(
+        counter,
+        [
+            (
+                f"{to_persian_digits(slide_no)} / {to_persian_digits(deck_total)}",
+                10,
+                False,
+                MUTED_HEX,
+                "ctr",
+            )
+        ],
+        align="ctr",
+    )
+    return slide
+
+
+def _render_list_body(slide, section: OfficeSlide, style: SlideCategory) -> None:
+    """Bulleted body: category marker glyphs, size auto-fitted to the lines."""
+    lines = [line for line in section.bullets if line.strip()]
+    if not lines:
+        return
+    rendered = sum(_wrapped_lines(line, _LIST_CHARS_PER_LINE) for line in lines)
+    size = 19.0 if rendered <= LIST_LINES_COMFORTABLE else 16.0
+    body = _add_textbox(slide, left=0.9, top=2.25, width=11.7, height=4.55)
+    _write_lines(
+        body,
+        [(f"{style.glyph} {line}", size, False, BODY_HEX, "r") for line in lines],
+        line_spacing=1.3,
+    )
+
+
+def _render_prose_body(slide, section: OfficeSlide, style: SlideCategory) -> None:
+    """Long-form lines on a tinted quote-style panel with an accent frame."""
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.enum.text import MSO_ANCHOR
+    from pptx.util import Inches, Pt
+
+    lines = [line for line in section.bullets if line.strip()]
+    if not lines:
+        return
+    rendered = sum(_wrapped_lines(line, _PROSE_CHARS_PER_LINE) for line in lines)
+    size = 18.0 if rendered <= LIST_LINES_COMFORTABLE else 15.0
+    panel = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE,
+        Inches(0.95),
+        Inches(2.3),
+        Inches(11.55),
+        Inches(4.35),
+    )
+    panel.fill.solid()
+    panel.fill.fore_color.rgb = _hex_rgb(style.tint)
+    panel.line.color.rgb = _hex_rgb(style.accent)
+    panel.line.width = Pt(1.2)
+    panel.shadow.inherit = False
+    frame = panel.text_frame
+    frame.word_wrap = True
+    frame.margin_left = frame.margin_right = Inches(0.35)
+    frame.margin_top = frame.margin_bottom = Inches(0.25)
+    frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+    _write_lines(
+        frame, [(line, size, False, BODY_HEX, "r") for line in lines], line_spacing=1.35
+    )
+
+
+def _render_data_body(slide, section: OfficeSlide, style: SlideCategory) -> None:
+    """Statistic-style lines as a stack of tinted cards, one card per line."""
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.enum.text import MSO_ANCHOR
+    from pptx.util import Inches
+
+    lines = [line for line in section.bullets if line.strip()]
+    if not lines:
+        return
+    card_height = 0.5
+    gap = 0.06
+    top = 2.25
+    for index, line in enumerate(lines):
+        card = slide.shapes.add_shape(
+            MSO_SHAPE.ROUNDED_RECTANGLE,
+            Inches(0.95),
+            Inches(top),
+            Inches(11.55),
+            Inches(card_height),
+        )
+        card.fill.solid()
+        card.fill.fore_color.rgb = _hex_rgb(style.tint if index % 2 == 0 else "FFFFFF")
+        card.line.fill.background()
+        card.shadow.inherit = False
+        frame = card.text_frame
+        frame.word_wrap = True
+        frame.margin_left = frame.margin_right = Inches(0.25)
+        frame.margin_top = frame.margin_bottom = 0
+        frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+        paragraph = frame.paragraphs[0]
+        _rtl_paragraph(paragraph, align="r", space_after=0)
+        marker = paragraph.add_run()
+        marker.text = f"{style.glyph} "
+        _set_run_font(marker, name=OFFICE_FONT, size=15, bold=True, color=style.accent)
+        run = paragraph.add_run()
+        run.text = line
+        _set_run_font(run, name=OFFICE_FONT, size=15, bold=True, color=BODY_HEX)
+        top += card_height + gap
+
+
+def _render_table_body(slide, section: OfficeSlide, style: SlideCategory) -> None:
+    """Grid lines as a real PowerPoint table: accent header, zebra rows, RTL.
+
+    The first grid line is the header row (the deterministic fallback keeps
+    the source grid's header first, and continuation parts repeat it). Any
+    non-grid line of the section becomes a small caption above the table, so
+    no sentence of the user's text leaves the slide.
+    """
+    from pptx.enum.text import MSO_ANCHOR
+    from pptx.util import Inches
+
+    lines = [line for line in section.bullets if line.strip()]
+    grid = [line for line in lines if _TABLE_SEPARATOR.search(line)]
+    plain = [line for line in lines if not _TABLE_SEPARATOR.search(line)]
+    top = 2.25
+    if plain:
+        caption = _add_textbox(slide, left=0.9, top=top, width=11.7, height=0.55)
+        _write_lines(caption, [(" — ".join(plain), 13, False, MUTED_HEX, "r")])
+        top += 0.65
+    if not grid:
+        return
+    rows = [[cell.strip() for cell in line.split("|")] for line in grid]
+    columns = max(len(row) for row in rows)
+    rows = [row + [""] * (columns - len(row)) for row in rows]
+    height = min(7.0 - top, max(0.42 * len(rows), 0.5))
+    graphic = slide.shapes.add_table(
+        len(rows), columns, Inches(0.95), Inches(top), Inches(11.55), Inches(height)
+    )
+    table = graphic.table
+    try:
+        # RTL table: the user's first logical column is the rightmost one,
+        # and our explicit fills replace the theme's banding.
+        tbl_pr = table._tbl.tblPr
+        tbl_pr.set("rtl", "1")
+        tbl_pr.set("firstRow", "0")
+        tbl_pr.set("bandRow", "0")
+    except AttributeError:  # pragma: no cover - python-pptx always has tblPr
+        pass
+    for column in table.columns:
+        column.width = Inches(11.55 / columns)
+    row_height = Inches(max(0.36, min(0.5, height / max(1, len(rows)))))
+    for row_index, row in enumerate(rows):
+        table.rows[row_index].height = row_height
+        header = row_index == 0
+        for column_index in range(columns):
+            cell = table.cell(row_index, column_index)
+            cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+            cell.margin_left = cell.margin_right = Inches(0.08)
+            cell.margin_top = cell.margin_bottom = Inches(0.02)
+            cell.fill.solid()
+            cell.fill.fore_color.rgb = _hex_rgb(
+                style.accent if header else (style.tint if row_index % 2 == 1 else "FFFFFF")
+            )
+            text_frame = cell.text_frame
+            text_frame.word_wrap = True
+            paragraph = text_frame.paragraphs[0]
+            _rtl_paragraph(paragraph, align="ctr" if header else "r", space_after=0)
+            run = paragraph.add_run()
+            run.text = row[column_index]
+            _set_run_font(
+                run,
+                name=OFFICE_FONT,
+                size=13 if header else 12,
+                bold=header,
+                color=ON_ACCENT_HEX if header else BODY_HEX,
+            )
+
+
 def build_office_pptx(
     document: OfficeDocument,
     slides: list[OfficeSlide],
     *,
     subtitle: str = "",
-    max_slides: int = MAX_SLIDES,
+    max_slides: int | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> bytes:
-    """Build the ``.pptx`` file: title, agenda, one slide per section, closing.
+    """Build the ``.pptx`` file: title, agenda, categorized content, closing.
 
-    The deck follows the booklet's palette (deep navy, steel blue) and the
-    same right-to-left rules: every paragraph is marked RTL and aligned to
-    the right, and Persian runs carry a complex-script face.
+    The deck follows the booklet's palette (deep navy, teal, cream paper) and
+    the same right-to-left rules: every paragraph is marked RTL and aligned
+    to the right, and Persian runs carry a complex-script face. Each section
+    is *categorized* from its own lines (grid, statistics, list, prose) and
+    styled with that category's ribbon, badge, rule and body layout; an
+    over-full section becomes as many «(ادامه)» slides as the text needs.
+    ``max_slides=None`` (the default) lifts the slide cap entirely.
+
+    ``on_progress(done, total)`` is a synchronous hook called as content
+    slides are drawn; the bot wires it to the user-facing progress bar. It is
+    best-effort: a failing callback never breaks the build.
     """
     try:
         from pptx import Presentation
@@ -712,21 +1141,42 @@ def build_office_pptx(
 
     sections = list(slides)
     fixed_slides = 3  # title, agenda and closing
-    if max_slides < fixed_slides + 1:
-        raise OfficeError("سقف ارائه باید دست‌کم ۴ اسلاید باشد (عنوان، فهرست، محتوا و پایان).")
-    max_content_slides = max_slides - fixed_slides
-    if len(sections) > max_content_slides:
-        required = len(sections) + fixed_slides
-        raise OfficeError(
-            f"ارائه با اسلایدهای عنوان، فهرست و پایان به {required} اسلاید نیاز دارد؛ "
-            f"سقف فعلی {max_slides} است. متن را کوتاه‌تر یا OFFICE_MAX_SLIDES را بیشتر کنید."
-        )
+    if max_slides is not None:
+        if max_slides < fixed_slides + 1:
+            raise OfficeError("سقف ارائه باید دست‌کم ۴ اسلاید باشد (عنوان، فهرست، محتوا و پایان).")
+        max_content_slides = max_slides - fixed_slides
+        if len(sections) > max_content_slides:
+            required = len(sections) + fixed_slides
+            raise OfficeError(
+                f"ارائه با اسلایدهای عنوان، فهرست و پایان به {required} اسلاید نیاز دارد؛ "
+                f"سقف فعلی {max_slides} است. متن را کوتاه‌تر کنید یا OFFICE_MAX_SLIDES "
+                "را صفر (نامحدود) بگذارید."
+            )
     if not sections:
         sections = [OfficeSlide(title=document.title or DEFAULT_TITLE, bullets=())]
+
+    # Categorize before drawing anything: the agenda shows each section's
+    # category colour, and fit-splitting turns over-full sections into
+    # readable continuation slides.
+    categorized = [(section, categorize_slide(section)) for section in sections]
+    planned: list[tuple[OfficeSlide, SlideCategory]] = [
+        (part, SLIDE_CATEGORIES[category])
+        for section, category in categorized
+        for part in fit_slide_parts(section, category)
+    ]
+
+    def announce(done: int, total: int) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(done, total)
+        except Exception:  # pragma: no cover - progress must never break a build
+            logger.debug("pptx progress callback failed", exc_info=True)
 
     presentation = Presentation()
     presentation.slide_width = Inches(SLIDE_WIDTH_INCHES)
     presentation.slide_height = Inches(SLIDE_HEIGHT_INCHES)
+    deck_total = len(planned) + fixed_slides
 
     # --- title slide ------------------------------------------------------
     title_slide = _blank_slide(presentation)
@@ -747,36 +1197,41 @@ def build_office_pptx(
             subtitle_frame, [(subtitle, 18, False, "D6E4F0", "ctr")], align="ctr"
         )
 
-    # --- agenda slide -----------------------------------------------------
+    # --- agenda slide: one colour-coded entry per section -----------------
     agenda_slide = _blank_slide(presentation)
+    _paint_background(agenda_slide, PAPER_HEX)
     agenda_frame = _add_textbox(agenda_slide, left=0.9, top=0.8, width=11.5, height=0.9)
     _write_lines(agenda_frame, [("فهرست مطالب", 30, True, ACCENT_HEX, "r")])
     _add_rectangle(agenda_slide, left=0.9, top=1.75, width=11.5, height=0.03, color=ACCENT_SOFT_HEX)
-    agenda_items: list[tuple[str, float, bool, str, str]] = []
-    from .progress import to_persian_digits
-
-    for index, section in enumerate(sections, start=1):
-        agenda_items.append(
-            (f"{to_persian_digits(index)}. {section.title}", 18, False, BODY_HEX, "r")
-        )
     agenda_body = _add_textbox(agenda_slide, left=0.9, top=2.1, width=11.5, height=4.6)
-    _write_lines(agenda_body, agenda_items, line_spacing=1.35)
+    for index, (section, category) in enumerate(categorized, start=1):
+        style = SLIDE_CATEGORIES[category]
+        paragraph = agenda_body.paragraphs[0] if index == 1 else agenda_body.add_paragraph()
+        _rtl_paragraph(paragraph, align="r")
+        paragraph.line_spacing = 1.3
+        # The dot carries the section's category colour, so the agenda works
+        # as a legend for the ribbons and badges of the content slides.
+        dot = paragraph.add_run()
+        dot.text = "● "
+        _set_run_font(dot, name=OFFICE_FONT, size=16, bold=True, color=style.accent)
+        run = paragraph.add_run()
+        run.text = f"{to_persian_digits(index)}. {section.title}"
+        _set_run_font(run, name=OFFICE_FONT, size=18, bold=False, color=BODY_HEX)
+    announce(0, len(planned))
 
-    # --- one slide per section -------------------------------------------
-    for section in sections:
-        slide = _blank_slide(presentation)
-        heading = _add_textbox(slide, left=0.9, top=0.75, width=11.5, height=1.1)
-        _write_lines(heading, [(section.title, 30, True, ACCENT_HEX, "r")])
-        _add_rectangle(slide, left=0.9, top=1.85, width=11.5, height=0.03, color=ACCENT_SOFT_HEX)
-        bullets = [line for line in section.bullets if line.strip()]
-        if bullets:
-            body = _add_textbox(slide, left=0.9, top=2.2, width=11.5, height=4.5)
-            _write_lines(
-                body,
-                [(f"▪ {line}", 19, False, BODY_HEX, "r") for line in bullets],
-                line_spacing=1.35,
-            )
-        _add_notes(slide, section.notes)
+    # --- categorized content slides (auto-split for readability) ----------
+    for offset, (part, style) in enumerate(planned):
+        slide = _content_slide_scaffold(presentation, part, style, offset + 3, deck_total)
+        if style.key == SLIDE_CATEGORY_TABLE:
+            _render_table_body(slide, part, style)
+        elif style.key == SLIDE_CATEGORY_DATA:
+            _render_data_body(slide, part, style)
+        elif style.key == SLIDE_CATEGORY_PROSE:
+            _render_prose_body(slide, part, style)
+        else:
+            _render_list_body(slide, part, style)
+        _add_notes(slide, part.notes)
+        announce(offset + 1, len(planned))
 
     # --- closing slide ----------------------------------------------------
     closing = _blank_slide(presentation)

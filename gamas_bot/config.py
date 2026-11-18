@@ -614,6 +614,9 @@ class Settings:
     office_enabled: bool
     office_max_input_bytes: int
     office_max_chars: int
+    #: Slide cap for generated decks. ``0`` means **unlimited** (the default):
+    #: the deck grows with the text and the renderer keeps slides readable by
+    #: splitting over-full sections into continuation slides.
     office_max_slides: int
     office_session_ttl_minutes: int
     office_min_interval_seconds: float
@@ -1438,8 +1441,10 @@ def from_env(env_file: str | None = None) -> Settings:
         office_max_chars=_env_int(
             "OFFICE_MAX_CHARS", 100_000, minimum=200, maximum=1_000_000
         ),
+        # 0 = unlimited deck size; the renderer splits over-full sections
+        # into readable continuation slides instead of refusing the build.
         office_max_slides=_env_int(
-            "OFFICE_MAX_SLIDES", 30, minimum=4, maximum=200
+            "OFFICE_MAX_SLIDES", 0, minimum=0, maximum=100_000
         ),
         office_session_ttl_minutes=_env_int(
             "OFFICE_SESSION_TTL_MINUTES", 30, minimum=1, maximum=1440
