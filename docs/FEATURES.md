@@ -84,6 +84,12 @@ no page image is ever sent to a third-party recognition service.
 - The source card offers extracted text, full booklets, compact revision notes,
   exports, the original download and learning actions. Page/section/slide
   locators stay attached.
+- Booklet generation shows the same pipeline stages as lecture notes:
+  «اعتبارسنجی جزوه با متن سند» (evidence gate) and «ویرایش نهایی جزوه»
+  (editorial compile) appear on the progress bar, and an accepted booklet
+  whose coverage is imperfect is delivered with an explicit completion note
+  instead of a «verified» claim. Compact revision notes report per-chunk
+  progress and the same final validation stage.
 - Identical uploads reuse the same user's extraction; caches are owner-scoped.
 - The code-default ceilings are `DOC_MAX_BYTES=1073741824` (1 GiB) and
   `DOC_UNPACKED_MAX_BYTES=1073741824`, with 5 000 000 extracted characters and
@@ -111,10 +117,17 @@ pick Word, Excel, PowerPoint or PDF.
 - One private in-memory draft per user, `OFFICE_SESSION_TTL_MINUTES=30`, cleared
   on cancel/navigation/shutdown.
 - Limits: `OFFICE_MAX_CHARS=100000`, `OFFICE_MAX_INPUT_BYTES=1000000`,
-  `OFFICE_MAX_SLIDES=30`, Excel tables up to 2000 rows × 40 columns, output
-  files up to 50 MiB, `OFFICE_JOB_CONCURRENCY=2`.
+  Excel tables up to 2000 rows × 40 columns, output files up to 50 MiB,
+  `OFFICE_JOB_CONCURRENCY=2`. Decks have **no slide cap** by default
+  (`OFFICE_MAX_SLIDES=0`); a positive value restores a hard cap.
+- PowerPoint decks are visually categorized: each section's lines are
+  classified (grid / statistics / list / prose / mixed) and rendered with a
+  category ribbon, badge and colour-coded agenda dots; grid sections become
+  real RTL tables and over-full sections split into «(ادامه)» slides.
 - Excel cells are literal strings: `=1+2` is stored, never evaluated. Text to
   PowerPoint creates a new deck; it is not a visual conversion of a document.
+- Every build shows a multi-stage progress bar (analysis → layout → graphic
+  design per slide → delivery).
 
 Office and document notes/exports never spend user credit or learning gifts, but
 configured AI calls still cost the operator money.

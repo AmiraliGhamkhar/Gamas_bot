@@ -4,6 +4,30 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Document booklets: same visible quality pipeline as lecture notes.** The
+📘 جزوهٔ کامل / ⚡ مرور سریع actions on an uploaded PDF/DOCX/PPTX now wire the
+note pipeline's stage callbacks through to the chat progress bar, so the user
+sees «اعتبارسنجی جزوه با متن سند» and «ویرایش نهایی جزوه» exactly like the
+audio flow — including on the deterministic no-provider path, where the
+extractive booklet is the analogue of those passes. Compact revision notes
+report per-chunk extraction progress and the final whole-document validation.
+An accepted booklet whose coverage is imperfect (the pipeline's
+`on_incomplete` signal) is still delivered, but the completion message now
+says so explicitly instead of claiming a verified result.
+
+**Free Office: unlimited, categorized PowerPoint decks with a real progress
+bar.** The slide cap is gone by default (`OFFICE_MAX_SLIDES=0` = unlimited; a
+positive value restores the old hard cap, and an explicit `max_slides=`
+argument is still enforced by the builders). Each content section is now
+classified from its own lines — grid, statistics, list, prose or mixed — and
+rendered with a category ribbon, a Persian badge, colour-coded agenda dots
+and a per-category body layout (real RTL tables for grids, tinted cards for
+statistics, quote panels for prose). Over-full sections split into «(ادامه)»
+continuation slides with the table header repeated, so unlimited decks stay
+readable; the user's lines are still never rewritten. The build reports a
+multi-stage progress bar (text analysis → deck planning → per-slide graphic
+design → delivery) for both session texts and extracted documents.
+
 **Documentation alignment.** Clarified that a transcript is stored and its
 charge settled before optional note generation, with downloads offered on the
 final results screen. Corrected SQLite artifact storage, test dependencies,

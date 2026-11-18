@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -24,6 +25,7 @@ from .notes import (
     NoteSection,
     StructuredNotes,
     StructuringError,
+    compile_will_run,
     enforce_final_acceptance,
     ensure_structured_booklet,
     gate_notes,
@@ -33,6 +35,25 @@ from .notes import (
 from .notes_evidence import SignalAudit, audit_notes, content_words, extract_signals, split_sentences
 
 logger = logging.getLogger(__name__)
+
+#: Pipeline-stage reporter, mirroring :mod:`gamas_bot.notes`'s contract: called
+#: with ``"validating"``/``"compiling"`` so the caller can show the evidence
+#: gate and the final editorial pass on its progress bar.
+StageCallback = Callable[[str], Awaitable[None]]
+#: Called when an accepted booklet still omits source facts (the reason).
+IncompleteCallback = Callable[[str], Awaitable[None]]
+#: Per-chunk reporter for the compact pipeline: ``(done, total)``.
+ChunkCallback = Callable[[int, int], Awaitable[None]]
+
+
+async def _notify(callback: Any, *args: Any) -> None:
+    """Invoke a progress/stage callback without ever failing the note build."""
+    if callback is None:
+        return
+    try:
+        await callback(*args)
+    except Exception:  # noqa: BLE001 - reporting is never a note failure
+        logger.warning("office note progress callback failed", exc_info=True)
 
 #: Source material sent to the compact-only prompt in one request. The bound
 #: keeps the prompt small even when an extracted file contains many pages.
@@ -425,8 +446,18 @@ async def generate_full_booklet(
     title: str,
     settings: Settings,
     session: Any,
+    on_stage: StageCallback | None = None,
+    on_incomplete: IncompleteCallback | None = None,
 ) -> tuple[StructuredNotes, bool]:
-    """Run the existing full booklet pipeline, with a complete safe fallback."""
+    """Run the existing full booklet pipeline, with a complete safe fallback.
+
+    ``on_stage`` is forwarded to the map-reduce pipeline, so the caller's
+    progress bar shows the same evidence gate («اعتبارسنجی») and editorial
+    compile («ویرایش نهایی») stages the lecture pipeline shows; the callback
+    never changes the outcome. ``on_incomplete`` is forwarded as well: an
+    accepted booklet whose coverage is imperfect is delivered and reported,
+    exactly like the audio flow.
+    """
     source = source_text(chunks, include_locators=True)
     source_chars = len(source_text(chunks, include_locators=False))
     if source_chars > MAX_OFFICE_NOTE_SOURCE_CHARS:
@@ -444,6 +475,15 @@ async def generate_full_booklet(
             fallback, fallback_report, mode="full", stage="office_fallback"
         )
     if not settings.note_configured or session is None:
+        # Same visible contract as the model path: the deterministic booklet
+        # also passes the evidence gate, and the editor-assembled fallback is
+        # the deterministic analogue of the final editorial pass. When strict
+        # grounding is off the pipeline below would skip those stages, so the
+        # fallback must not claim them either.
+        if getattr(settings, "note_strict_grounding", False):
+            await _notify(on_stage, "validating")
+        if compile_will_run(fallback, settings, mode="full", presentation=False):
+            await _notify(on_stage, "compiling")
         return fallback, True
     locator_sources = _locator_source_map(chunks)
     allowed = tuple(dict.fromkeys((*locators_in_chunks(chunks), *locator_sources)))
@@ -454,6 +494,8 @@ async def generate_full_booklet(
             session,
             mode="full",
             source_locators=True,
+            on_stage=on_stage,
+            on_incomplete=on_incomplete,
         )
     except (LLMError, StructuringError) as exc:
         logger.warning("Office full booklet using source fallback error=%s", type(exc).__name__)
@@ -598,8 +640,16 @@ async def generate_compact_notes(
     title: str,
     settings: Settings,
     session: Any,
+    on_stage: StageCallback | None = None,
+    on_chunk: ChunkCallback | None = None,
 ) -> tuple[CompactNotes, bool]:
-    """Build compact notes with a dedicated prompt/schema or extractive fallback."""
+    """Build compact notes with a dedicated prompt/schema or extractive fallback.
+
+    ``on_chunk(done, total)`` reports each finished source chunk — in the
+    model path as answers arrive, in the extractive path as sections are
+    selected — and ``on_stage("validating")`` marks the final whole-document
+    evidence audit, so the caller's progress bar mirrors the full booklet's.
+    """
     if not chunks:
         raise StructuringError("متن قابل استفاده‌ای برای یادداشت مرور سریع پیدا نشد.")
     chunks = _rechunk_source_chunks(chunks, max_chars=MAX_COMPACT_INPUT_CHARS)
@@ -609,19 +659,25 @@ async def generate_compact_notes(
             "متن استخراج‌شده از سقف تولید یادداشت مرور سریع بیشتر است؛ فایل اصلی را دریافت کنید "
             "و سند را به چند بخش کوچک‌تر تقسیم کنید."
         )
-    fallback_sections = tuple(
-        _extractive_compact_section(chunk, index=index)
-        for index, chunk in enumerate(chunks, start=1)
-    )
-    fallback = CompactNotes(title or "مرور سریع", fallback_sections)
-    if not settings.note_configured or session is None:
+    fallback_sections: list[CompactSection] = []
+    provider_active = settings.note_configured and session is not None
+    for index, chunk in enumerate(chunks, start=1):
+        fallback_sections.append(_extractive_compact_section(chunk, index=index))
+        # The AI path reports each chunk from ``make_one`` as answers arrive;
+        # without a provider the deterministic selection *is* the work.
+        if not provider_active:
+            await _notify(on_chunk, index, len(chunks))
+    fallback = CompactNotes(title or "مرور سریع", tuple(fallback_sections))
+    if not provider_active:
         result = fallback
         used_fallback = True
     else:
         concurrency = max(1, min(8, int(settings.note_concurrency or 1)))
         semaphore = asyncio.Semaphore(concurrency)
+        completed = 0
 
         async def make_one(index: int, source: OfficeSourceChunk) -> tuple[CompactSection, bool]:
+            nonlocal completed
             deterministic = _extractive_compact_section(source, index=index)
             async with semaphore:
                 try:
@@ -639,11 +695,17 @@ async def generate_compact_notes(
                         index,
                         type(exc).__name__,
                     )
+                    completed += 1
+                    await _notify(on_chunk, completed, len(chunks))
                     return deterministic, True
             parsed = _parse_compact_payload(payload, source=source, index=index)
             if parsed is None or not _compact_section_grounded(parsed, source):
                 logger.warning("Office compact chunk using extractive fallback index=%d validation=failed", index)
+                completed += 1
+                await _notify(on_chunk, completed, len(chunks))
                 return deterministic, True
+            completed += 1
+            await _notify(on_chunk, completed, len(chunks))
             return parsed, False
 
         results = await asyncio.gather(
@@ -664,6 +726,7 @@ async def generate_compact_notes(
         )
     # One final whole-document audit catches interactions between chunks as
     # well as any model output that slipped through a per-chunk check.
+    await _notify(on_stage, "validating")
     adapted = result.as_structured_notes()
     complete_source = source_text(chunks, include_locators=True)
     report = audit_notes(complete_source, adapted)

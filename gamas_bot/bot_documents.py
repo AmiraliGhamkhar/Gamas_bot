@@ -617,12 +617,21 @@ class DocumentOfficeWorkflowMixin:
         source_name: str | None,
         kind: str,
         reference: str,
+        progress: WorkProgress | None = None,
     ) -> tuple[str, bytes, str, str]:
         if kind not in OFFICE_FORMATS:
             raise OfficeError("قالب خروجی آفیس رایگان نامعتبر است.")
+
+        async def _report(percent: int, stage: str, detail: str = "") -> None:
+            if progress is not None:
+                await progress.update(percent, stage, detail)
+
         suffix = Path(source_name).suffix.lower() if source_name else ""
         delimiter = "," if suffix == ".csv" else "\t" if suffix == ".tsv" else None
         artifact_title = short_title(title, max_words=3, fallback=FALLBACK_OFFICE)
+        await _report(
+            8, "تحلیل و دسته‌بندی متن", "متن بررسی و به بخش‌های ساختاری تقسیم می‌شود…"
+        )
         document = await run_file_io(
             build_office_document,
             source_text,
@@ -637,6 +646,9 @@ class DocumentOfficeWorkflowMixin:
         label = FORMAT_LABELS[kind]
         filename = office_filename(document.title, kind, reference)
         if kind == "word":
+            await _report(
+                30, "صفحه‌آرایی سند Word", "سرصفحه، قاب صفحه و قالب راست‌به‌چپ اعمال می‌شود…"
+            )
             payload = await run_file_io(
                 build_plain_docx,
                 document.title,
@@ -647,8 +659,12 @@ class DocumentOfficeWorkflowMixin:
                 mode_label=f"آفیس رایگان — {label}",
                 heading_offset=OFFICE_HEADING_OFFSET,
             )
+            await _report(50, "نهایی‌سازی سند Word")
             caption = f"🗂 سند آزاد — {label} | {document.title}"
         elif kind == "excel":
+            await _report(
+                20, "استخراج و چیدمان جدول‌ها", "ساختار جدول‌های متن شما شناسایی می‌شود…"
+            )
             tables = await run_file_io(office_document_tables, document)
             source_has_table = any(block.kind == "table" for block in document.blocks)
             if (
@@ -656,6 +672,9 @@ class DocumentOfficeWorkflowMixin:
                 and self.settings.note_configured
                 and len(document.text) <= MAX_DECK_CHUNK_CHARS
             ):
+                await _report(
+                    32, "استنباط جدول با هوش مصنوعی", "چیدمان ستون‌ها از روی متن پیشنهاد می‌شود…"
+                )
                 inferred = await infer_table(
                     document.text,
                     settings=self.settings,
@@ -677,12 +696,21 @@ class DocumentOfficeWorkflowMixin:
                         for line in source_lines
                     ):
                         tables = [inferred]
+            await _report(45, "ساخت کاربرگ Excel", "ردیف‌های زبرا و سرستون ثابت اعمال می‌شود…")
             payload = await run_file_io(build_office_xlsx, document, tables)
             caption = f"🗂 سند آزاد — {label} | {document.title}"
         elif kind == "ppt":
+            # 0 (the default) means unlimited: the deck grows with the text
+            # and the renderer splits over-full sections into readable slides.
+            configured_cap = max(0, int(getattr(self.settings, "office_max_slides", 0) or 0))
+            max_content_slides = configured_cap - 3 if configured_cap else None
             slides = None
-            max_content_slides = self.settings.office_max_slides - 3
             if self.settings.note_configured:
+                await _report(
+                    14,
+                    "طراحی ساختار ارائه",
+                    "بهترین چیدمان بخش‌ها برای متن شما انتخاب می‌شود…",
+                )
                 slides = await plan_deck(
                     document.text,
                     settings=self.settings,
@@ -695,24 +723,61 @@ class DocumentOfficeWorkflowMixin:
                     document,
                     max_slides=max_content_slides,
                 )
+            await _report(
+                28,
+                "چیدمان و طبقه‌بندی اسلایدها",
+                f"{to_persian_digits(len(slides))} بخش شناسایی شد؛ دستهٔ گرافیکی هر بخش تعیین می‌شود…",
+            )
+            slide_hook = None
+            if progress is not None:
+                loop = asyncio.get_running_loop()
+                hook_state = {"percent": -1, "closed": False}
+
+                def slide_hook(done: int, total: int) -> None:
+                    percent = 38 + round(14 * done / max(1, total))
+                    if percent == hook_state["percent"] and done < total:
+                        return
+                    hook_state["percent"] = percent
+
+                    async def _publish_hook() -> None:
+                        # The builder runs in the file-IO thread; a frame that
+                        # was queued before the build finished must not paint
+                        # over the later delivery/completion stages.
+                        if hook_state["closed"]:
+                            return
+                        await progress.update(
+                            percent,
+                            "طراحی گرافیک و رنگ‌بندی اسلایدها",
+                            f"اسلاید {to_persian_digits(done)} از {to_persian_digits(total)}",
+                        )
+
+                    asyncio.run_coroutine_threadsafe(_publish_hook(), loop)
+
             payload = await run_file_io(
                 build_office_pptx,
                 document,
                 slides,
                 subtitle="ارائهٔ تازه از متن؛ قالب‌بندی فایل اصلی تبدیل نمی‌شود",
-                max_slides=self.settings.office_max_slides,
+                max_slides=configured_cap or None,
+                on_progress=slide_hook,
             )
+            if slide_hook is not None:
+                hook_state["closed"] = True
+            await _report(54, "نهایی‌سازی فایل ارائه", "فایل PowerPoint بسته‌بندی شد…")
             caption = (
-                f"🗂 ارائهٔ تازه از متن «{document.title}»؛ "
+                f"🗂 ارائهٔ تازه از متن «{document.title}» "
+                f"({to_persian_digits(len(slides))} بخش)؛ "
                 "فایل اصلی دست‌نخورده مانده است."
             )
         else:
+            await _report(25, "چیدمان صفحه‌های PDF", "جلد، فهرست و قاب صفحه‌ها ساخته می‌شود…")
             payload = await run_file_io(
                 build_office_pdf,
                 document,
                 meta=meta,
                 mode_label=f"آفیس رایگان — {label}",
             )
+            await _report(50, "نهایی‌سازی سند PDF")
             caption = f"🗂 سند آزاد — {label} | {document.title}"
         library_title = f"{document.title} — {label}"
         return filename, payload, caption, library_title
@@ -772,7 +837,7 @@ class DocumentOfficeWorkflowMixin:
         user_id: int,
         *,
         stage: str,
-        success_text: str,
+        success_text: Any,
         buttons: list[list],
         operation: Any,
         library_kind: str = "office",
@@ -907,9 +972,12 @@ class DocumentOfficeWorkflowMixin:
                         payload=payload,
                         content_text=content_text,
                     )
+            resolved_success = (
+                success_text(outputs) if callable(success_text) else success_text
+            )
             await self._edit(  # type: ignore[attr-defined]
                 event,
-                completed_progress_text(success_text, headline="✅ فایل آماده شد"),
+                completed_progress_text(resolved_success, headline="✅ فایل آماده شد"),
                 buttons,
             )
         except (OfficeError, StructuringError) as exc:
@@ -947,11 +1015,6 @@ class DocumentOfficeWorkflowMixin:
         reference = f"OFF-{secrets.token_hex(4).upper()}"
 
         async def build(_workdir: Path, progress: WorkProgress) -> list[Any]:
-            await progress.update(
-                self.OFFICE_BUILD_PERCENT // 2,
-                f"ساخت فایل {FORMAT_LABELS[kind]}",
-                "متن شما در حال قالب‌بندی است…",
-            )
             return [
                 await self._build_office_export(
                     source_text,
@@ -959,6 +1022,7 @@ class DocumentOfficeWorkflowMixin:
                     source_name=source_name,
                     kind=kind,
                     reference=reference,
+                    progress=progress,
                 )
             ]
 
@@ -1057,11 +1121,6 @@ class DocumentOfficeWorkflowMixin:
         title = str(document.get("title") or "سند")
 
         async def build(_workdir: Path, progress: WorkProgress) -> list[Any]:
-            await progress.update(
-                self.OFFICE_BUILD_PERCENT // 2,
-                f"ساخت خروجی {FORMAT_LABELS[kind]}",
-                "متن استخراج‌شدهٔ سند در حال قالب‌بندی است…",
-            )
             return [
                 await self._build_office_export(
                     source,
@@ -1069,6 +1128,7 @@ class DocumentOfficeWorkflowMixin:
                     source_name=None,
                     kind=kind,
                     reference=reference,
+                    progress=progress,
                 )
             ]
 
@@ -1156,6 +1216,9 @@ class DocumentOfficeWorkflowMixin:
             ],
             [Button.inline("📚 بازگشت به کتابخانه", b"library")],
         ]
+        #: Set by the pipeline's ``on_incomplete`` callback while the build
+        #: runs; read by the success screen after the build finishes.
+        note_incomplete: dict[str, str] = {}
 
         async def build(_workdir: Path, progress: WorkProgress) -> list[Any]:
             fallback_used = False
@@ -1171,6 +1234,25 @@ class DocumentOfficeWorkflowMixin:
                     "تولید جزوهٔ منبع‌محور",
                     "ساخت متن ممکن است چند دقیقه طول بکشد…",
                 )
+
+                async def _note_stage(name: str) -> None:
+                    """Mirror the lecture pipeline's stages on the progress bar."""
+                    if name == "validating":
+                        await progress.update(
+                            34,
+                            "اعتبارسنجی جزوه با متن سند",
+                            "هر بخش جزوه با متن اصلی تطبیق داده می‌شود؛ بخش بی‌پشتوانه برمی‌گردد…",
+                        )
+                    elif name == "compiling":
+                        await progress.update(
+                            40,
+                            "ویرایش نهایی جزوه",
+                            "ویرایش تحریریهٔ نهایی و یکدست‌سازی ساختار جزوه…",
+                        )
+
+                async def _note_incomplete(reason: str) -> None:
+                    note_incomplete["reason"] = reason
+
                 notes, fallback_used = await generate_full_booklet(
                     chunks,
                     title=title,
@@ -1180,6 +1262,8 @@ class DocumentOfficeWorkflowMixin:
                         if self.settings.note_configured
                         else None
                     ),
+                    on_stage=_note_stage,
+                    on_incomplete=_note_incomplete,
                 )
                 notes = replace(notes, title=title)
                 full_notes = notes
@@ -1197,6 +1281,22 @@ class DocumentOfficeWorkflowMixin:
                     "استخراج نکته‌های فشرده",
                     "ساخت یادداشت ممکن است چند دقیقه طول بکشد…",
                 )
+
+                async def _compact_chunk(done: int, total: int) -> None:
+                    await progress.update(
+                        20 + round(16 * done / max(1, total)),
+                        "استخراج نکته‌های فشرده",
+                        f"بخش {to_persian_digits(done)} از {to_persian_digits(total)} مرور شد…",
+                    )
+
+                async def _compact_stage(name: str) -> None:
+                    if name == "validating":
+                        await progress.update(
+                            38,
+                            "اعتبارسنجی نکته‌ها با متن سند",
+                            "عددها و اصطلاح‌های منبع در نکته‌ها بررسی می‌شود…",
+                        )
+
                 compact, fallback_used = await generate_compact_notes(
                     chunks,
                     title=title,
@@ -1206,6 +1306,8 @@ class DocumentOfficeWorkflowMixin:
                         if self.settings.note_configured
                         else None
                     ),
+                    on_stage=_compact_stage,
+                    on_chunk=_compact_chunk,
                 )
                 markdown = compact.to_markdown()
                 word_payload = await run_file_io(
@@ -1268,6 +1370,12 @@ class DocumentOfficeWorkflowMixin:
                         f"{short_title(title, fallback=FALLBACK_OFFICE, max_words=2)} — مرور تعاملی HTML",
                     )
             variant = "کامل" if mode == "full" else "مرور"
+            logger.info(
+                "office document notes final mode=%s quality=%s fallback=%s",
+                mode,
+                getattr(full_notes, "quality_state", "") if full_notes is not None else "",
+                fallback_used,
+            )
             if fallback_used:
                 logger.info(
                     "Office document notes used deterministic source fallback mode=%s",
@@ -1292,6 +1400,21 @@ class DocumentOfficeWorkflowMixin:
                 outputs.append(review_output)
             return outputs
 
+        def _success_text(_outputs: list[Any]) -> str:
+            text = (
+                f"✅ {mode_label} ساخته شد و فایل‌های آن در کتابخانه ذخیره شدند.\n"
+                "برچسب‌های صفحه/اسلاید از سند استخراج‌شده حفظ شده‌اند؛ فایل اصلی هم همچنان قابل دریافت است."
+            )
+            if note_incomplete.get("reason"):
+                # Same honesty contract as the lecture pipeline: an accepted
+                # booklet whose coverage is imperfect is delivered, but the
+                # completion screen says so instead of claiming «verified».
+                text += (
+                    "\nℹ️ اعتبارسنجی نهایی: پوشش برخی جزئیات منبع در جزوه کامل تأیید نشد؛ "
+                    "متن کامل سند از «📥 دریافت فایل اصلی» در دسترس است."
+                )
+            return text
+
         await self._office_run_operation(
             event,
             user_id,
@@ -1300,10 +1423,7 @@ class DocumentOfficeWorkflowMixin:
                 if mode == "full"
                 else "استخراج نکته‌های فشرده و ساخت Word/PDF"
             ),
-            success_text=(
-                f"✅ {mode_label} ساخته شد و فایل‌های آن در کتابخانه ذخیره شدند.\n"
-                "برچسب‌های صفحه/اسلاید از سند استخراج‌شده حفظ شده‌اند؛ فایل اصلی هم همچنان قابل دریافت است."
-            ),
+            success_text=_success_text,
             buttons=buttons,
             operation=build,
             library_kind="booklet",
