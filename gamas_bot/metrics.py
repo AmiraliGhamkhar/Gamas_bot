@@ -15,9 +15,64 @@ import math
 import os
 import sys
 import threading
+import time
 from typing import Any
 
 SAMPLE_WINDOW = 512
+
+#: Provider counter fields persisted across restarts. Gauges (``in_flight``),
+#: per-process peaks and latency ring buffers are intentionally excluded.
+PROVIDER_COUNTER_FIELDS: tuple[str, ...] = (
+    "attempts",
+    "successes",
+    "failures",
+    "rate_limits",
+    "quota_exhaustions",
+    "server_errors",
+    "timeouts",
+    "connection_errors",
+    "auth_errors",
+    "invalid_inputs",
+    "retries",
+    "cooldown_waits",
+    "cancellations",
+    "overflow_skips",
+    "failovers_in",
+    "failovers_out",
+)
+
+#: Flat counters persisted across restarts (provider counters are added by
+#: the collector itself). Units are plain integer events, never prices or text.
+FLAT_COUNTER_FIELDS: tuple[str, ...] = (
+    "submitted_jobs",
+    "deduplicated_updates",
+    "db_errors",
+    "curation_delivery_errors",
+    "curation_source_missing",
+    "support_ticket_denials",
+    "support_reply_failures",
+    "learning_validation_failures",
+    "retention_errors",
+    "broadcast_failures",
+    "balance_repairs",
+    "learning_capacity_denials",
+    "document_unpack_rejections",
+    "receipt_hash_errors",
+)
+
+#: Provider events that mean "something needs an operator"; the health screen
+#: shows when the most recent one happened (wall clock).
+PROVIDER_ERROR_EVENTS: frozenset[str] = frozenset(
+    {
+        "timeout",
+        "rate_limit",
+        "server_error",
+        "connection_error",
+        "auth_error",
+        "quota_exhausted",
+        "invalid_input",
+    }
+)
 
 PIPELINE_STAGES: tuple[str, ...] = (
     "queued",
@@ -110,7 +165,7 @@ class _ProviderStats:
         success_rate = (
             round(self.successes / completed_attempts, 4)
             if completed_attempts > 0
-            else 1.0
+            else None
         )
         return {
             "in_flight": self.in_flight,
@@ -137,11 +192,41 @@ class _ProviderStats:
 
 
 def peak_rss_bytes() -> int:
-    """Return peak resident memory in bytes on POSIX/Linux (0 where unavailable)."""
+    """Return peak resident memory in bytes (0 where unavailable)."""
     if os.name == "posix" and PathLikeStatuses.available():
         hwm = PathLikeStatuses.vm_hwm_bytes()
         if hwm > 0:
             return hwm
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            counters = _PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(_PROCESS_MEMORY_COUNTERS)
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+                handle, ctypes.byref(counters), counters.cb
+            )
+            if ok:
+                return int(counters.PeakWorkingSetSize)
+            return 0
+        except Exception:  # pragma: no cover - Windows fallback
+            return 0
     try:
         import resource
 
@@ -212,6 +297,11 @@ class MetricsCollector:
             self._end_to_end = _Series()
             self._providers: dict[tuple[str, str], _ProviderStats] = {}
             self._llm_operations: dict[tuple[str, str, str], dict[str, Any]] = {}
+            # Cumulative totals restored at startup (empty until the first
+            # orderly flush of a previous run completes).
+            self._base_totals: dict[str, int] = {}
+            self._last_db_error_at: float | None = None
+            self._last_provider_error: dict[str, Any] | None = None
 
     def _provider(self, layer: str, slug: str) -> _ProviderStats:
         key = (layer, slug)
@@ -233,9 +323,10 @@ class MetricsCollector:
             self._deduplicated_updates += 1
 
     def record_db_error(self) -> None:
-        """Count one failed SQLite transaction (admin health panel)."""
+        """Count one failed/strained SQLite operation (admin health panel)."""
         with self._lock:
             self._db_errors += 1
+            self._last_db_error_at = time.time()
 
     def record_curation_delivery_error(self) -> None:
         with self._lock:
@@ -391,6 +482,13 @@ class MetricsCollector:
                 stats.cooldown_waits += 1
             elif event == "overflow_skip":
                 stats.overflow_skips += 1
+            if event in PROVIDER_ERROR_EVENTS:
+                self._last_provider_error = {
+                    "layer": str(layer)[:16],
+                    "slug": str(slug)[:64],
+                    "event": event,
+                    "at": time.time(),
+                }
 
     def record_llm_operation(
         self,
@@ -438,6 +536,72 @@ class MetricsCollector:
             self._provider(layer, from_slug).failovers_out += 1
             self._provider(layer, to_slug).failovers_in += 1
 
+    def _flat_totals_unlocked(self) -> dict[str, int]:
+        """Flatten every cumulative counter into persistable integer totals."""
+        flat = {field: int(getattr(self, f"_{field}")) for field in FLAT_COUNTER_FIELDS}
+        flat.update(
+            {f"outcome.{name}": int(value) for name, value in self._outcomes.items()}
+        )
+        flat.update(
+            {
+                f"retention.{name}": int(value)
+                for name, value in self._retention_deletions.items()
+            }
+        )
+        for (layer, slug), stats in self._providers.items():
+            for field_name in PROVIDER_COUNTER_FIELDS:
+                flat[f"provider.{layer}.{slug}.{field_name}"] = int(
+                    getattr(stats, field_name)
+                )
+        return flat
+
+    @property
+    def restored(self) -> bool:
+        """True when totals from an earlier run were loaded at startup."""
+        with self._lock:
+            return any(self._base_totals.values())
+
+    def export_totals(self) -> dict[str, int]:
+        """Cumulative counters (restored base plus this run) for persistence.
+
+        The store is absolute — rows are overwritten, never incremented — so a
+        crash between flushes can lose at most the current run's delta, never
+        double-count it.
+        """
+        with self._lock:
+            return self._flat_totals_unlocked()
+
+    def load_base(self, totals: dict[str, Any]) -> None:
+        """Merge persisted cumulative counters into the live counters."""
+        with self._lock:
+            for key, raw in totals.items():
+                try:
+                    value = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if value <= 0:
+                    continue
+                self._base_totals[key] = int(self._base_totals.get(key, 0)) + value
+                if key in FLAT_COUNTER_FIELDS:
+                    setattr(self, f"_{key}", int(getattr(self, f"_{key}")) + value)
+                elif key.startswith("outcome."):
+                    name = key.partition(".")[2]
+                    if name in self._outcomes:
+                        self._outcomes[name] += value
+                elif key.startswith("retention."):
+                    name = key.partition(".")[2]
+                    if name in self._retention_deletions:
+                        self._retention_deletions[name] += value
+                elif key.startswith("provider."):
+                    parts = key.split(".", 3)
+                    if len(parts) != 4:
+                        continue
+                    _, layer, slug, field_name = parts
+                    if field_name not in PROVIDER_COUNTER_FIELDS:
+                        continue
+                    stats = self._provider(layer, slug)
+                    setattr(stats, field_name, int(getattr(stats, field_name)) + value)
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             providers_by_layer: dict[str, dict[str, Any]] = {}
@@ -481,6 +645,13 @@ class MetricsCollector:
                 },
                 "providers": providers_by_layer,
                 "peak_rss_mb": round(peak_rss_bytes() / (1024 * 1024), 2),
+                "metrics_restored": any(self._base_totals.values()),
+                "last_db_error_at": self._last_db_error_at,
+                "last_provider_error": (
+                    dict(self._last_provider_error)
+                    if self._last_provider_error is not None
+                    else None
+                ),
             }
 
 

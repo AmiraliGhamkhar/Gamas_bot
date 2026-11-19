@@ -4,6 +4,18 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Admin system health and provider accounting.** Elapsed times use duration units,
+unknown/partial-delivery errors have Persian labels, and partial issues are
+reported separately from failed jobs. The live system screen no longer offers a
+misleading period selector. It exposes database probe/schema information and
+connection, quota and authentication failures; providers without completed
+attempts no longer show 100% success. Quota-denied LLM dispatches and Speechmatics
+poll retries now use consistent provider accounting. Logical database read
+failures are counted once, including retried reads. Migration 036 persists
+aggregate runtime counters across orderly restarts (not abrupt termination);
+last-error timestamps and latency samples remain process-local. Windows peak
+RSS reporting and multi-day uptime formatting are supported.
+
 **Booklet orchestration and delivery.** Optional synthesis follows a local
 preflight and precedes final verification and repair. Model request attempts
 record stage, duration, retries and exact/estimated usage without changing

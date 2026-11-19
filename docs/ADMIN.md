@@ -17,6 +17,27 @@ grants nothing.
 Grants, unlimited status, bans and gift resets are audited and rate-limited, and
 cannot target yourself or another admin.
 
+## System health and processing reports
+
+**🩺 سامانه** shows current process health, a database probe, the latest schema
+migration, and cumulative provider counters. It has no time-window selector:
+these live/cumulative values are not a historical period report. Use the
+processing report for windowed job outcomes.
+
+- Provider success is unavailable until an attempt completes; no traffic is not
+  reported as 100% success. Quota-denied dispatches count as failed attempts.
+- Connection, quota and authentication errors are shown separately from transient
+  retries. Failover-out, overflow and retries also appear in processing details.
+- Partial-delivery issues have their own breakdown; they are not silently counted
+  as fully failed jobs. Error labels and elapsed-time units are Persian.
+- Migration `036_runtime_metrics.sql` stores aggregate counters as absolute totals.
+  Startup restores them and orderly shutdown saves them. An abrupt termination
+  can lose the current run's increments; this is not a durable incident log.
+  Last-error timestamps and latency samples remain local to the current process.
+- Restored counters are cumulative across runs, while uptime, active work and
+  memory readings describe the current process. Do not interpret cumulative
+  provider totals as traffic for the selected processing-report window.
+
 ## Commands
 
 | Command | Effect |

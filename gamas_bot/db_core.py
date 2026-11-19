@@ -69,6 +69,8 @@ APPLICATION_TABLES: frozenset[str] = frozenset(
         "submission_binary_artifacts",
         # Interactive HTML learning & delivered library (migration 035)
         "library_file_blobs",
+        # Cumulative runtime/provider counters that survive restarts (036)
+        "runtime_metric_totals",
     }
 )
 
@@ -93,12 +95,18 @@ async def _rows(
     params = tuple(parameters) if parameters is not None else None
     for attempt in range(3):
         try:
-            return list(await connection.execute_fetchall(sql, params))
+            rows = list(await connection.execute_fetchall(sql, params))
+            if attempt:
+                # A retried-then-served read was still a strained operation;
+                # count the logical operation once, not every attempt.
+                METRICS.record_db_error()
+            return rows
         except sqlite3.Error as exc:
-            METRICS.record_db_error()
-            if (not isinstance(exc, sqlite3.OperationalError)
-                    or not any(word in str(exc).lower() for word in ("locked", "busy"))
-                    or attempt == 2):
+            transient = isinstance(exc, sqlite3.OperationalError) and any(
+                word in str(exc).lower() for word in ("locked", "busy")
+            )
+            if not transient or attempt == 2:
+                METRICS.record_db_error()
                 raise
             delay = (0.05, 0.15)[attempt] * random.uniform(0.9, 1.1)
             await asyncio.sleep(delay)

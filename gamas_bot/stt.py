@@ -726,6 +726,7 @@ async def _get_json(
     headers: dict[str, str],
     deadline: float,
     params: dict[str, str] | None = None,
+    slug: str = "",
 ) -> object:
     """One idempotent GET with a bounded transient retry.
 
@@ -765,7 +766,7 @@ async def _get_json(
                 else min(retry_after, MAX_RETRY_AFTER_SECONDS)
             )
             delay = min(delay, remaining)
-            METRICS.record_provider_event("stt", label.lower(), "retry")
+            METRICS.record_provider_event("stt", slug or label.lower(), "retry")
             logger.warning(
                 "%s read failed (attempt %d/%d); retrying in %.1fs (%s)",
                 label, attempt, MAX_TRANSIENT_RETRIES + 1, delay, type(exc).__name__,
@@ -812,6 +813,7 @@ async def _speechmatics_poll(
             headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
             params=_speechmatics_wait_params(settings),
             deadline=deadline,
+            slug="speechmatics",
         )
         if not isinstance(status_data, dict):
             raise STTError("Speechmatics پاسخ وضعیت را با ساختار قابل‌خواندن برنگرداند.")
@@ -846,6 +848,7 @@ async def _speechmatics_poll(
         headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
         params={"format": "json-v2"},
         deadline=deadline,
+        slug="speechmatics",
     )
     if not isinstance(result, dict):
         raise STTError("Speechmatics پاسخ متن را با ساختار قابل‌خواندن برنگرداند.")

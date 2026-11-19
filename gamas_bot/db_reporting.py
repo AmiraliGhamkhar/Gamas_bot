@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import logging
 from pathlib import Path
 import sqlite3
+import time
 from typing import Any
 
 from .db_core import _rows, iso
@@ -240,7 +241,12 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
             "max_seconds": _round(rows[0][2]),
         }
 
-    async def admin_health(self) -> dict[str, Any]:
+    async def admin_health(
+        self,
+        *,
+        with_probe: bool = False,
+        with_schema: bool = False,
+    ) -> dict[str, Any]:
         last_rows = await _rows(
             self.read_db,
             "SELECT MAX(finished_at) FROM submissions WHERE status IN ('done','partial')",
@@ -255,12 +261,38 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
                     wal_bytes = wal_path.stat().st_size
             except OSError:
                 db_bytes = 0
+        probe_ok: bool | None = None
+        probe_seconds: float | None = None
+        if with_probe:
+            started = time.perf_counter()
+            try:
+                await _rows(self.read_db, "SELECT 1")
+                probe_ok = True
+            except Exception:
+                logger.warning("admin health probe failed", exc_info=True)
+                probe_ok = False
+            probe_seconds = round(time.perf_counter() - started, 3)
+        schema_version: str | None = None
+        if with_schema:
+            try:
+                schema_rows = await _rows(
+                    self.read_db,
+                    "SELECT name FROM schema_migrations ORDER BY name DESC LIMIT 1",
+                )
+                if schema_rows and schema_rows[0][0]:
+                    schema_version = str(schema_rows[0][0])
+            except Exception:
+                logger.warning("admin schema check failed", exc_info=True)
+                schema_version = None
         return {
             "last_success": (
                 str(last_rows[0][0]) if last_rows and last_rows[0][0] else None
             ),
             "db_bytes": int(db_bytes),
             "wal_bytes": int(wal_bytes),
+            "probe_ok": probe_ok,
+            "probe_seconds": probe_seconds,
+            "schema_version": schema_version,
         }
 
     async def admin_report(
@@ -319,14 +351,25 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
         )
         terminal = delivered + undelivered
 
+        # One statement covers both failure scopes so the query budget stays
+        # flat: failed/rejected rows (the delivered-broken slice) and partial
+        # rows carrying a recorded error kind (booklet/note quality notices
+        # such as notes_quality or booklet_render).
         error_rows = await _rows(
             self.read_db,
-            "SELECT COALESCE(error_kind, 'unclassified') AS error_kind, COUNT(*) "
+            "WITH e AS ("
+            "SELECT 'failed' AS scope, COALESCE(error_kind, 'unclassified') AS error_kind "
             f"FROM submissions WHERE status IN ('failed','rejected') AND {where} "
-            "GROUP BY COALESCE(error_kind, 'unclassified') "
-            "ORDER BY COUNT(*) DESC LIMIT 12",
-            period_params,
+            "UNION ALL "
+            "SELECT 'partial' AS scope, error_kind AS error_kind "
+            "FROM submissions WHERE status = 'partial' "
+            f"AND error_kind IS NOT NULL AND error_kind <> '' AND {where}), "
+            "g AS (SELECT scope, error_kind, COUNT(*) AS n FROM e GROUP BY scope, error_kind) "
+            "SELECT scope, error_kind, n FROM g ORDER BY n DESC",
+            (*period_params, *period_params),
         )
+        failed_error_rows = [row for row in error_rows if row[0] == "failed"][:12]
+        partial_error_rows = [row for row in error_rows if row[0] == "partial"][:12]
 
         artifact_scope = "s.created_at >= ?" if period_start else "1 = 1"
         artifact_params: tuple[Any, ...] = (period_start,) if period_start else ()
@@ -462,8 +505,12 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
                     by_status.get("done", 0) / terminal if terminal else None
                 ),
                 "errors": [
-                    {"kind": str(row[0]), "count": int(row[1])}
-                    for row in error_rows
+                    {"kind": str(row[1]), "count": int(row[2])}
+                    for row in failed_error_rows
+                ],
+                "partial_issues": [
+                    {"kind": str(row[1]), "count": int(row[2])}
+                    for row in partial_error_rows
                 ],
                 "queue_wait": queue_wait,
                 "processing_time": processing_time,
@@ -512,6 +559,58 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
             params,
         )
         return [{"engine": str(row[0]), "count": int(row[1])} for row in rows]
+
+    async def load_runtime_metrics(self) -> dict[str, int]:
+        """Cumulative counters flushed by earlier runs (best-effort).
+
+        A missing/unreadable table never blocks startup: the caller falls
+        back to zeroed counters and the next orderly shutdown re-creates it.
+        """
+        try:
+            rows = await _rows(
+                self.read_db,
+                "SELECT metric_key, metric_value FROM runtime_metric_totals",
+            )
+        except Exception:
+            logger.warning(
+                "runtime metric totals are unavailable; starting from zero",
+                exc_info=True,
+            )
+            return {}
+        totals: dict[str, int] = {}
+        for row in rows:
+            key = str(row[0] or "").strip()
+            try:
+                value = int(row[1] or 0)
+            except (TypeError, ValueError):
+                continue
+            if key and value > 0:
+                totals[key[:200]] = value
+        return totals
+
+    async def store_runtime_metrics(self, totals: dict[str, int]) -> None:
+        """Persist absolute cumulative counters; never increments in place."""
+        if not totals:
+            return
+        now = iso(self._now())
+        async with self._transaction():
+            for key, raw_value in sorted(totals.items()):
+                safe_key = str(key).strip()[:200]
+                if not safe_key:
+                    continue
+                try:
+                    value = int(raw_value)
+                except (TypeError, ValueError):
+                    continue
+                if value < 0:
+                    value = 0
+                await self.db.execute(
+                    "INSERT INTO runtime_metric_totals(metric_key, metric_value, updated_at) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(metric_key) DO UPDATE SET "
+                    "metric_value = excluded.metric_value, updated_at = excluded.updated_at",
+                    (safe_key, value, now),
+                )
 
     async def recover_interrupted(self) -> int:
         now = iso(self._now())

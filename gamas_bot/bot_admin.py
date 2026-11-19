@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import math
 from pathlib import Path
@@ -172,7 +172,25 @@ class AdminWorkflowMixin:
     def _duration_text(seconds: float | None) -> str:
         if seconds is None:
             return "—"
-        return format_seconds_as_credits(int(round(seconds)))
+        return format_duration(int(round(max(0.0, float(seconds)))))
+
+    @staticmethod
+    def _uptime_text(seconds: float) -> str:
+        total = max(0, int(seconds))
+        days, remainder = divmod(total, 86_400)
+        if days:
+            return f"{to_persian_digits(days)} روز و {format_duration(remainder)}"
+        return format_duration(total)
+
+    @staticmethod
+    def _epoch_text(value: object) -> str:
+        if not value:
+            return "ثبت نشده"
+        try:
+            at = datetime.fromtimestamp(float(value), tz=timezone.utc)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OSError, OverflowError):
+            return "ثبت نشده"
+        return f"{jalali_date(at)} — {to_persian_digits(at.strftime('%H:%M'))} UTC"
 
     def _timing_line(self, label: str, summary: dict) -> str:
         count = int(summary.get("count") or 0)
@@ -233,7 +251,9 @@ class AdminWorkflowMixin:
         return f"{jalali_date(at)} — {to_persian_digits(at.strftime('%H:%M'))} UTC"
 
     def _admin_error_label(self, kind: str) -> str:
-        return FAILURE_KIND_LABELS_FA.get(kind, kind)
+        # Unknown kinds are shown wrapped, never as a bare English token, so
+        # nothing raw leaks into the Persian UI.
+        return FAILURE_KIND_LABELS_FA.get(kind, f"سایر ({kind})")
 
     def _admin_attention_lines(self, report: dict, runtime: dict) -> list[str]:
         payments = report["payments"]
@@ -268,7 +288,11 @@ class AdminWorkflowMixin:
             items.append(
                 f"🗄 {to_persian_digits(db_errors)} خطای پایگاه‌داده از شروع اجرای این نسخه"
             )
+        # Provider trouble is split into transient (self-healing) and
+        # operator-actionable (auth/quota/connection) buckets; hiding the
+        # second bucket made a dead API key look like a healthy system.
         transient = 0
+        actionable = 0
         providers = runtime.get("providers", {}) or {}
         for layer in ("stt", "llm"):
             for stats in (providers.get(layer, {}) or {}).values():
@@ -276,10 +300,38 @@ class AdminWorkflowMixin:
                     int(stats.get(key, 0) or 0)
                     for key in ("timeouts", "rate_limits", "server_errors")
                 )
+                actionable += sum(
+                    int(stats.get(key, 0) or 0)
+                    for key in (
+                        "connection_errors",
+                        "quota_exhaustions",
+                        "auth_errors",
+                    )
+                )
         if transient:
             items.append(
                 f"🌐 {to_persian_digits(transient)} خطای موقت ارائه‌دهنده "
                 "(پایان مهلت / محدودیت نرخ / خطای سرور) از شروع اجرا"
+            )
+        if actionable:
+            items.append(
+                f"🚨 {to_persian_digits(actionable)} خطای نیازمند اقدام اپراتور "
+                "(اتصال / سهمیه / احراز هویت) از شروع اجرا"
+            )
+        last_provider_error = runtime.get("last_provider_error")
+        if last_provider_error:
+            items.append(
+                "🕒 آخرین خطای ارائه‌دهنده: "
+                f"{last_provider_error.get('layer', '')} "
+                f"{last_provider_error.get('slug', '')} — "
+                f"{self._epoch_text(last_provider_error.get('at'))}"
+            )
+        partial_issues = processing.get("partial_issues") or []
+        if partial_issues:
+            top = partial_issues[0]
+            items.append(
+                f"📘 {to_persian_digits(int(top['count']))} تحویل ناقص در این بازه — "
+                f"بیشترین: {self._admin_error_label(top['kind'])}"
             )
         if not items:
             items.append("✅ مورد فوری‌ای در انتظار نیست.")
@@ -489,6 +541,15 @@ class AdminWorkflowMixin:
         else:
             lines.extend(["", "🚨 در این بازه خطای ثبت‌شده‌ای وجود ندارد."])
 
+        partial_issues = processing.get("partial_issues") or []
+        if partial_issues:
+            lines.extend(["", "📘 تحویل ناقص (جزوه/نتایج با هشدار):"])
+            for item in partial_issues:
+                lines.append(
+                    f"• {self._admin_error_label(str(item['kind']))}: "
+                    f"{to_persian_digits(int(item['count']))}"
+                )
+
         if engines:
             usage = " | ".join(
                 f"{self._admin_engine_label(str(item['engine']))}: "
@@ -500,20 +561,40 @@ class AdminWorkflowMixin:
                 lines.extend(["", f"🎙 موتور تبدیل گفتار در بازه: {usage}"])
 
         failovers = {"stt": 0, "llm": 0}
+        failovers_out = {"stt": 0, "llm": 0}
+        overflow_skips = {"stt": 0, "llm": 0}
+        retries = {"stt": 0, "llm": 0}
         providers = runtime.get("providers", {}) or {}
         for layer in failovers:
             for stats in (providers.get(layer, {}) or {}).values():
                 failovers[layer] += int(stats.get("failovers_in", 0) or 0)
+                failovers_out[layer] += int(stats.get("failovers_out", 0) or 0)
+                overflow_skips[layer] += int(stats.get("overflow_skips", 0) or 0)
+                retries[layer] += int(stats.get("retries", 0) or 0)
         lines.append(
             "🔁 جایگزینی خودکار (از شروع اجرا): "
             f"STT {to_persian_digits(failovers['stt'])}"
             f" | LLM {to_persian_digits(failovers['llm'])}"
         )
+        lines.append(
+            "↪️ خروج از مسیر / رد به‌علت پر بودن / تلاش دوباره: "
+            f"STT {to_persian_digits(failovers_out['stt'])}/"
+            f"{to_persian_digits(overflow_skips['stt'])}/"
+            f"{to_persian_digits(retries['stt'])}"
+            f" | LLM {to_persian_digits(failovers_out['llm'])}/"
+            f"{to_persian_digits(overflow_skips['llm'])}/"
+            f"{to_persian_digits(retries['llm'])}"
+        )
         lines.append("")
         lines.extend(self._admin_series_lines(processing["series"]))
         buttons = [
             self._admin_period_row("adm:ovp", period),
-            [Button.inline("🩺 وضعیت اکنون", b"adm:hub:sys")],
+            [
+                Button.inline(
+                    "🩺 وضعیت اکنون",
+                    f"adm:ovs:{period}".encode("ascii"),
+                )
+            ],
             [Button.inline("↩️ نمای کلی", b"adm:home")],
         ]
         buttons.extend(self._admin_menu())
@@ -586,13 +667,13 @@ class AdminWorkflowMixin:
     async def _show_admin_system_report(self, event: Any, period: str = "7d") -> None:
         period = period if period in self.ADMIN_PERIOD_KEYS else "7d"
         runtime = self.runtime_metrics()  # type: ignore[attr-defined]
-        health = await self.db.admin_health()
+        health = await self.db.admin_health(with_probe=True, with_schema=True)
         uptime = max(0.0, self.deps.now_wall() - self._started_at)
         lines = [
             "🩺 سلامت سیستم",
             "🗓 وضعیت اکنون (آمار پردازش در نمای کلی و بخش پردازش است)",
             "",
-            f"• زمان اجرای این نسخه: {format_duration(int(uptime))}",
+            f"• زمان اجرای این نسخه: {self._uptime_text(uptime)}",
             f"• کارها: {to_persian_digits(self.queue.active_count)} فعال"
             f" (اوج {to_persian_digits(int(runtime.get('peak_active_jobs', 0) or 0))})"
             f" | {to_persian_digits(self.queue.pending)} در صف"
@@ -606,6 +687,26 @@ class AdminWorkflowMixin:
             f"• به‌روزرسانی‌های تکراری حذف‌شده: "
             f"{to_persian_digits(int(runtime.get('deduplicated_updates', 0) or 0))}",
         ]
+        probe_ok = health.get("probe_ok")
+        if probe_ok is True:
+            lines.append(
+                f"• خواندن پایگاه‌داده: سالم "
+                f"({to_persian_digits(int(round(float(health.get('probe_seconds') or 0) * 1000)))} میلی‌ثانیه)"
+            )
+        elif probe_ok is False:
+            lines.append("• خواندن پایگاه‌داده: خطا — گزارش‌ها ممکن است ناقص باشند")
+        schema_version = health.get("schema_version")
+        if schema_version:
+            lines.append(f"• نسخهٔ اسکیمای دیتابیس: {schema_version}")
+        last_db_error_at = runtime.get("last_db_error_at")
+        if last_db_error_at:
+            lines.append(
+                f"• آخرین خطای پایگاه‌داده: {self._epoch_text(last_db_error_at)}"
+            )
+        if runtime.get("metrics_restored"):
+            lines.append(
+                "• شمارنده‌ها از اجرای قبلی بازیابی شدند (جمع انباشته)."
+            )
         providers = runtime.get("providers", {}) or {}
         provider_lines: list[str] = []
         for layer, layer_label in (("stt", "STT"), ("llm", "LLM")):
@@ -616,15 +717,31 @@ class AdminWorkflowMixin:
                     f"{to_persian_digits(int(stats.get('in_flight', 0) or 0))}/"
                     f"{to_persian_digits(int(stats.get('peak_in_flight', 0) or 0))} اوج"
                     f" | موفقیت {self._rate_text(stats.get('success_rate'))}"
-                    f" | پایان مهلت {to_persian_digits(int(stats.get('timeouts', 0) or 0))}"
+                    f" | تلاش {to_persian_digits(int(stats.get('attempts', 0) or 0))}"
+                )
+                provider_lines.append(
+                    f"  پایان مهلت {to_persian_digits(int(stats.get('timeouts', 0) or 0))}"
                     f" | محدودیت نرخ {to_persian_digits(int(stats.get('rate_limits', 0) or 0))}"
                     f" | خطای سرور {to_persian_digits(int(stats.get('server_errors', 0) or 0))}"
+                    f" | اتصال {to_persian_digits(int(stats.get('connection_errors', 0) or 0))}"
+                )
+                provider_lines.append(
+                    f"  سهمیه {to_persian_digits(int(stats.get('quota_exhaustions', 0) or 0))}"
+                    f" | احراز هویت {to_persian_digits(int(stats.get('auth_errors', 0) or 0))}"
+                    f" | ورودی نامعتبر {to_persian_digits(int(stats.get('invalid_inputs', 0) or 0))}"
                 )
         if provider_lines:
             lines.extend(["", "🌐 ارائه‌دهنده‌ها (از شروع اجرا):", *provider_lines])
         else:
             lines.extend(
                 ["", "🌐 از شروع اجرا هنوز درخواستی به ارائه‌دهنده‌ها نرفته است."]
+            )
+        last_provider_error = runtime.get("last_provider_error")
+        if last_provider_error:
+            lines.append(
+                f"🕒 آخرین خطای ارائه‌دهنده: {last_provider_error.get('layer', '')} "
+                f"{last_provider_error.get('slug', '')} — "
+                f"{self._epoch_text(last_provider_error.get('at'))}"
             )
         if self.settings.subscription_required and self.settings.subscription_channel:
             lines.extend(
@@ -649,8 +766,10 @@ class AdminWorkflowMixin:
                 "• فایل‌های موقت هر کار پس از پایان همان کار پاک می‌شوند.",
             ]
         )
+        # This screen is a live snapshot, not a windowed report: there is no
+        # period selector here (it used to render identical content for every
+        # period). The chosen period only travels to the processing detail.
         buttons = [
-            self._admin_period_row("adm:ovs", period),
             [
                 Button.inline(
                     "⚙️ جزئیات پردازش",
