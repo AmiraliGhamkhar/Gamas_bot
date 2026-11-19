@@ -63,8 +63,13 @@ context-only overlap, isolated overflow retries, route-specific budgets, and
 Gemini native counting via a fake session. `tests/test_section_writer.py` covers
 parallel topic isolation, schema and provenance, route fallbacks, unsupported
 measurements, and checkpoint round trips that retry only failed ranges.
-`tests/test_review_sheet.py` covers
-the review-sheet planner (strict plan
+`tests/test_booklet_pipeline.py` runs real TXT/PDF/PPTX/DOCX extraction through the
+Office booklet pipeline and offline PDF, Word and review HTML rendering. It
+also checks synthesis/repair order and per-attempt telemetry on retry, malformed
+JSON and provider fallback. The media job tests cover the single ledger debit
+across retries, the safe partial result after repair failure, and terminal render
+failure with raw data retained. `tests/test_review_sheet.py` covers
+the standalone review-sheet planner (strict plan
 parsing, grounding, minute allocation, quality states), the deterministic
 renderer, the HTML validator (hard errors and warnings), the `review_html`
 artifact contract and the migration 033 fresh, populated and replay paths.
@@ -137,3 +142,13 @@ it consumes quota and must not run in routine CI. Verify schema/domain validity,
 finish reason, dashboard usage and latency without recording secrets or source
 text. Model availability, account limits, Telegram deployment behavior and
 production performance remain unverified until those separate checks run.
+
+### Booklet release comparison
+
+Run `python -m scripts.booklet_regression_bench --compile --repeats 250` and
+repeat with `--fault --jobs 3` to exercise bounded retries, fallback and
+incomplete repair. This benchmark fakes model replies but uses real routing,
+quota, verification and PDF/Word rendering. Estimated tokens, timing, peak RSS
+and exact source-key scores describe only the synthetic workload. See the
+[Phase 8 technical report](../AUDIT/PHASE_8_ROLLOUT.md) for the comparisons and
+rollout gates.

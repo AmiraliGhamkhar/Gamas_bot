@@ -204,7 +204,7 @@ def test_optional_planning_is_local_bounded_and_only_accepts_grounded_partitions
     seen_windows = []
 
     async def answer(*args, **request):
-        assert request["task"] == "BOOKLET_GENERATION"
+        assert request["task"] == "BOOKLET_PLAN"
         assert request["strict_json"] is True
         assert len(request["user"]) <= LLM_PLANNER_WINDOW_CHARS
         blocks = json.loads(request["user"])["blocks"]

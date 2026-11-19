@@ -460,6 +460,24 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(base, compact_text)
         self.assertNotIn("راهنمای سامانه.pdf", items[0]["title"])
 
+    async def test_full_office_invalid_render_fails_without_delivery_or_credit_debit(self):
+        source = "متن آزمایشی برای بررسی اعتبار فایل نهایی در آفیس."
+        doc_id, created = await self.db.document_add(
+            self.user_id, file_msg_ref=f"{self.user_id}:922", title="جزوه آزمایشی.pdf",
+            source_type="pdf", page_count=1, sha256=hashlib.sha256(source.encode()).hexdigest(),
+            text=source, chunks_json="[]",
+        )
+        self.assertTrue(created)
+        before = await self.billing_snapshot()
+        callback = self.callback(f"doc:note:{doc_id}:full")
+        with mock.patch("gamas_bot.bot_documents.build_notes_pdf", return_value=b"invalid nonempty PDF"):
+            await self.bot._handle_callback(callback)
+        self.assertIn("ساخت فایل ناموفق", callback.edits[-1]["text"])
+        self.assertFalse(self.capture.file_payloads)
+        self.assertEqual(await self.db.library_list(self.user_id, limit=10), [])
+        self.assertEqual((await self.db.document_get(self.user_id, doc_id))["text"], source)
+        self.assertEqual(await self.billing_snapshot(), before)
+
     async def test_foreign_document_callback_is_owner_scoped(self):
         other = self.user_id + 1
         await self.db.ensure_user(other)

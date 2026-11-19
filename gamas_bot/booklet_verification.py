@@ -224,6 +224,44 @@ def _closest(assertion: str, sentences: Sequence[str]) -> str:
     return best if words & content_words(best) else ""
 
 
+_MARKDOWN_TABLE_ALIGNMENT = re.compile(r":?-{3,}:?")
+
+
+def _verbatim_table_fields(tables: Sequence[n.NoteTable], text: str) -> set[str]:
+    """Resolve exact cell/column matches without mistaking Markdown pipes for prose.
+
+    Require a header and alignment row, and keep cell order and header identity.
+    If the owned range lacks that context, leave the row to the ordinary checks.
+    """
+    if not tables or "|" not in text:
+        return set()
+
+    def cells(line: str) -> tuple[str, ...]:
+        trimmed = line.strip()
+        if not (trimmed.startswith("|") and trimmed.endswith("|")) or r"\|" in trimmed:
+            return ()
+        return tuple(_literal(cell) for cell in trimmed[1:-1].split("|"))
+
+    source_rows: dict[tuple[str, ...], set[tuple[str, ...]]] = defaultdict(set)
+    headers: tuple[str, ...] = ()
+    previous: tuple[str, ...] = ()
+    for line in text.splitlines():
+        row = cells(line)
+        if len(row) >= 2 and len(previous) == len(row) and all(_MARKDOWN_TABLE_ALIGNMENT.fullmatch(cell) for cell in row):
+            headers = previous
+        elif headers and len(row) == len(headers):
+            source_rows[headers].add(row)
+        else:
+            headers = ()
+        previous = row
+    return {
+        f"tables[{i}].rows[{j}]"
+        for i, table in enumerate(tables)
+        for j, row in enumerate(table.rows)
+        if tuple(_literal(cell) for cell in row) in source_rows.get(tuple(_literal(cell) for cell in table.headers), ())
+    }
+
+
 def _section_evidence(section: n.NoteSection, index: int, scope: _Evidence, *, semantic: bool, deep_tables: bool
                       ) -> tuple[list[_Finding], int, int]:
     """Hard signal checks are local; only ambiguous claims need reasoning."""
@@ -232,6 +270,7 @@ def _section_evidence(section: n.NoteSection, index: int, scope: _Evidence, *, s
     source_signals = _signals(text)
     sentences = tuple(_sentences(text))
     literal_sentences = {_literal(sentence) for sentence in sentences}
+    exact_table_fields = _verbatim_table_fields(section.all_tables, text)
     templates: dict[str, list[tuple[Signal, ...]]] = defaultdict(list)
     for source_sentence in sentences:
         template, signals = _number_template(source_sentence)
@@ -241,7 +280,7 @@ def _section_evidence(section: n.NoteSection, index: int, scope: _Evidence, *, s
     for field, item in _text_items(section):
         for claim in _sentences(item):
             numbers = _signals(claim)
-            direct = _literal(claim) in literal_sentences
+            direct = field in exact_table_fields or _literal(claim) in literal_sentences
             contextual_support = False
             if numbers and not direct:
                 template, in_order = _number_template(claim)
@@ -914,9 +953,25 @@ def with_report(notes: n.StructuredNotes, report: VerificationReport, *, strict:
 
 async def verify_and_repair(notes: n.StructuredNotes, document: NormalizedDocument, plan: ContentPlan,
                             router: n.SectionWriter, *, allow_repair: bool = True,
-                            after_repair: Callable[[n.StructuredNotes], Awaitable[n.StructuredNotes]] | None = None) -> n.StructuredNotes:
+                            before_verify: Callable[[n.StructuredNotes], Awaitable[n.StructuredNotes]] | None = None) -> n.StructuredNotes:
     """Verify, visit each selected node once, then verify the retained output."""
     run = _VerificationRun(_Source(document, plan), router)
+    if before_verify is not None:
+        # Progressive delivery and editorial input get a deterministic preflight.
+        # Paid semantic verification and the single repair pass only run on the
+        # chosen artifact, not on both the draft and the editorial proposal.
+        baseline = await asyncio.to_thread(_inspect, notes, run.source, strict=run.strict, semantic=False)
+        if not any(f.issue.severity == "critical" for f in baseline.findings):
+            proposal = await before_verify(with_report(notes, baseline.report, strict=run.strict))
+            if proposal != notes:
+                proposed = await asyncio.to_thread(_inspect, proposal, run.source, strict=run.strict, semantic=False)
+                known = {(f.issue.code, f.issue.section_id, _finding_key(f)) for f in baseline.findings}
+                if any(f.issue.severity in ("critical", "high") and
+                       (f.issue.code, f.issue.section_id, _finding_key(f)) not in known for f in proposed.findings):
+                    notes = replace(notes, quality_state=n.QUALITY_RECOVERED)
+                else:
+                    # The draft's preflight report is not the final verdict.
+                    notes = replace(proposal, verification_report=None)
     initial = await run.check(notes, reason=allow_repair)
     edited, changed = await run.repair(notes, initial) if allow_repair else (notes, False)
     if changed:
@@ -945,16 +1000,5 @@ async def verify_and_repair(notes: n.StructuredNotes, document: NormalizedDocume
         finalized = replace(fallback, quality_state=n.QUALITY_RECOVERED)
         final = await run.check(finalized, reason=False)
         withheld.append(_issue("source_only_fallback", "high", "No safe renderable draft remained; source text was retained.").issue)
-    if after_repair is not None:
-        approved = with_report(finalized, final.report, strict=run.strict, extra=withheld)
-        proposal = await after_repair(approved)
-        if proposal != approved:
-            proposed = await run.check(proposal, reason=allow_repair)
-            before = {(f.issue.code, f.issue.section_id, _literal(f.assertion)) for f in final.findings}
-            new_issues = [f for f in proposed.findings if (f.issue.code, f.issue.section_id, _literal(f.assertion)) not in before]
-            if not any(f.issue.severity in ("critical", "high") for f in new_issues):
-                finalized, final = proposal, proposed
-            else:
-                finalized = replace(approved, quality_state=n.QUALITY_RECOVERED)
     logger.info("booklet verification issues=%d withheld=%d semantic_calls=%d", len(final.findings), len(withheld), run.semantic_attempts)
     return with_report(finalized, final.report, strict=run.strict, extra=withheld)

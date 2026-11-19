@@ -56,13 +56,11 @@ links without rewriting the factual body. See
 - Interactive HTML review sheet (`🌐 دریافت جزوه مرور تعاملی HTML`): a single
   self-contained `.html` file with the Vazirmatn fonts embedded, so it works
   offline. It has a 30-minute study plan split into 5–12 sections (the last one
-  a one-minute self-test), collapsible questions, exam traps and comparison
-  pairs. Every question, answer and trap cites source units from the validated
-  booklet; unsupported items are omitted. No scripts or styles come from the
-  model, and the page runs only the fixed script pinned by its
-  Content-Security-Policy. It is generated only from a completed AI booklet, so
-  deterministic fallback and degraded booklets never get one. Downloading it is
-  free and never re-renders the file; billing rules are unchanged.
+  a one-minute self-test), collapsible questions and progress tracking. The
+  bot builds it from exact excerpts of a verified booklet, without contacting
+  a model. The template, fonts and Content-Security-Policy stay unchanged.
+  Recovered, unverified, or too-thin booklets do not get a review sheet.
+  Downloading it is free and never re-renders the file.
 - Nothing is pushed automatically: the final message lists what was produced and
   offers one button per artifact. Re-downloading is free and never re-renders.
 - Quality gates (`NOTE_STRICT_GROUNDING`, `NOTE_QUALITY_GATE`,

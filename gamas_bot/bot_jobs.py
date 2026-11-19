@@ -35,7 +35,7 @@ from .docx_export import (
     resolve_fonts,
 )
 from .notes_pdf import build_notes_pdf, notes_pdf_filename
-from .review_sheet import generate_review_sheet
+from .review_sheet import render_booklet_review
 from .fileio import AsyncFileReader, run_file_io, run_file_io_resource
 from .intake import (
     USER_VISIBLE_ERRORS,
@@ -1198,7 +1198,7 @@ class JobPipelineMixin:
             if job_meta is not None:
                 job_meta["note_quality"] = quality_state
             logger.info(
-                "note final job=%s quality=%s outcome=delivered",
+                "note final job=%s quality=%s outcome=generated",
                 job.submission_id, quality_state,
             )
             return notes
@@ -1258,7 +1258,7 @@ class JobPipelineMixin:
             notes = ensure_structured_booklet(notes, source_document)
             job.meta["note_quality"] = getattr(notes, "quality_state", "VERIFIED")
             logger.info(
-                "note final job=%s quality=%s outcome=delivered",
+                "note final job=%s quality=%s outcome=generated",
                 job.submission_id, job.meta["note_quality"],
             )
             return notes
@@ -1323,7 +1323,7 @@ class JobPipelineMixin:
                         logger.warning("booklet source could not be read for structural check")
             try:
                 notes = ensure_structured_booklet(notes, source_text)
-                if getattr(self.settings, "note_strict_grounding", False):
+                if notes.verification_report is None and getattr(self.settings, "note_strict_grounding", False):
                     notes, final_report = gate_notes(notes, source_text, strict=True, mode="full")
                     notes = enforce_final_acceptance(
                         notes, final_report, mode="full", stage="render_boundary", allow_incomplete=True
@@ -1339,6 +1339,8 @@ class JobPipelineMixin:
                 )
                 notes = None
                 job.meta["note_failure"] = "structure"
+                job.meta["booklet_render_incomplete"] = True
+                job.meta["delivery_failed"] = True
         booklet_title = short_title(
             getattr(notes, "title", "") if notes is not None else "",
             fallback=FALLBACK_BOOKLET,
@@ -1391,6 +1393,9 @@ class JobPipelineMixin:
                     "متن خام را نیز بررسی کنید.",
                 )
             incomplete_reason = job.meta.get("note_incomplete")
+            verification = notes.verification_report
+            if verification is not None and not verification.passed and quality not in {"DEGRADED", "RECOVERED"}:
+                incomplete_reason = incomplete_reason or "verification_incomplete"
             if incomplete_reason == "missing_numbers":
                 add_notice(
                     "notes_incomplete",
@@ -1495,10 +1500,8 @@ class JobPipelineMixin:
             from .artifacts import KIND_REVIEW_HTML
 
             try:
-                review_file = await generate_review_sheet(
+                review_file = await render_booklet_review(
                     notes,
-                    self.settings,
-                    self._http_session() if self.settings.note_configured else None,  # type: ignore[attr-defined]
                     reference=reference,
                     announce=lambda label: progress.update(95, label),
                 )
@@ -1562,6 +1565,9 @@ class JobPipelineMixin:
                         job.submission_id,
                         exc_info=True,
                     )
+            if not (pdf_ready and docx_ready):
+                job.meta["delivery_failed"] = True
+                job.meta["booklet_render_incomplete"] = True
             if not pdf_ready and not docx_ready:
                 add_notice(
                     "booklet_unavailable",
@@ -1727,6 +1733,10 @@ class JobPipelineMixin:
             has_review_html=KIND_REVIEW_HTML in kinds,
             has_learning_item=item_id is not None,
         )
+        render_incomplete = bool(job.meta.get("booklet_render_incomplete"))
+        if render_incomplete:
+            header = texts.DELIVERY_READY_HEADER.format(reference=reference)
+            body = body.replace(header, f"خروجی‌های در دسترس — {reference}", 1)
         # Quality notices are a suffix to the single results message: do not
         # create a competing Telegram interaction or expose any source text.
         body += notice
@@ -1737,9 +1747,9 @@ class JobPipelineMixin:
                 job.submission_id,
             )
             job.meta["delivery_failed"] = True
-        status = "done" if notified and not notice else "partial"
+        status = "done" if notified and not notice and not render_incomplete else "partial"
         status_error = notice.strip() or None
-        status_kind = notice_kind or None
+        status_kind = notice_kind or ("booklet_render" if render_incomplete else None)
         if not notified:
             status_error = "\n".join(
                 part for part in ("results notification failed", status_error) if part
@@ -1761,7 +1771,7 @@ class JobPipelineMixin:
             )
         job.meta["outcome"] = status
         if progress is not None:
-            if notified:
+            if notified and not render_incomplete:
                 await progress.complete(
                     texts.DELIVERY_READY_HEADER.format(reference=reference)
                 )

@@ -67,7 +67,8 @@ from .learning import MAX_MODEL_INPUT_CHARS, SIZE_PRESETS, normalize_content_tex
 from .media import MediaToolError, convert_to_pptx
 from .notes import StructuringError
 from .notes_pdf import build_notes_pdf, notes_pdf_filename
-from .review_sheet import generate_review_sheet
+from .review_sheet import render_booklet_review
+from .artifact_validation import validate_docx_artifact, validate_pdf_artifact
 from .office import (
     FORMAT_LABELS,
     OFFICE_FORMATS,
@@ -998,6 +999,16 @@ class DocumentOfficeWorkflowMixin:
                 ),
                 buttons,
             )
+        except Exception:
+            logger.exception("Office operation failed stage=%s", stage)
+            await self._edit(  # type: ignore[attr-defined]
+                event,
+                failed_progress_text(
+                    progress.percent, "آماده‌سازی یا ذخیرهٔ فایل خروجی انجام نشد؛ دوباره تلاش کنید.",
+                    headline="❌ ساخت فایل ناموفق بود.",
+                ),
+                buttons,
+            )
         finally:
             if workdir is not None:
                 await run_file_io(shutil.rmtree, workdir, ignore_errors=True)
@@ -1272,6 +1283,8 @@ class DocumentOfficeWorkflowMixin:
                     source_type=str(document.get("source_type") or "txt"),
                     document_id=f"document:{document_id}",
                 )
+                if fallback_used or (notes.verification_report is not None and not notes.verification_report.passed):
+                    note_incomplete.setdefault("reason", "verification_incomplete")
                 notes = replace(notes, title=title)
                 full_notes = notes
                 markdown = notes.to_markdown()
@@ -1351,16 +1364,17 @@ class DocumentOfficeWorkflowMixin:
                     meta=meta,
                     mode_label=mode_label,
                 )
+            if mode == "full":
+                await run_file_io(validate_docx_artifact, word_payload)
+                await run_file_io(validate_pdf_artifact, pdf_payload)
             # The interactive review sheet is only derived from a completed AI
             # booklet. The deterministic source fallback is never planned again,
             # and a failure here must not cost the Word and PDF files above.
             review_output: tuple[str, bytes, str, str] | None = None
             if mode == "full" and not fallback_used and full_notes is not None:
                 try:
-                    review_file = await generate_review_sheet(
+                    review_file = await render_booklet_review(
                         full_notes,
-                        self.settings,
-                        self._http_session() if self.settings.note_configured else None,  # type: ignore[attr-defined]
                         reference=reference,
                         announce=lambda label: progress.update(
                             self.OFFICE_BUILD_PERCENT - 6, label
@@ -1945,7 +1959,10 @@ class DocumentOfficeWorkflowMixin:
         )
         chunks = [OfficeSourceChunk(text=raw_text, locators=())]
 
+        verification_incomplete = False
+
         async def build(_workdir: Path, progress: WorkProgress) -> list[Any]:
+            nonlocal verification_incomplete
             await progress.update(
                 20,
                 "تحلیل و ساختاردهی علمی متن",
@@ -1961,6 +1978,8 @@ class DocumentOfficeWorkflowMixin:
                     else None
                 ),
             )
+            verification_incomplete = (fallback_used or
+                                       (notes.verification_report is not None and not notes.verification_report.passed))
             resolved_title = notes.display_title or title
             await progress.update(
                 self.OFFICE_BUILD_PERCENT - 12,
@@ -1979,13 +1998,13 @@ class DocumentOfficeWorkflowMixin:
                 design=resolve_design(),
                 meta=meta,
             )
+            await run_file_io(validate_pdf_artifact, pdf_payload)
+            await run_file_io(validate_docx_artifact, word_payload)
             review_output: tuple[str, bytes, str, str] | None = None
             if not fallback_used:
                 try:
-                    review_file = await generate_review_sheet(
+                    review_file = await render_booklet_review(
                         notes,
-                        self.settings,
-                        self._http_session() if self.settings.note_configured else None,  # type: ignore[attr-defined]
                         reference=reference,
                         announce=lambda label: progress.update(
                             self.OFFICE_BUILD_PERCENT - 5, label
@@ -2020,13 +2039,17 @@ class DocumentOfficeWorkflowMixin:
                 outputs.append(review_output)
             return outputs
 
+        def success_text(_outputs: list[Any]) -> str:
+            message = "✅ فایل‌های جزوه ساخته شدند و در کتابخانه ذخیره شدند."
+            if verification_incomplete:
+                message += "\nℹ️ پوشش همهٔ جزئیات منبع در اعتبارسنجی نهایی تأیید نشد."
+            return message
+
         await self._office_run_operation(
             event,
             user_id,
             stage="تبدیل متن خام به جزوهٔ علمی کامل (PDF + Word + HTML)",
-            success_text=(
-                "✅ جزوهٔ علمی کامل شما ساخته شد و فایل‌های آن در کتابخانه ذخیره شدند."
-            ),
+            success_text=success_text,
             buttons=self._office_format_keyboard(),
             operation=build,
             library_kind="booklet",

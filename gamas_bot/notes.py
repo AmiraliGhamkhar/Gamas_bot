@@ -2293,8 +2293,15 @@ def booklet_output_violations(notes: StructuredNotes) -> tuple[str, ...]:
         violations.append("timeline_marker")
     if _BOOKLET_SPEAKER_MARKER.search(text):
         violations.append("speaker_reference")
+    # Attachments in the provenance field (e.g. «اسلاید ۱») are legitimate
+    # and validated against source blocks separately. Only reject them when
+    # a writer leaks them into instructional content or global metadata.
     if _BOOKLET_SOURCE_METADATA_MARKER.search(text):
-        violations.append("source_metadata_reference")
+        content = notes.to_payload()
+        for section in content["sections"]:
+            section.pop("source_locators", None)
+        if _BOOKLET_SOURCE_METADATA_MARKER.search(json.dumps(content, ensure_ascii=False)):
+            violations.append("source_metadata_reference")
     return tuple(dict.fromkeys(violations))
 
 
@@ -3791,10 +3798,6 @@ async def _structure_booklet(
         await notify("validating")
 
         async def edit(baseline: StructuredNotes) -> StructuredNotes:
-            if (writer.failures or baseline.quality_state == QUALITY_RECOVERED
-                    or not any(section.section_id for section in baseline.sections)
-                    or not compile_will_run(baseline, settings, mode=resolved_mode, presentation=presentation)):
-                return baseline
             if on_merged is not None:
                 try:
                     await on_merged(with_provenance(baseline))
@@ -3803,9 +3806,12 @@ async def _structure_booklet(
             await notify("compiling")
             return await synthesize_booklet(with_provenance(baseline), plan, normalized, writer)
 
+        can_edit = (allow_repair and not writer.failures and draft.quality_state != QUALITY_RECOVERED
+                    and any(section.section_id for section in draft.sections)
+                    and compile_will_run(draft, settings, mode=resolved_mode, presentation=presentation))
         verified = await verify_and_repair(with_provenance(draft), normalized, plan, writer,
                                            allow_repair=allow_repair and not writer.failures,
-                                           after_repair=edit if allow_repair else None)
+                                           before_verify=edit if can_edit else None)
         return with_provenance(verified)
 
     if len(units) == 1:

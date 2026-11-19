@@ -164,6 +164,10 @@ LLM_CONNECT_TIMEOUT_SECONDS = 10.0
 MAX_COMPATIBILITY_ADJUSTMENTS = 4
 
 _T = TypeVar("_T")
+_REQUEST_STAGE: contextvars.ContextVar[str] = contextvars.ContextVar("gamas_llm_stage", default="UNSPECIFIED")
+_REQUEST_USAGE: contextvars.ContextVar[tuple[str, int | None, int | None] | None] = contextvars.ContextVar(
+    "gamas_llm_request_usage", default=None,
+)
 _ACTUAL_USAGE_TOKENS: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "gamas_llm_actual_usage_tokens", default=None
 )
@@ -1308,8 +1312,26 @@ def booklet_input_budget(
     return min((budget for budget in candidates if budget > 0), default=0)
 
 
+def _record_model_request(
+    route: NoteRoute, *, kind: str, retries: int, started: float, error: str,
+    input_tokens: int | None, output_tokens: int | None,
+    estimated_input: int | None, estimated_output: int | None, model: str = "",
+) -> None:
+    """Operational telemetry only; never executes or modifies a ledger entry."""
+    model = model or route.model
+    if route.api_key:
+        model = model.replace(route.api_key, "[redacted]")
+    logger.info(
+        "llm request stage=%s kind=%s provider=%s model=%s retries=%d duration_ms=%.1f error=%s "
+        "input_tokens=%s output_tokens=%s estimated_input_tokens=%s estimated_output_tokens=%s",
+        _REQUEST_STAGE.get(), kind, route.slug, _sanitize_error_text(model, limit=100), retries,
+        (time.perf_counter() - started) * 1000, error or "none", input_tokens, output_tokens,
+        estimated_input if input_tokens is None else None, estimated_output if output_tokens is None else None,
+    )
+
+
 async def _native_prompt_tokens(
-    route: NoteRoute, session: aiohttp.ClientSession, headers: dict[str, str], wire: dict,
+    route: NoteRoute, session: aiohttp.ClientSession, headers: dict[str, str], wire: dict, ratio: float,
 ) -> int | None:
     """Google's documented countTokens accepts the corresponding GenerateContentRequest.
 
@@ -1321,6 +1343,9 @@ async def _native_prompt_tokens(
             or host.netloc != "generativelanguage.googleapis.com"):
         return None
     model = "models/" + _gemini_model_id(route.model)
+    started = time.perf_counter()
+    category = "invalid_usage"
+    exact = None
     try:
         async with session.post(
             _endpoint(route.base_url, model + ":countTokens"), headers=headers,
@@ -1331,10 +1356,22 @@ async def _native_prompt_tokens(
                 response_body = await _read_json_body(response)
                 count = response_body.get("totalTokens") if isinstance(response_body, dict) else None
                 if type(count) is int and count > 0:
+                    exact, category = count, ""
                     return count
+            else:
+                category = f"http_{response.status}"
             logger.info("native token count unavailable provider=%s status=%d", route.slug, response.status)
     except (aiohttp.ClientError, TimeoutError, ValueError, TypeError) as exc:
-        logger.info("native token count unavailable provider=%s error=%s", route.slug, type(exc).__name__)
+        category = type(exc).__name__
+        logger.info("native token count unavailable provider=%s error=%s", route.slug, category)
+    except BaseException as exc:
+        category = type(exc).__name__
+        raise
+    finally:
+        _record_model_request(route, kind="count_tokens", retries=0, started=started, error=category,
+                              input_tokens=exact, output_tokens=None, estimated_output=None,
+                              estimated_input=(estimate_tokens(json.dumps(wire, ensure_ascii=False), chars_per_token=ratio)
+                                               if exact is None else None))
     return None
 
 
@@ -1473,6 +1510,7 @@ def _log_usage(
     model, input_tokens, output_tokens, total_tokens = _usage_summary(payload, route.style)
     cached_tokens, reasoning_tokens = _usage_detail_counts(payload, route.style)
     _ACTUAL_USAGE_TOKENS.set(total_tokens)
+    _REQUEST_USAGE.set((model, input_tokens, output_tokens))
     request_id = _response_request_id(headers, payload=payload, api_key=route.api_key)
 
     def shown(value: int | None) -> str:
@@ -2213,6 +2251,7 @@ async def _complete_on_route(
     retry_on_timeout: bool = True,
     schema: dict | None = None,
     adaptive_capacity: bool = False,
+    validate_response: Callable[[str], None] | None = None,
 ) -> str:
     """One completion from one provider, with its own bounded retry budget.
 
@@ -2225,10 +2264,12 @@ async def _complete_on_route(
     answer in seconds.
     """
     url, headers, payload = _build_request_for(route, settings, system, user, schema=schema)
+    ratio = settings.llm_token_estimation_chars_per_token
+    counted = None
     if adaptive_capacity:
         capacity = model_capacity(route, settings)
         output = request_payload_output_tokens(payload) or settings.note_max_output_tokens
-        counted = await _native_prompt_tokens(route, session, headers, payload)
+        counted = await _native_prompt_tokens(route, session, headers, payload, ratio)
         if counted is None:
             remaining = _estimated_budget(settings, capacity, system, "", payload, output_tokens=output)
             oversized = estimate_tokens(user, chars_per_token=settings.llm_token_estimation_chars_per_token) > remaining
@@ -2274,49 +2315,70 @@ async def _complete_on_route(
             and route.style in ("openai", "gemini")
         )
         try:
-            if streaming_active:
-                return await _complete_streaming_on_route(
-                    route, session, settings, url=url, headers=headers,
-                    payload=payload, timeout_seconds=timeout_seconds,
-                    include_stream_options=include_stream_options,
-                )
-            async with session.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(
-                    total=timeout_seconds,
-                    sock_connect=LLM_CONNECT_TIMEOUT_SECONDS,
-                ),
-                allow_redirects=False,
-            ) as response:
-                ttfb_ms = (time.perf_counter() - started) * 1000.0
-                if response.status != 200:
-                    raise await _error_from_response(
-                        route.label, response, route.api_key or None
+            usage_scope = _REQUEST_USAGE.set(None)
+            category = ""
+            text = None
+            try:
+                if streaming_active:
+                    text = await _complete_streaming_on_route(
+                        route, session, settings, url=url, headers=headers,
+                        payload=payload, timeout_seconds=timeout_seconds,
+                        include_stream_options=include_stream_options,
                     )
-                resp_headers = getattr(response, "headers", None)
-                try:
-                    result = await _read_json_body(response)
-                except (ValueError, TypeError) as exc:
-                    raise LLMResponseError(
-                        "پاسخ سرویس تولید جزوه JSON معتبری نبود."
-                    ) from exc
-                elapsed_ms = (time.perf_counter() - started) * 1000.0
-            if not isinstance(result, dict):
-                raise LLMResponseError("پاسخ سرویس تولید جزوه یک شیء JSON نبود.")
-            # Usage is logged even for an answer the parser then rejects or
-            # reports as truncated: those are exactly the requests whose real
-            # token counts calibrate the chunk budget.
-            _log_usage(
-                route, result, headers=resp_headers,
-                ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms,
-                requested_output_tokens=requested_output_tokens,
-            )
-            _raise_if_in_body_error(
-                route.label, result, resp_headers, route.api_key or None
-            )
-            return _parse_response(result, route.style)
+                else:
+                    async with session.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(
+                            total=timeout_seconds,
+                            sock_connect=LLM_CONNECT_TIMEOUT_SECONDS,
+                        ),
+                        allow_redirects=False,
+                    ) as response:
+                        ttfb_ms = (time.perf_counter() - started) * 1000.0
+                        if response.status != 200:
+                            raise await _error_from_response(
+                                route.label, response, route.api_key or None
+                            )
+                        resp_headers = getattr(response, "headers", None)
+                        try:
+                            result = await _read_json_body(response)
+                        except (ValueError, TypeError) as exc:
+                            raise LLMResponseError(
+                                "پاسخ سرویس تولید جزوه JSON معتبری نبود."
+                            ) from exc
+                        elapsed_ms = (time.perf_counter() - started) * 1000.0
+                    if not isinstance(result, dict):
+                        raise LLMResponseError("پاسخ سرویس تولید جزوه یک شیء JSON نبود.")
+                    # Usage is logged even for an answer the parser then rejects or
+                    # reports as truncated: those are exactly the requests whose real
+                    # token counts calibrate the chunk budget.
+                    _log_usage(
+                        route, result, headers=resp_headers,
+                        ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms,
+                        requested_output_tokens=requested_output_tokens,
+                    )
+                    _raise_if_in_body_error(
+                        route.label, result, resp_headers, route.api_key or None
+                    )
+                    text = _parse_response(result, route.style)
+                if validate_response is not None:
+                    validate_response(text)
+                return text
+            except BaseException as exc:
+                category = type(exc).__name__
+                raise
+            finally:
+                model, exact_input, exact_output = _REQUEST_USAGE.get() or ("", None, None)
+                _REQUEST_USAGE.reset(usage_scope)
+                _record_model_request(
+                    route, kind="completion", retries=request_number - 1, started=started, error=category,
+                    input_tokens=exact_input if exact_input is not None else counted, output_tokens=exact_output,
+                    estimated_input=(estimate_tokens(json.dumps(payload, ensure_ascii=False), chars_per_token=ratio)
+                                     if exact_input is None and counted is None else None), model=model,
+                    estimated_output=estimate_tokens(text, chars_per_token=ratio) if text and exact_output is None else None,
+                )
         except LLMRequestError as exc:
             if not isinstance(exc, (LLMContextOverflowError, LLMOutputBudgetError)):
                 err_lower = str(exc).lower()
@@ -2577,6 +2639,10 @@ async def _dispatch_across_routes(
     failures: list[LLMError] = []
     descriptions: list[str] = []
     indexed_routes: list[tuple[int, NoteRoute]] = list(enumerate(routes))
+    # Wait for the same effective capacity that the shared ledger enforces.
+    # A wider local pool turns ordinary same-process contention into quota
+    # denial and unnecessary fallback instead of waiting for an existing lease.
+    budgets = tuple(_provider_budget(settings, route, index) for index, route in indexed_routes)
     # Duplicate hedged completions spend scarce provider quota; disabled for the
     # approved routes even if a stale deployment sets the legacy knob nonzero.
     hedge_after = 0.0
@@ -2588,7 +2654,7 @@ async def _dispatch_across_routes(
         and _route_cooldown_remaining(session, routes[0].slug) <= 0
     ):
         primary_lease = pool.try_acquire(
-            routes[0].slug, route_max_in_flight(0, settings)
+            routes[0].slug, budgets[0].max_in_flight
         )
         if primary_lease is not None:
             def _make_primary() -> Awaitable[_T]:
@@ -2599,7 +2665,7 @@ async def _dispatch_across_routes(
                 )
 
             async def _run_backup() -> _T:
-                backup_limit = route_max_in_flight(1, settings)
+                backup_limit = budgets[1].max_in_flight
                 acquired_b = await pool.acquire_any(
                     [(routes[1].slug, backup_limit)],
                     timeout=getattr(settings, "llm_slot_wait_timeout", 30.0) if wait_for_capacity else 0.0,
@@ -2654,7 +2720,7 @@ async def _dispatch_across_routes(
             ),
         )
         candidates = [
-            (route.slug, route_max_in_flight(orig_idx, settings))
+            (route.slug, budgets[orig_idx].max_in_flight)
             for orig_idx, route in ordered
         ]
         try:
@@ -2690,7 +2756,7 @@ async def _dispatch_across_routes(
                     "immediately without wait to %s",
                     bypassed_route.slug,
                     pool.in_flight(bypassed_route.slug),
-                    route_max_in_flight(_b_idx, settings),
+                    budgets[_b_idx].max_in_flight,
                     chosen_slug,
                 )
         elif previous_failed_slug is not None:
@@ -2702,7 +2768,7 @@ async def _dispatch_across_routes(
                 reserve_quota,
                 str(settings.db_path),
                 route.slug,
-                _provider_budget(settings, route, orig_idx),
+                budgets[orig_idx],
                 max(1, int(reservation_tokens)),
                 2,  # reserve one bounded retry as well as the initial dispatch
             )
@@ -2727,6 +2793,7 @@ async def _dispatch_across_routes(
             circuit_failure: bool | None = None
             started = time.perf_counter()
             usage_token = _ACTUAL_USAGE_TOKENS.set(None)
+            stage_scope = _REQUEST_STAGE.set(_sanitize_error_text(task or "UNSPECIFIED", limit=48).upper())
             try:
                 result = await call_route(r, last)
                 succeeded = True
@@ -2738,6 +2805,7 @@ async def _dispatch_across_routes(
             finally:
                 actual_tokens = _ACTUAL_USAGE_TOKENS.get()
                 _ACTUAL_USAGE_TOKENS.reset(usage_token)
+                _REQUEST_STAGE.reset(stage_scope)
                 await asyncio.to_thread(
                     finish_quota, hold, actual_tokens=actual_tokens, succeeded=succeeded,
                     circuit_failure=circuit_failure,
@@ -2963,28 +3031,23 @@ async def _complete_json_on_route(
     strict_json: bool = False,
     adaptive_capacity: bool = False,
 ) -> dict:
-    """One provider's two-attempt JSON turn (used by the hedged path)."""
-    last_exc: LLMError | None = None
-    # Prefer failover over a second near-identical full-prompt request. The
-    # schema remains on the request; another provider gets the recovery attempt.
-    for attempt, prompt in enumerate((user,)):
-        try:
-            raw = await _complete_on_route(
-                route, session, settings, system=system, user=prompt,
-                retry_on_timeout=retry_on_timeout, schema=schema, adaptive_capacity=adaptive_capacity,
-            )
-            return _parse_json_object(raw, strict=strict_json)
-        except LLMRequestError:
-            raise
-        except LLMError as exc:
-            last_exc = exc
-            if not isinstance(exc, LLMResponseError) or attempt:
-                raise
-    assert last_exc is not None
-    raise last_exc
+    """Validate JSON inside the recorded attempt; fail over without resending it."""
+    parsed = None
+
+    def parse(text: str) -> None:
+        nonlocal parsed
+        parsed = _parse_json_object(text, strict=strict_json)
+
+    raw = await _complete_on_route(
+        route, session, settings, system=system, user=user,
+        retry_on_timeout=retry_on_timeout, schema=schema, adaptive_capacity=adaptive_capacity,
+        validate_response=parse,
+    )
+    return parsed if parsed is not None else _parse_json_object(raw, strict=strict_json)
 
 
 TASK_PROVIDER_ORDER = {
+    "BOOKLET_PLAN": ("avalai", "gemini", "openrouter"),
     "BOOKLET_GENERATION": ("avalai", "gemini", "openrouter"),
     "BOOKLET_REPAIR": ("avalai", "gemini", "openrouter"),
     "BOOKLET_VERIFY": ("avalai", "gemini", "openrouter"),

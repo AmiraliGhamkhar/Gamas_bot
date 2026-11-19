@@ -318,7 +318,8 @@ async def maybe_refine_plan(
             payload = await complete_json(
                 session, settings, system=_WINDOW_SYSTEM,
                 user=user,
-                task="BOOKLET_GENERATION", max_output_tokens=1024, sampling_temperature=0, strict_json=True,
+                task="BOOKLET_PLAN", max_output_tokens=1024, sampling_temperature=0, strict_json=True,
+                adaptive_capacity=True,
             )
             replacement = _parse_window(payload, boundary, group)
         except (LLMError, ValueError) as exc:
