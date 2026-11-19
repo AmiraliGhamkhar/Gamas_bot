@@ -68,13 +68,13 @@ class FinalAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         source = (
             "دوز ۵۰۰ میلی‌گرم است. نسبت ۸.۵ درصد گزارش شد. مدت ۳۰ دقیقه بود."
         )
-        generation = note_payload("دوز ۵۰۰ میلی‌گرم است.")
-        repairs = [
-            note_payload("دوز ۵۰۰ میلی‌گرم است. نسبت ۸.۵ درصد گزارش شد."),
-            note_payload(
-                "دوز ۵۰۰ میلی‌گرم است. نسبت ۸.۵ درصد گزارش شد. مدت ۳۰ دقیقه بود."
-            ),
-        ]
+        statements = ["دوز ۵۰۰ میلی‌گرم است.", "نسبت ۸.۵ درصد گزارش شد.", "مدت ۳۰ دقیقه بود."]
+        generation = note_payload(statements[0])
+        repairs = [note_payload(statements[0]), note_payload(statements[0])]
+        # An accepted coverage repair appends missing facts; the already-safe
+        # paragraph remains independently present in each response.
+        for count, repair in enumerate(repairs, 2):
+            repair["sections"][0]["paragraphs"] = statements[:count]
         repair_calls = 0
 
         async def fake_complete_json(_session, _settings, **kwargs):
@@ -92,7 +92,7 @@ class FinalAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             notes = await structure_document(source, settings, object())
         self.assertTrue(notes.has_content)
         self.assertLessEqual(repair_calls, MAX_NOTE_REPAIR_ATTEMPTS)
-        self.assertEqual(repair_calls, settings.note_max_repair_attempts)
+        self.assertEqual(repair_calls, 1)  # multiple issues on one node never trigger a second edit
 
 
 class JobStageReportingTests(unittest.IsolatedAsyncioTestCase):
@@ -183,6 +183,35 @@ class PromptRoutingTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(fragment=source_fragment):
                 self.assertIn(source_fragment, prompt)
         self.assertNotIn("[REDACTED]", prompt)
+
+    async def test_normalized_mixed_educational_prompt_masks_only_fake_credentials(self):
+        from gamas_bot.document_model import NormalizedDocument
+
+        fake_key = "sk-or-v1-abcdefghijklmno123456789"
+        fake_token = "123456:AAEAAabcdeFGHIJKLMNopqrs12345"
+        educational = (
+            "Synthetic case: Patient ID 765432109, student@example.invalid, Dr. Example.",
+            "تاریخ ۱۴۰۵/۰۳/۱۲، کمیت ۱۲٫۵ mg و پیوند‌واژه در تمرین حفظ می‌شوند.",
+            "Educational labels: anonymous survey, privacy, medical history, employment law.",
+        )
+        raw = "\ufeff" + "\r\n".join((*educational, f"API_KEY={fake_key}", f"Telegram token {fake_token}"))
+        source = NormalizedDocument.from_source_text(raw, source_type="txt")
+        answer = _Response(200, {"choices": [{
+            "message": {"content": json.dumps(note_payload(educational[1]), ensure_ascii=False)},
+            "finish_reason": "stop",
+        }]})
+        settings = make_settings(note_providers=("avalai",), avalai_api_key="av-test", note_compile=False)
+        session = _Session([answer])
+        notes = await structure_document(source, settings, session)
+        self.assertEqual(len(session.calls), 1)
+        prompt = session.calls[0]["json"]["messages"][-1]["content"]
+        self.assertIn("\n".join(educational), prompt)
+        self.assertNotIn(fake_key, prompt)
+        self.assertNotIn(fake_token, prompt)
+        self.assertGreaterEqual(prompt.count("[REDACTED]"), 2)
+        self.assertIn(fake_key, source.text)  # redaction is transport-only
+        self.assertIn(fake_token, source.text)
+        self.assertEqual(notes.input_ranges[-1].end_offset, len(source.text))
 
 
 class PromptSecretProtectionTests(unittest.TestCase):
@@ -312,16 +341,15 @@ class ProseClaimGateTests(unittest.IsolatedAsyncioTestCase):
         )
         with mock.patch("gamas_bot.notes.complete_json", new=fake_complete_json):
             notes = await structure_document(self.SOURCE, settings, object())
-        # A critical unsupported claim now routes to the source-preserving
-        # fallback instead of delivering a merely degraded booklet.
-        self.assertEqual(notes.quality_state, "RECOVERED")
+        # Retain the verified portion of the affected section.
+        self.assertEqual(notes.quality_state, "DEGRADED")
         body = " ".join(notes.sections[0].paragraphs)
         self.assertIn("نفرون", body)
         self.assertNotIn("اریتروپویتین", body)
 
 
 class CompleteBookletGateTests(unittest.IsolatedAsyncioTestCase):
-    async def test_a_lost_number_routes_to_source_preserving_recovery(self):
+    async def test_a_lost_number_is_reported_without_replacing_a_safe_draft(self):
         source = "دوز ۵۰۰ میلی‌گرم است و نسبت ۸.۵ درصد گزارش شد."
         payload = {
             "title": "دوز",
@@ -344,13 +372,10 @@ class CompleteBookletGateTests(unittest.IsolatedAsyncioTestCase):
                 source, settings, object(), on_incomplete=on_incomplete
             )
         self.assertTrue(notes.has_content)
-        # A complete booklet is never delivered as a partial synthesis: the
-        # fallback retains the exact source facts after bounded repair fails.
-        self.assertEqual(reasons, [])
-        self.assertEqual(notes.quality_state, "RECOVERED")
-        rendered = notes.to_markdown()
-        self.assertIn("۵۰۰", rendered)
-        self.assertIn("۸.۵", rendered)
+        self.assertEqual(reasons, ["missing_numbers"])
+        self.assertEqual(notes.quality_state, "DEGRADED")
+        self.assertFalse(notes.verification_report.passed)
+        self.assertIn("دوز دارو بررسی شد.", notes.to_markdown())
 
 
 class CompileStageNotificationTests(unittest.IsolatedAsyncioTestCase):

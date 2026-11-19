@@ -42,15 +42,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, replace
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Iterable
 
-from .doc_extract import DocSection, ExtractedDoc
-from .notes import NoteSection, StructuredNotes
 from .textnorm import normalize_display
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .doc_extract import ExtractedDoc
+    from .notes import NoteSection, StructuredNotes
     from .transcript import TranscriptDocument
 
 logger = logging.getLogger(__name__)
@@ -105,6 +107,31 @@ def _pairs_to_dict(pairs: tuple[tuple[str, str], ...]) -> dict[str, str]:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceBlock:
+    id: str
+    kind: str
+    text: str
+    start_offset: int
+    end_offset: int
+    page_number: int | None = None
+    slide_number: int | None = None
+    start_ms: int | None = None
+    end_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRange:
+    start_offset: int
+    end_offset: int
+    block_ids: tuple[str, ...]
+
+
+def normalize_source_text(text: str, *, initial: bool = True) -> str:
+    """Technical normalization only: CRLF/CR and one leading encoding BOM."""
+    return (text.removeprefix("\ufeff") if initial else text).replace("\r\n", "\n").replace("\r", "\n")
+
+
+@dataclass(frozen=True, slots=True)
 class SourceUnit:
     """One ordered, addressable slice of a normalized document.
 
@@ -123,12 +150,20 @@ class SourceUnit:
     heading_level: int | None = None
     #: What one unit means in this document: page / slide / section / text.
     kind: str = "section"
+    start_offset: int | None = None
+    end_offset: int | None = None
+    page_number: int | None = None
+    slide_number: int | None = None
+    start_ms: int | None = None
+    end_ms: int | None = None
 
     def render(self) -> str:
         """Heading + body, matching :meth:`doc_extract.DocSection.render`."""
+        if self.start_offset is not None:
+            return self.text  # exact unit: text owns its separators
         heading = self.heading.strip()
         body = self.text.strip()
-        if heading and body and heading not in body:
+        if heading and body:
             return f"{heading}\n{body}"
         return body or heading
 
@@ -143,6 +178,10 @@ class SourceUnit:
         }
         if self.heading_level is not None:
             payload["heading_level"] = self.heading_level
+        for key in ("start_offset", "end_offset", "page_number", "slide_number", "start_ms", "end_ms"):
+            value = getattr(self, key)
+            if value is not None:
+                payload[key] = value
         return payload
 
     @classmethod
@@ -174,6 +213,12 @@ class SourceUnit:
             heading=str(payload.get("heading") or ""),
             heading_level=heading_level,
             kind=str(payload.get("kind") or "section"),
+            start_offset=payload.get("start_offset"),
+            end_offset=payload.get("end_offset"),
+            page_number=payload.get("page_number"),
+            slide_number=payload.get("slide_number"),
+            start_ms=payload.get("start_ms"),
+            end_ms=payload.get("end_ms"),
         )
 
 
@@ -184,6 +229,11 @@ _SOURCE_TYPE_UNIT_KIND = {
     "docx": "section",
     "image": "page",
 }
+
+
+def _locator_number(locator: str) -> int | None:
+    label = locator.rpartition(" ")[2]
+    return int(label) if label.isdecimal() else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,11 +256,74 @@ class NormalizedDocument:
     metadata: tuple[tuple[str, str], ...] = ()
     provenance: str = ""
 
+    def __post_init__(self) -> None:
+        if not any(unit.start_offset is not None or unit.end_offset is not None for unit in self.units):
+            return  # historical units use implicit separators and offsets
+        cursor = 0
+        ids: set[str] = set()
+        for unit in self.units:
+            end = cursor + len(unit.text)
+            if (not unit.unit_id or unit.unit_id in ids or end == cursor
+                    or unit.start_offset != cursor or unit.end_offset != end):
+                raise ValueError("invalid normalized source block partition")
+            ids.add(unit.unit_id)
+            cursor = end
+
     @property
     def text(self) -> str:
-        """The complete normalized source, units joined in order."""
+        """The complete normalized educational source."""
+        if self.units and self.units[0].start_offset is not None:
+            return "".join(unit.text for unit in self.units)
         rendered = (unit.render() for unit in self.units)
         return "\n\n".join(text for text in rendered if text.strip())
+
+    @property
+    def source_blocks(self) -> tuple[SourceBlock, ...]:
+        """Project existing provenance units as an exact partition of `text`."""
+        blocks: list[SourceBlock] = []
+        cursor = 0
+        for unit in self.units:
+            body = unit.render()
+            if unit.start_offset is None:
+                if not body.strip():
+                    continue
+                body = ("\n\n" if blocks else "") + body
+            end = cursor + len(body)
+            blocks.append(SourceBlock(
+                unit.unit_id, unit.kind, body, cursor, end, unit.page_number,
+                unit.slide_number, unit.start_ms, unit.end_ms,
+            ))
+            cursor = end
+        return tuple(blocks)
+
+    @classmethod
+    def from_blocks(
+        cls, blocks: Iterable[SourceBlock], *, source_type: str, title: str = "",
+        document_id: str | None = None, metadata: Iterable[tuple[str, str]] = (),
+        language: str | None = None, provenance: str = "",
+    ) -> NormalizedDocument:
+        """Assign stable unit IDs and offsets to the canonical text stream."""
+        parts = [(block, normalize_source_text(block.text, initial=index == 0))
+                 for index, block in enumerate(blocks)]
+        text = "".join(part for _, part in parts)
+        digest = hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
+        cursor = 0
+        units: list[SourceUnit] = []
+        for block, part in parts:
+            if not part:
+                continue
+            end = cursor + len(part)
+            units.append(SourceUnit(
+                len(units), f"u{digest[:16]}:{cursor}-{end}", part, kind=block.kind,
+                start_offset=cursor, end_offset=end, page_number=block.page_number,
+                slide_number=block.slide_number, start_ms=block.start_ms, end_ms=block.end_ms,
+            ))
+            cursor = end
+        return cls(
+            units=tuple(units), title=title, source_type=source_type, language=language or detect_language(text),
+            page_count=1 if units else 0, document_id=document_id or f"doc-{digest[:16]}",
+            metadata=tuple(metadata), provenance=provenance or f"text>{source_type}",
+        )
 
     @property
     def stable_id(self) -> str:
@@ -230,6 +343,47 @@ class NormalizedDocument:
                 return unit
         return None
 
+    def chunk_ranges(self, bodies: Sequence[str]) -> tuple[SourceRange, ...]:
+        """Bind splitter bodies to ordered offsets, ignoring only reflowed whitespace.
+
+        Synthetic headers must be removed by the splitter that added them.
+        Reject an inconsistent split rather than submitting a partial document.
+        Boundary whitespace belongs to one adjacent range; all ranges together
+        reconstruct the canonical source exactly, even for mid-word splits.
+        """
+        cursor = 0
+        block_cursor = 0
+        ranges: list[SourceRange] = []
+        source = self.text
+        blocks = self.source_blocks
+        size = len(source)
+        for index, body in enumerate(bodies):
+            start = cursor
+            for char in body:
+                if char.isspace():
+                    continue
+                while cursor < size and source[cursor].isspace():
+                    cursor += 1
+                if cursor == size or source[cursor] != char:
+                    raise ValueError("source split changed or reordered content")
+                cursor += 1
+            if index == len(bodies) - 1:
+                while cursor < size and source[cursor].isspace():
+                    cursor += 1
+            while (block_cursor < len(blocks)
+                   and blocks[block_cursor].end_offset <= start):
+                block_cursor += 1
+            ids: list[str] = []
+            position = block_cursor
+            while position < len(blocks) and blocks[position].start_offset < cursor:
+                ids.append(blocks[position].id)
+                position += 1
+            ranges.append(SourceRange(start, cursor, tuple(ids)))
+        if cursor != size:
+            raise ValueError("source split left an unassigned range")
+        return tuple(ranges)
+
+
     @classmethod
     def from_extracted(
         cls,
@@ -244,26 +398,30 @@ class NormalizedDocument:
         """Adapt an extraction result without losing a single section.
 
         Every :class:`~gamas_bot.doc_extract.DocSection` becomes one unit, in
-        order, with its locator and heading intact. Extraction already cleaned
-        the text; ``normalize_display`` is idempotent, so applying it here
-        only guarantees the canonical normal form.
+        order, with its locator and heading intact. Extraction uses technical
+        normalization only; no lesson text is rewritten here.
         """
         kind = _SOURCE_TYPE_UNIT_KIND.get(extracted.source_type, "section")
         units = tuple(
             SourceUnit(
                 ordinal=index,
                 unit_id=f"u{index + 1:04d}",
-                text=normalize_display(section.text),
+                text=normalize_source_text(section.text, initial=index == 0),
                 locator=section.locator,
-                heading=normalize_display(section.heading),
+                heading=normalize_source_text(section.heading, initial=index == 0),
                 heading_level=section.heading_level,
                 kind=kind,
+                page_number=_locator_number(section.locator) if kind == "page" else None,
+                slide_number=_locator_number(section.locator) if kind == "slide" else None,
             )
             for index, section in enumerate(extracted.sections)
         )
         full_text = "\n\n".join(
             rendered for rendered in (unit.render() for unit in units) if rendered.strip()
         )
+        source_metadata = tuple(metadata)
+        if extracted.pages_without_text:
+            source_metadata += (("pages_without_text", ",".join(map(str, extracted.pages_without_text))),)
         return cls(
             units=units,
             title=title,
@@ -271,7 +429,7 @@ class NormalizedDocument:
             source_type=extracted.source_type or "text",
             page_count=int(extracted.page_count),
             document_id=document_id,
-            metadata=tuple(metadata),
+            metadata=source_metadata,
             provenance=provenance or f"upload>extract:{extracted.source_type}",
         )
 
@@ -318,6 +476,38 @@ class NormalizedDocument:
         )
 
     @classmethod
+    def from_source_text(
+        cls,
+        text: str,
+        *,
+        source_type: str = "text",
+        title: str = "",
+        locator: str = "",
+        document_id: str = "",
+        metadata: Iterable[tuple[str, str]] = (),
+        provenance: str = "",
+        language: str | None = None,
+        kind: str = "paragraph",
+    ) -> NormalizedDocument:
+        """Preserve paragraph boundaries and all non-technical source text."""
+        source = str(text or "")
+        # Partition before technical normalization (the pattern also recognizes CRLF).
+        starts = sorted({
+            0,
+            *(m.end() for m in re.finditer(r"\r?\n[^\S\n]*\r?\n\s*", source) if m.end() < len(source)),
+            *(m.end() for m in re.finditer(r"(?<=[\r\n]) {0,3}(?=#{1,6}[ \t]+\S)", source)),
+        })
+        normalized = cls.from_blocks(
+            (SourceBlock("", kind, source[start:end], start, end)
+             for start, end in zip(starts, [*starts[1:], len(source)], strict=True) if end > start),
+            source_type=source_type, title=title, document_id=document_id, metadata=metadata,
+            language=language, provenance=provenance,
+        )
+        if locator and normalized.units:
+            normalized = replace(normalized, units=tuple(replace(unit, locator=locator) for unit in normalized.units))
+        return normalized
+
+    @classmethod
     def from_transcript(
         cls,
         transcript: "TranscriptDocument",
@@ -325,6 +515,7 @@ class NormalizedDocument:
         title: str = "",
         document_id: str = "",
         provenance: str = "audio>transcribe",
+        source_type: str = "transcript",
     ) -> "NormalizedDocument":
         """Adapt a cleaned transcript via its existing LLM-input contract.
 
@@ -339,17 +530,26 @@ class NormalizedDocument:
             metadata.append(("diarization_attempted", "true"))
         if transcript.overlap_count:
             metadata.append(("overlap_count", str(transcript.overlap_count)))
-        return cls.from_text(
-            transcript.llm_document(),
-            source_type="transcript",
-            title=title,
-            document_id=document_id,
-            metadata=metadata,
-            provenance=provenance,
+        blocks: list[SourceBlock] = []
+        for paragraph in transcript.paragraphs:
+            text = paragraph.text.strip()
+            if not text:
+                continue
+            start, end = paragraph.start, paragraph.end
+            blocks.append(SourceBlock(
+                "", "transcript", ("\n\n" if blocks else "") + text, 0, 0,
+                start_ms=round(start * 1000) if start is not None and math.isfinite(start) else None,
+                end_ms=round(end * 1000) if end is not None and math.isfinite(end) else None,
+            ))
+        return cls.from_blocks(
+            blocks, source_type=source_type, title=title, document_id=document_id,
+            metadata=metadata, provenance=provenance,
         )
 
     def to_extracted(self) -> ExtractedDoc:
         """Back-compat adapter: the extraction shape existing callers consume."""
+        from .doc_extract import DocSection, ExtractedDoc
+
         return ExtractedDoc(
             self.source_type,
             self.page_count,
@@ -359,10 +559,11 @@ class NormalizedDocument:
                 )
                 for unit in self.units
             ),
+            tuple(int(page) for page in self.metadata_map.get("pages_without_text", "").split(",") if page.isdecimal()),
         )
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "document_id": self.document_id,
             "title": self.title,
             "language": self.language,
@@ -373,6 +574,10 @@ class NormalizedDocument:
             "units": [unit.to_payload() for unit in self.units],
         }
 
+        if self.units and self.units[0].start_offset is not None:
+            payload["text_length"] = self.units[-1].end_offset
+        return payload
+
     def to_json(self) -> str:
         return json.dumps(self.to_payload(), ensure_ascii=False)
 
@@ -380,11 +585,13 @@ class NormalizedDocument:
     def from_payload(cls, payload: object) -> "NormalizedDocument":
         if not isinstance(payload, dict):
             raise ValueError("NormalizedDocument payload must be a JSON object")
-        units = tuple(
-            unit
-            for unit in (SourceUnit.from_payload(item) for item in payload.get("units") or [])
-            if unit is not None
-        )
+        raw_units = payload.get("units") or []
+        units = tuple(unit for unit in map(SourceUnit.from_payload, raw_units) if unit is not None)
+        if "text_length" in payload and (
+            len(units) != len(raw_units) or not units or units[-1].end_offset is None
+            or units[-1].end_offset != payload["text_length"]
+        ):
+            raise ValueError("invalid normalized source block partition")
         language = str(payload.get("language") or LANGUAGE_UNDETERMINED)
         return cls(
             units=units,
@@ -405,6 +612,38 @@ class NormalizedDocument:
 # ===========================================================================
 # Layer 2 — ContentPlan
 # ===========================================================================
+
+
+PLAN_SCHEMA_VERSION = 2
+_PLAN_DIMENSIONS = {
+    "numbers": "important_numbers", "units": "important_numbers", "dates": "important_numbers",
+    "terminology": "critical_terms", "abbreviations": "critical_terms",
+    "formulas": "important_facts", "definitions": "important_facts",
+}
+
+
+def _legacy_plan_strings(payload: dict[str, Any], key: str) -> tuple[str, ...]:
+    return tuple(str(item) for item in payload.get(key) or () if str(item))
+
+
+def _plan_strings(payload: dict[str, Any], key: str) -> tuple[str, ...]:
+    values = payload.get(key, [])
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise ValueError(f"{key} must be an array of strings")
+    return tuple(values)
+
+
+def _plan_ranges(payload: dict[str, Any]) -> tuple[SourceRange, ...]:
+    ranges = payload.get("source_ranges", [])
+    if not isinstance(ranges, list):
+        raise ValueError("source_ranges must be an array")
+    result = []
+    for item in ranges:
+        if (not isinstance(item, dict) or type(item.get("start_offset")) is not int
+                or type(item.get("end_offset")) is not int):
+            raise ValueError("invalid source range offsets")
+        result.append(SourceRange(item["start_offset"], item["end_offset"], _plan_strings(item, "block_ids")))
+    return tuple(result)
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,8 +670,26 @@ class PlanTopic:
     #: Relationships between topics: ids of topics that must come first.
     depends_on: tuple[str, ...] = ()
 
-    def to_payload(self) -> dict[str, Any]:
-        return {
+    description: str = ""
+    parent_id: str | None = None
+    source_ranges: tuple[SourceRange, ...] = ()
+    important_facts: tuple[str, ...] = ()
+    critical_terms: tuple[str, ...] = ()
+    important_numbers: tuple[str, ...] = ()
+    required_dimensions: tuple[str, ...] = ()
+    duplicate_of: str | None = None
+    repeated_title_of: str | None = None
+
+    @property
+    def id(self) -> str:
+        return self.topic_id
+
+    @property
+    def source_block_ids(self) -> tuple[str, ...]:
+        return self.unit_ids
+
+    def to_payload(self, *, canonical: bool = False) -> dict[str, Any]:
+        result: dict[str, Any] = {
             "topic_id": self.topic_id,
             "title": self.title,
             "purpose": self.purpose,
@@ -442,30 +699,77 @@ class PlanTopic:
             "depth": self.depth,
             "depends_on": list(self.depends_on),
         }
+        if not canonical:
+            return result
+        result["id"] = result.pop("topic_id")
+        result["source_block_ids"] = result.pop("unit_ids")
+        result.update({
+            "description": self.description,
+            "parent_id": self.parent_id,
+            "source_ranges": [
+                {"start_offset": item.start_offset, "end_offset": item.end_offset, "block_ids": list(item.block_ids)}
+                for item in self.source_ranges
+            ],
+            "important_facts": list(self.important_facts),
+            "critical_terms": list(self.critical_terms),
+            "important_numbers": list(self.important_numbers),
+            "required_dimensions": list(self.required_dimensions),
+            "duplicate_of": self.duplicate_of,
+            "repeated_title_of": self.repeated_title_of,
+        })
+        return result
 
     @classmethod
-    def from_payload(cls, payload: object) -> "PlanTopic | None":
+    def from_payload(cls, payload: object, *, strict: bool = False) -> "PlanTopic | None":
         if not isinstance(payload, dict):
             return None
-        topic_id = str(payload.get("topic_id") or "").strip()
+        id_key = "id" if strict else "topic_id"
+        topic_id = str(payload.get(id_key) or "").strip()
         title = str(payload.get("title") or "").strip()
         if not topic_id or not title:
             return None
         depth = str(payload.get("depth") or DEFAULT_PLAN_DEPTH).strip().lower()
         if depth not in PLAN_DEPTHS:
             depth = DEFAULT_PLAN_DEPTH
+        if not strict:
+            return cls(
+                topic_id=topic_id, title=title, purpose=str(payload.get("purpose") or ""),
+                unit_ids=_legacy_plan_strings(payload, "unit_ids"), locators=_legacy_plan_strings(payload, "locators"),
+                concepts=_legacy_plan_strings(payload, "concepts"), depth=depth,
+                depends_on=_legacy_plan_strings(payload, "depends_on"),
+            )
+        for key in ("id", "title", "description"):
+            if not isinstance(payload.get(key), str):
+                raise ValueError(f"{key} must be text")
+        for key in ("parent_id", "duplicate_of", "repeated_title_of"):
+            if payload.get(key) is not None and not isinstance(payload[key], str):
+                raise ValueError(f"{key} must be a string or null")
+        for key in ("parent_id", "source_block_ids", "source_ranges", "important_facts", "critical_terms",
+                    "important_numbers", "required_dimensions"):
+            if key not in payload:
+                raise ValueError(f"missing canonical topic field: {key}")
         return cls(
             topic_id=topic_id,
             title=title,
             purpose=str(payload.get("purpose") or ""),
-            unit_ids=tuple(str(item) for item in payload.get("unit_ids") or () if str(item)),
-            locators=tuple(str(item) for item in payload.get("locators") or () if str(item)),
-            concepts=tuple(str(item) for item in payload.get("concepts") or () if str(item)),
+            unit_ids=_plan_strings(payload, "source_block_ids"),
+            locators=_plan_strings(payload, "locators"),
+            concepts=_plan_strings(payload, "concepts"),
             depth=depth,
-            depends_on=tuple(
-                str(item) for item in payload.get("depends_on") or () if str(item)
-            ),
+            depends_on=_plan_strings(payload, "depends_on"),
+            description=payload["description"],
+            parent_id=payload["parent_id"],
+            source_ranges=_plan_ranges(payload),
+            important_facts=_plan_strings(payload, "important_facts"),
+            critical_terms=_plan_strings(payload, "critical_terms"),
+            important_numbers=_plan_strings(payload, "important_numbers"),
+            required_dimensions=_plan_strings(payload, "required_dimensions"),
+            duplicate_of=payload.get("duplicate_of"),
+            repeated_title_of=payload.get("repeated_title_of"),
         )
+
+
+PlannedTopic = PlanTopic  # Same type; keep the existing public name.
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,6 +785,14 @@ class ContentPlan:
     language: str = LANGUAGE_UNDETERMINED
     topics: tuple[PlanTopic, ...] = ()
 
+    title: str = ""
+    document_summary: str = ""
+    global_terminology: tuple[str, ...] = ()
+    coverage_requirements: tuple[str, ...] = ()
+    planner: str = "deterministic"
+    metadata: tuple[tuple[str, str], ...] = ()
+    schema_version: int = 1  # Archived minimal plans remain readable.
+
     def topic(self, topic_id: str) -> PlanTopic | None:
         for topic in self.topics:
             if topic.topic_id == topic_id:
@@ -488,36 +800,94 @@ class ContentPlan:
         return None
 
     def issues(self, document: NormalizedDocument | None = None) -> list[str]:
-        """Integrity problems, reported (not raised) for the caller to handle."""
+        """Check references, hierarchy and exact ordered source coverage."""
         problems: list[str] = []
+        canonical = self.schema_version == PLAN_SCHEMA_VERSION
+        if self.schema_version not in {1, PLAN_SCHEMA_VERSION}:
+            problems.append("unsupported ContentPlan version")
+        known_topics = {topic.topic_id for topic in self.topics}
+        blocks = {block.id: block for block in document.source_blocks} if document is not None else {}
+        known_units = {unit.unit_id for unit in document.units} if document is not None else set()
+        if self.planner not in {"deterministic", "llm"}:
+            problems.append("invalid planner")
+        if canonical and document is not None and self.document_id != document.stable_id:
+            problems.append("plan references a different document")
+        if canonical and (self.topics or self.coverage_requirements):
+            if not all(value.strip() for value in (self.title, self.document_id, self.document_summary)):
+                problems.append("missing plan title, identity or summary")
         seen: set[str] = set()
+        covered: list[str] = []
+        cursor = 0
         for topic in self.topics:
-            if topic.topic_id in seen:
-                problems.append(f"duplicate topic id: {topic.topic_id}")
-            seen.add(topic.topic_id)
+            topic_id = topic.topic_id
+            if not topic_id.strip() or topic_id in seen:
+                problems.append(f"duplicate topic id: {topic_id}" if topic_id in seen else "empty topic id")
             if not topic.title.strip():
-                problems.append(f"topic {topic.topic_id} has no title")
+                problems.append(f"topic {topic_id} has no title")
             for dependency in topic.depends_on:
-                if dependency not in seen and self.topic(dependency) is None:
-                    problems.append(
-                        f"topic {topic.topic_id} depends on unknown topic {dependency}"
-                    )
-        if document is not None:
-            known_units = {unit.unit_id for unit in document.units}
-            for topic in self.topics:
+                if dependency not in known_topics:
+                    problems.append(f"topic {topic_id} depends on unknown topic {dependency}")
+                elif dependency not in seen and canonical:
+                    problems.append(f"topic {topic_id} has a forward or cyclic dependency")
+            for reference in (topic.parent_id, topic.duplicate_of, topic.repeated_title_of):
+                if reference is not None and reference not in seen:
+                    problems.append(f"topic {topic_id} has an invalid parent or duplicate reference")
+            seen.add(topic_id)
+            if document is not None:
                 for unit_id in topic.unit_ids:
                     if unit_id not in known_units:
-                        problems.append(
-                            f"topic {topic.topic_id} covers unknown unit {unit_id}"
-                        )
+                        problems.append(f"topic {topic_id} covers unknown unit {unit_id}")
+            if not canonical:
+                continue
+            if not topic.description.strip() or not topic.unit_ids:
+                problems.append(f"topic {topic_id} has no description or source references")
+            for dimension in topic.required_dimensions:
+                field = _PLAN_DIMENSIONS.get(dimension)
+                if not field or not getattr(topic, field):
+                    problems.append(f"topic {topic_id} has an unsupported required dimension: {dimension}")
+            if tuple(block_id for item in topic.source_ranges for block_id in item.block_ids) != topic.unit_ids:
+                problems.append(f"topic {topic_id} range references differ from block ids")
+            for item in topic.source_ranges:
+                block = blocks.get(item.block_ids[0]) if len(item.block_ids) == 1 else None
+                if (len(item.block_ids) != 1 or type(item.start_offset) is not int or type(item.end_offset) is not int
+                        or item.start_offset != cursor or item.end_offset <= cursor
+                        or (document is not None and (block is None or
+                            (block.start_offset, block.end_offset) != (item.start_offset, item.end_offset)))):
+                    problems.append(f"topic {topic_id} has an invalid source range")
+                cursor = item.end_offset
+            covered.extend(topic.unit_ids)
+        if canonical:
+            if len(set(covered)) != len(covered) or tuple(covered) != self.coverage_requirements:
+                problems.append("topic coverage does not match the ordered requirements exactly once")
+            if document is not None and (tuple(covered) != tuple(blocks) or cursor != len(document.text)):
+                problems.append("plan does not cover the complete source")
         return problems
 
+    def validate(self, document: NormalizedDocument | None = None) -> ContentPlan:
+        problems = self.issues(document)
+        if problems:
+            raise ValueError("; ".join(problems))
+        return self
+
     def to_payload(self) -> dict[str, Any]:
-        return {
+        canonical = self.schema_version == PLAN_SCHEMA_VERSION
+        result: dict[str, Any] = {
             "document_id": self.document_id,
             "language": self.language,
-            "topics": [topic.to_payload() for topic in self.topics],
+            "topics": [topic.to_payload(canonical=canonical) for topic in self.topics],
         }
+        if not canonical:
+            return result
+        result.update({
+            "title": self.title,
+            "document_summary": self.document_summary,
+            "global_terminology": list(self.global_terminology),
+            "coverage_requirements": list(self.coverage_requirements),
+            "planner": self.planner,
+            "metadata": _pairs_to_dict(self.metadata),
+            "schema_version": self.schema_version,
+        })
+        return result
 
     def to_json(self) -> str:
         return json.dumps(self.to_payload(), ensure_ascii=False)
@@ -526,16 +896,42 @@ class ContentPlan:
     def from_payload(cls, payload: object) -> "ContentPlan":
         if not isinstance(payload, dict):
             raise ValueError("ContentPlan payload must be a JSON object")
+        version = payload.get("schema_version", 1)
+        if type(version) is not int or version not in {1, PLAN_SCHEMA_VERSION}:
+            raise ValueError("unsupported ContentPlan version")
+        canonical = version == PLAN_SCHEMA_VERSION
+        raw_topics = payload.get("topics")
+        if not canonical and raw_topics is None:
+            raw_topics = []
+        if not isinstance(raw_topics, list):
+            raise ValueError("topics must be an array")
         topics = tuple(
-            topic
-            for topic in (PlanTopic.from_payload(item) for item in payload.get("topics") or [])
-            if topic is not None
+            topic for item in raw_topics if (topic := PlanTopic.from_payload(item, strict=canonical)) is not None
         )
-        return cls(
+        if not canonical:
+            return cls(
+                document_id=str(payload.get("document_id") or ""),
+                language=str(payload.get("language") or LANGUAGE_UNDETERMINED), topics=topics,
+            )
+        metadata = payload.get("metadata")
+        if (len(topics) != len(raw_topics) or any(
+            not isinstance(payload.get(key), str) for key in ("document_id", "title", "document_summary", "planner")
+        ) or any(key not in payload for key in ("global_terminology", "coverage_requirements"))
+                or not isinstance(metadata, dict) or any(not isinstance(value, str) for value in metadata.values())):
+            raise ValueError("invalid canonical ContentPlan fields")
+        plan = cls(
             document_id=str(payload.get("document_id") or ""),
             language=str(payload.get("language") or LANGUAGE_UNDETERMINED),
             topics=topics,
+            title=str(payload.get("title") or ""),
+            document_summary=str(payload.get("document_summary") or ""),
+            global_terminology=_plan_strings(payload, "global_terminology"),
+            coverage_requirements=_plan_strings(payload, "coverage_requirements"),
+            planner=str(payload.get("planner", "deterministic")),
+            metadata=_pairs(metadata),
+            schema_version=version,
         )
+        return plan.validate()
 
     @classmethod
     def from_json(cls, payload: str) -> "ContentPlan":
@@ -545,38 +941,10 @@ class ContentPlan:
 def plan_from_document(
     document: NormalizedDocument, *, depth: str = DEFAULT_PLAN_DEPTH
 ) -> ContentPlan:
-    """Deterministic structural default plan: one ordered topic per unit.
+    """Build and validate the canonical plan without a model request."""
+    from .note_planning import build_deterministic_plan
 
-    This is **not** the global planner. It exists so the plan layer is real,
-    testable and provenance-complete today: every source unit is covered by
-    exactly one topic, topics follow source order, and each topic depends on
-    its predecessor (a linear chain). A later planning stage replaces this
-    with semantic grouping; the representation does not change.
-    """
-    if depth not in PLAN_DEPTHS:
-        depth = DEFAULT_PLAN_DEPTH
-    topics: list[PlanTopic] = []
-    previous_id = ""
-    for index, unit in enumerate(document.units):
-        topic_id = f"t{index + 1:03d}"
-        title = unit.heading or unit.locator or f"بخش {index + 1}"
-        topics.append(
-            PlanTopic(
-                topic_id=topic_id,
-                title=title,
-                purpose="source coverage",
-                unit_ids=(unit.unit_id,),
-                locators=(unit.locator,) if unit.locator else (),
-                depth=depth,
-                depends_on=(previous_id,) if previous_id else (),
-            )
-        )
-        previous_id = topic_id
-    return ContentPlan(
-        document_id=document.stable_id,
-        language=document.language,
-        topics=tuple(topics),
-    )
+    return build_deterministic_plan(document, depth=depth)
 
 
 # ===========================================================================
@@ -591,6 +959,8 @@ def _note_section_payload(section: NoteSection) -> dict[str, Any]:
     single-section wrapper) means this module can never drift from the JSON
     shape the renderers and validators already trust.
     """
+    from .notes import StructuredNotes
+
     payload = StructuredNotes(sections=(section,)).to_payload()
     sections = payload.get("sections")
     return sections[0] if isinstance(sections, list) and sections else {}
@@ -662,6 +1032,8 @@ class StructuredSection:
         if not isinstance(payload, dict):
             return None
         section_id = str(payload.get("section_id") or "").strip()
+        from .notes import NoteSection
+
         body = NoteSection.from_payload(payload.get("body"), 0)
         if not section_id or body is None:
             return None
@@ -700,6 +1072,8 @@ def notes_from_sections(
     ``StructuredNotes`` is produced. Empty-content sections are dropped,
     matching the note model's own contract.
     """
+    from .notes import StructuredNotes
+
     ordered = sorted(sections, key=lambda section: section.order)
     bodies = tuple(section.body for section in ordered if section.body.has_content)
     if base is None:

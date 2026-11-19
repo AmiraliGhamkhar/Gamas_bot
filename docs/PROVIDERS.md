@@ -86,6 +86,11 @@ caps from application budgets:
 | OpenRouter | `nvidia/nemotron-3.5-super-vl:free` | 1000000 / 1000000 | 131072 |
 
 These are repository metadata, **not** current provider/account guarantees.
+The capacity registry matches the exact provider/model pair; unknown overrides
+use configurable deployment ceilings rather than inheriting these limits. The
+native Google route can use [`models.countTokens`](https://ai.google.dev/api/tokens)
+with the sanitized generation request; failure or an unsupported endpoint falls
+back to estimation. The counter is not sent to custom proxies.
 Operating defaults remain **131072 context / 64000 chunk characters / 16384
 output**, with `NOTE_COMPILE=false`; never substitute a reference context window
 for the output budget. Verify current model documentation and entitlement
@@ -134,29 +139,39 @@ A rendered booklet must be **faithful and structurally valid**; only a booklet
 that also meets the completeness checks is announced as complete. Long-source
 metadata is generated per chunk and merged in source order, so the optional
 `NOTE_COMPILE` pass is not required for a summary, key points or glossary. The
-editorial pass receives a topic map plus the draft, not the entire raw source;
-the map is for ordering only, never evidence for new content. If a map chunk
-cannot be recovered, the pipeline does not merge only the successful chunks: it
-uses a source-only fallback for the complete source when enabled, otherwise it
-withholds the booklet.
+editorial pass receives the draft and a structural plan, not the raw source.
+It returns a patch: complete ID permutations, source-preserving headings,
+extractive summaries/comparisons, exact deduplication, or structural links.
+Detected literal value variants are possible conflicts, not factual verdicts;
+both variants remain. Large drafts are edited in whole-section topic groups,
+then chapter and final outlines. Over-budget or invalid proposals never
+truncate or replace the approved baseline. A failed map unit uses its local
+source-preserving fallback when enabled; otherwise the booklet is withheld
+rather than silently delivering only the successful sections.
 
 | Outcome | Rule | Result |
 | --- | --- | --- |
 | Recovered/scrubbed | Unsupported signals or claims are removed locally; if that cannot leave a safe booklet, the default source-only fallback is audited instead | Safe booklet delivered as `partial`, with a `notes_recovered` or `notes_degraded` notice |
-| Delivered, incomplete | The safe booklet omits source numbers/terms or has low sentence coverage after bounded repair | Booklet delivered as `partial`; the notice names the gap (or says coverage is incomplete) |
+| Delivered, incomplete | The safe booklet has unresolved plan, structural, or evidence findings after bounded repair | Booklet delivered as `partial`; the notice names the gap (or says coverage is incomplete) |
 | Structure unavailable | The source is unusable or no renderable structure can be recovered | Raw transcript retained; no booklet is rendered, and the results screen explains the failure |
 | Delivered, complete | Mandatory structure is valid, no fabricated signal or unsupported claim remains, and no diagnostic completeness gap remains | `done` |
 
-Safe compile output is not discarded merely for lower section/character ratios;
-source omissions are measured by the evidence/completeness audit and reported as
-partial. A malformed or empty structure is still withheld at the render boundary.
+Synthesis acceptance checks actual educational items and their owning source
+references rather than section or character counts. This protects generated
+content, not a claim that the baseline covered every source fact. Source
+omissions are measured separately by the evidence and completeness audit.
 
-The prose check is deliberately lexical: it flags a sentence with *no*
-vocabulary in common with the lecture for repair or removal, and never claims
-semantic entailment. Paraphrase, reordering and standard equivalents pass; an
-invented Persian-only statement does not. Offsets of the closest source sentence
-are kept on the report (`ClaimEvidence.span`) and only counts are logged — never
-the text.
+The deterministic report is available at `StructuredNotes.verification_report`
+in memory, or via `gamas_bot.booklet_verification.verify_booklet` without any
+provider. `passed` means no findings remain under the policy; the scores are
+ratios of explicit topic/dimension/fact, structural, and evidence checks, not
+arbitrary acceptance thresholds. With no plan, lexical/unit coverage is an
+informational fallback score. Deterministic word overlap is an evidence screen,
+not semantic entailment. Strict `repair` mode can ask the provider about
+ambiguous high-risk, quantitative, definition or procedure claims using exact
+local excerpts. A reply cannot mark unreviewed or unresolved claims as supported.
+Only stage, counts and status are logged; the report carries IDs rather than
+claim or source text. Stored booklet JSON and provider routing order are unchanged.
 
 ### Request diagnostics
 

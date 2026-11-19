@@ -4,6 +4,46 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Bounded booklet verification.** Reports identify remaining issues by topic,
+section and source reference. Deterministic checks come first; strict repair mode
+uses small semantic checks only for ambiguous claims. Each defective node gets
+at most one targeted edit. If it fails, the verifier retains healthy content and
+reports omissions instead of replacing a safe booklet wholesale.
+
+**Deterministic merge and opt-in synthesis.** Merge keeps source order,
+unique educational details, conflicting alternatives, and source references.
+`NOTE_COMPILE` now asks for bounded edits rather than a replacement booklet.
+Large drafts use whole-topic groups, chapter outlines, and a final complete
+outline; rejected or over-budget edits leave the approved content intact.
+
+**Parallel Section Writer.** Planned sections use topic-local evidence, a
+source-supported expansion matrix, and the existing note schema and provider
+chain. The bounded map preserves plan order and records source block IDs and
+failed ranges. Local fallback covers a failed range without regenerating other
+sections; integrations can checkpoint and resume unfinished work explicitly.
+
+**Topic-first booklet segmentation.** Planned topics, pages, and slides are
+mapped as source ranges. Only oversized topics are subdivided; context and
+output failures are retried on the affected range without using truncated JSON.
+The model registry and the request's real overhead now determine token budgets,
+with Gemini native counting and configurable unknown-model ceilings.
+
+**Booklet content planning.** The deterministic plan groups normalized blocks
+into ordered topics and records exact ranges, source facts, terminology, and
+repeat references without dropping coverage. Chunk orientation uses the plan
+without changing the stored booklet or renderer contracts. Local LLM outline
+refinement is opt-in and restricted to very large, weakly structured sources.
+
+**Booklet source normalization.** The existing document model now exposes
+stable source blocks and Unicode offsets, including page/slide numbers or
+transcript timings when available. Booklet chunks are checked against the
+complete normalized source before generation. Partial/stale document caches
+are rebuilt from stored text; presentation preambles and supported chart and
+SmartArt tails are retained. The old 250 000-character note-generation limit
+is gone. The paid map-request ceiling remains, with source-only recovery when
+enabled. Credential redaction, provider routing, and the stored booklet and
+renderer contracts are unchanged.
+
 **Fix: the «دعوت دوستان» referral screen never rendered.** The share button's
 URL embedded the Persian invite text raw — spaces included — which is not a
 valid URL; Telegram rejected the whole inline keyboard with

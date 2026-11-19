@@ -897,9 +897,8 @@ class IncompleteBookletDeliveryTests(BotPipelineTestCase):
         kinds = await self.db.read_db.execute_fetchall(
             "SELECT error_kind FROM submissions WHERE submission_id=?", (submission,)
         )
-        self.assertEqual(kinds[0][0], "notes_recovered")
-        # The canonical gate replaces number-losing output with a complete
-        # source-preserving booklet rather than delivering it as partial.
+        self.assertEqual(kinds[0][0], "notes_incomplete")
+        # The safe partial draft remains renderable; missing facts are reported.
         self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
         self.assertTrue(
             any("متن خام" in text for text in event.edits + event.replies),
@@ -1010,7 +1009,7 @@ class PresentationPromptTests(BotPipelineTestCase):
     """The deck's own text must be part of the note request, not only the audio."""
 
     def settings_overrides(self) -> dict:
-        return {"avalai_api_key": "note-key"}
+        return {"avalai_api_key": "note-key", "note_compile": False}
 
     async def test_slide_text_notes_and_narration_all_reach_the_note_model(self):
         deck = build_deck(
@@ -1071,17 +1070,20 @@ class PresentationPromptTests(BotPipelineTestCase):
 
         fake_probe.assert_not_awaited()
         structuring = self._structuring_calls(session)
-        self.assertEqual(len(structuring), 1, session.llm_calls)
-        # One review-plan request follows the completed booklet.
+        # Unaligned narration is its own semantic unit, not evidence assigned
+        # to the slide. Both units still produce a single completed booklet.
+        self.assertEqual(len(structuring), 2)
         self.assertLessEqual(len(self._review_plan_calls(session)), 1)
-        request = structuring[0]["json"]
-        user_content = request["messages"][1]["content"]
-        self.assertIn("## متن اسلایدها", user_content)
-        self.assertIn("شبکهٔ عصبی", user_content)
-        self.assertIn("لایهٔ ورودی", user_content)
-        self.assertIn("یادداشت گوینده: توضیح تکمیلی گوینده", user_content)
-        self.assertIn("## متن پیاده‌سازی‌شدهٔ صدای ارائه", user_content)
-        self.assertIn("امروز درباره", user_content)
+        bodies = [call["json"]["messages"][1]["content"].rsplit("\n\nموضوع همین بخش:", 1)[0]
+                  for call in structuring]
+        slide = next(body for body in bodies if "بخش ۱ از ۲" in body)
+        narration = next(body for body in bodies if "بخش ۲ از ۲" in body)
+        self.assertIn("\n\n## متن اسلایدها", slide)
+        self.assertIn("شبکهٔ عصبی", slide)
+        self.assertIn("لایهٔ ورودی", slide)
+        self.assertIn("یادداشت گوینده: توضیح تکمیلی گوینده", slide)
+        self.assertIn("\n\n## متن پیاده‌سازی‌شدهٔ صدای ارائه", narration)
+        self.assertTrue(narration.rstrip().endswith("امروز درباره شبکهٔ عصبی صحبت شد"))
         row = await self.db.submission(submission)
         assert row is not None
         self.assertEqual(row.status, "done")

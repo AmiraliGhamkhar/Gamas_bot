@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,7 @@ from typing import Iterable
 
 from . import texts
 from .learning import MAX_MODEL_INPUT_CHARS
+from .document_model import normalize_source_text
 from .progress import to_persian_digits
 
 logger = logging.getLogger(__name__)
@@ -122,7 +124,7 @@ class DocSection:
     def render(self) -> str:
         heading = self.heading.strip()
         body = self.text.strip()
-        if heading and body and heading not in body:
+        if heading and body:
             return f"{heading}\n{body}"
         return body or heading
 
@@ -144,6 +146,7 @@ class ExtractedDoc:
     source_type: str
     page_count: int
     sections: tuple[DocSection, ...] = field(default_factory=tuple)
+    pages_without_text: tuple[int, ...] = ()
 
     @property
     def text(self) -> str:
@@ -236,9 +239,11 @@ def _read_pdf_pages(path: Path) -> list[str]:
     for number, page in enumerate(pages, start=1):
         try:
             text = page.extract_text() or ""
-        except Exception:
-            logger.warning("pdf page %s could not be parsed", number, exc_info=True)
-            text = ""
+        except Exception as exc:
+            logger.warning("pdf page %s could not be parsed error=%s", number, type(exc).__name__)
+            raise DocExtractError(
+                f"خواندن متن صفحهٔ {to_persian_digits(number)} ناموفق بود؛ استخراج ناقص ذخیره نشد."
+            ) from None
         cleaned = _clean_block(text)
         total_chars += len(cleaned)
         _check_extracted_text_size(total_chars)
@@ -463,10 +468,12 @@ def extract_document(
 ) -> ExtractedDoc:
     """Extract a PDF/DOCX/PPTX into locator-tagged sections (blocking)."""
     source_type = (source_type or "").strip().lower()
+    pages_without_text: tuple[int, ...] = ()
     if source_type == "pdf":
         page_texts = _read_pdf_pages(path)
         sections = _pdf_sections_from_pages(page_texts)
         page_count = len(page_texts)
+        pages_without_text = tuple(i for i, text in enumerate(page_texts, 1) if not text)
         if looks_scanned(sections, page_count):
             raise ScannedPdfError(SCANNED_PDF_MESSAGE)
     elif source_type == "docx":
@@ -487,14 +494,12 @@ def extract_document(
             _check_extracted_text_size(total_chars)
     # The chunker bounds model inputs; oversized documents are refused rather
     # than silently losing the end of a long page or slide.
-    return ExtractedDoc(source_type, page_count, sections)
+    return ExtractedDoc(source_type, page_count, sections, pages_without_text)
 
 
 def _clean_block(text: str) -> str:
-    """Collapse whitespace while keeping paragraph breaks meaningful."""
-    lines = [" ".join(line.split()) for line in str(text or "").splitlines()]
-    kept = [line for line in lines if line]
-    return "\n".join(kept).strip()
+    """Normalize transport line endings; retain layout inside text blocks."""
+    return normalize_source_text(str(text or ""), initial=False).strip()
 
 
 def _split_paragraphs(text: str, limit: int) -> list[str]:
@@ -650,7 +655,9 @@ def chunks_to_json(chunks: Iterable[DocChunk]) -> str:
     )
 
 
-def chunks_from_json(payload: str | None, *, max_chars: int = MAX_MODEL_INPUT_CHARS) -> list[DocChunk]:
+def chunks_from_json(
+    payload: str | None, *, max_chars: int = MAX_MODEL_INPUT_CHARS, source_text: str | None = None,
+) -> list[DocChunk]:
     """Rebuild cached chunks from the ``documents.chunks_json`` column.
 
     A missing or unparsable cache is repaired by re-chunking the stored text, so
@@ -663,16 +670,27 @@ def chunks_from_json(payload: str | None, *, max_chars: int = MAX_MODEL_INPUT_CH
     except (TypeError, ValueError):
         raw = []
     chunks: list[DocChunk] = []
+    bodies: list[str] = []
     if isinstance(raw, list):
         for entry in raw:
-            if not isinstance(entry, dict):
-                continue
-            text = str(entry.get("text") or "").strip()
+            if not isinstance(entry, dict) or not isinstance(entry.get("text"), str):
+                return []
+            text = entry["text"].strip()
             if not text:
-                continue
+                return []
             sources = entry.get("sources")
             locator = str(entry.get("locator") or "سند")[:120]
             source_list = tuple(str(item)[:120] for item in sources) if isinstance(sources, list) else ()
+            if source_text is not None:
+                synthetic = set(source_list or (locator,))
+                lines = []
+                for line in text.splitlines(keepends=True):
+                    label = line.strip()
+                    if label.startswith("[") and label.endswith("]") and label[1:-1] in synthetic:
+                        synthetic.remove(label[1:-1])
+                    else:
+                        lines.append(line)
+                bodies.append("".join(lines))
             if len(text) > max_chars:
                 # Old caches may be oversized. Split them; never silently lose
                 # their tail or send an over-context request to a provider.
@@ -681,4 +699,11 @@ def chunks_from_json(payload: str | None, *, max_chars: int = MAX_MODEL_INPUT_CH
                     chunks.append(DocChunk(len(chunks), part.locator, part.sources, part.text))
             else:
                 chunks.append(DocChunk(len(chunks), locator, source_list or (locator,), text))
+    if source_text is not None:
+        # Legacy caches may reconstruct whitespace and insert tagged headers,
+        # but must never be preferred over a more complete stored source.
+        expected = re.sub(r"\s+", "", source_text)
+        actual = re.sub(r"\s+", "", "".join(bodies))
+        if actual != expected:
+            return []
     return chunks

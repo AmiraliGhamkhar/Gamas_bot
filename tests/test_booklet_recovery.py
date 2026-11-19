@@ -151,20 +151,19 @@ class FallbackAndCompileTests(unittest.IsolatedAsyncioTestCase):
     async def test_one_chunk_failure_preserves_successful_chunks(self):
         chunks = ("بخش موفق اول.", "بخش ناموفق میانی.", "بخش موفق آخر.")
 
-        async def fake_piece(_session, _settings, text, **_kwargs):
+        async def fake_piece(_session, _settings, source, unit, **_kwargs):
+            text = source.body(unit).strip().split("\n", 1)[1].strip()
             if "ناموفق" in text:
                 raise LLMError("synthetic provider failure")
             return StructuredNotes(
-                title="مدل",
+                title="مدل", input_ranges=(unit.source_range,),
                 sections=(NoteSection(heading=text[:10], paragraphs=(text,)),),
             )
 
         settings = make_settings(note_strict_grounding=False, note_compile=False)
-        with (
-            mock.patch.object(notes_mod, "split_transcript", return_value=list(chunks)),
-            mock.patch.object(notes_mod, "_structure_piece", new=fake_piece),
-        ):
-            notes = await structure_document("منبع غیرخالی", settings, object())
+        source = "\n\n".join(f"## عنوان {chr(97 + index)}\n{chunk}" for index, chunk in enumerate(chunks))
+        with mock.patch.object(notes_mod, "_structure_piece", new=fake_piece):
+            notes = await structure_document(source, settings, object())
         text = notes.to_json()
         self.assertEqual(notes.quality_state, QUALITY_RECOVERED)
         # Under direct scientific mode (note_strict_grounding=False), the
@@ -173,13 +172,14 @@ class FallbackAndCompileTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("بخش ناموفق میانی.", text)
         self.assertIn("بخش موفق آخر.", text)
 
-    async def test_chunk_gate_cleanup_is_recorded_as_repaired(self):
+    async def test_chunk_gate_cleanup_records_withheld_content(self):
         chunks = (
             "محتوای معتبر نخست فقط از منبع آمده است.",
             "محتوای معتبر دوم فقط از منبع آمده است.",
         )
 
-        async def fake_piece(_session, _settings, text, **_kwargs):
+        async def fake_piece(_session, _settings, source, unit, **_kwargs):
+            text = source.body(unit).strip().split("\n", 1)[1].strip()
             table = None
             if text == chunks[0]:
                 table = NoteTable(
@@ -187,17 +187,16 @@ class FallbackAndCompileTests(unittest.IsolatedAsyncioTestCase):
                     rows=[["محتوای معتبر", "999"], ["منبع", "999"]],
                 )
             return StructuredNotes(
-                title="مدل",
+                title="مدل", input_ranges=(unit.source_range,),
                 sections=(NoteSection(heading="بخش", paragraphs=(text,), table=table),),
             )
 
         settings = make_settings(note_strict_grounding=True, note_compile=False)
-        with (
-            mock.patch.object(notes_mod, "split_transcript", return_value=list(chunks)),
-            mock.patch.object(notes_mod, "_structure_piece", new=fake_piece),
-        ):
-            notes = await structure_document(" ".join(chunks), settings, object())
-        self.assertEqual(notes.quality_state, notes_mod.QUALITY_REPAIRED)
+        source = "\n\n".join(f"## عنوان {chr(97 + index)}\n{chunk}" for index, chunk in enumerate(chunks))
+        with mock.patch.object(notes_mod, "_structure_piece", new=fake_piece):
+            notes = await structure_document(source, settings, object())
+        self.assertEqual(notes.quality_state, notes_mod.QUALITY_DEGRADED)
+        self.assertFalse(notes.verification_report.passed)
         self.assertFalse(any(section.all_tables for section in notes.sections))
 
     async def test_provider_failure_uses_deterministic_chunk_fallback(self):
@@ -230,31 +229,16 @@ class FallbackAndCompileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(notes.quality_state, QUALITY_RECOVERED)
         self.assertIn("HbA1c", notes.to_json())
 
-    async def test_compile_loss_of_coverage_is_delivered_degraded(self):
-        baseline = notes_with(SOURCE)
-        compiled = notes_with("دوز آغازین بررسی شد.")
-        _, report = gate_notes(baseline, SOURCE)
-        settings = make_settings(note_strict_grounding=True)
-        accepted = notes_mod._gate_compiled(
-            compiled, baseline, report, SOURCE, settings, mode="full"
-        )
-        self.assertIsNotNone(accepted)
-        assert accepted is not None
-        self.assertEqual(accepted.quality_state, QUALITY_DEGRADED)
+    def test_compile_loss_of_coverage_is_rejected(self):
+        self.assertFalse(notes_mod.compile_accepts(notes_with("دوز آغازین بررسی شد."), notes_with(SOURCE)))
 
-    async def test_compile_fabrication_is_rejected(self):
-        baseline = notes_with("دوز آغازین 500 mg است.")
-        compiled = notes_with("دوز آغازین 999 mg است.")
-        _, report = gate_notes(baseline, SOURCE)
-        settings = make_settings(note_strict_grounding=True)
-        accepted = notes_mod._gate_compiled(
-            compiled, baseline, report, SOURCE, settings, mode="full"
-        )
-        self.assertIsNone(accepted)
+    def test_compile_fabrication_is_rejected(self):
+        self.assertFalse(notes_mod.compile_accepts(notes_with("دوز آغازین 999 mg است."),
+                                                  notes_with("دوز آغازین 500 mg است.")))
 
 
 class StrictFillAndFinalSafetyTests(unittest.IsolatedAsyncioTestCase):
-    async def test_strict_grounding_still_executes_completeness_fill(self):
+    async def test_zero_cap_disables_coverage_repair_even_when_opted_in(self):
         draft = {
             "title": "مرور درمان و دارو",
             "summary": "خلاصه",
@@ -269,7 +253,7 @@ class StrictFillAndFinalSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_complete_json(_session, _settings, **kwargs):
             calls.append(kwargs)
-            return fill if kwargs["system"] == notes_mod.COVERAGE_FILL_SYSTEM_PROMPT else draft
+            return fill if kwargs.get("task") == "BOOKLET_REPAIR" else draft
 
         settings = make_settings(
             note_strict_grounding=True,
@@ -280,8 +264,9 @@ class StrictFillAndFinalSafetyTests(unittest.IsolatedAsyncioTestCase):
         )
         with mock.patch.object(notes_mod, "complete_json", new=fake_complete_json):
             notes = await structure_document(SOURCE, settings, object())
-        self.assertTrue(any(call["system"] == notes_mod.COVERAGE_FILL_SYSTEM_PROMPT for call in calls))
-        self.assertIn("Metformin", notes.to_json())
+        self.assertFalse(any(call.get("task") == "BOOKLET_REPAIR" for call in calls))
+        self.assertFalse(notes.verification_report.passed)
+        self.assertIn("500 mg", notes.to_json())
 
     async def test_unrepairable_claim_is_removed_and_final_artifact_is_degraded(self):
         source = "گزارهٔ معتبر اول در منبع وجود دارد. گزارهٔ معتبر دوم نیز در منبع وجود دارد."

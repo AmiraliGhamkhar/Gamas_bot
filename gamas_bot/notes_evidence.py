@@ -1375,20 +1375,25 @@ def prose_claim_evidence(
     prepared = [(words, span) for words, span in prepared if words]
     if not prepared:
         return ()
+    postings: dict[str, list[int]] = {}
+    for index, (words, _span) in enumerate(prepared):
+        for word in words:
+            postings.setdefault(word, []).append(index)
     unsupported: list[ClaimEvidence] = []
     for claim, section_index, field_path in claims:
         words = content_words(claim)
         if len(words) < MIN_CLAIM_WORDS or _is_meta_sentence(claim):
             continue
+        counts: dict[int, int] = {}
+        for word in words:
+            for index in postings.get(word, ()):
+                counts[index] = counts.get(index, 0) + 1
         best_ratio = 0.0
         best_span = (0, 0)
-        for source_words, span in prepared:
-            ratio = len(words & source_words) / len(words)
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_span = span
-                if best_ratio >= minimum_ratio:
-                    break
+        if counts:
+            best_index, count = min(counts.items(), key=lambda item: (-item[1], item[0]))
+            best_ratio = count / len(words)
+            best_span = prepared[best_index][1]
         if best_ratio < minimum_ratio:
             unsupported.append(
                 ClaimEvidence(

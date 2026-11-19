@@ -506,19 +506,17 @@ class LLMCapacityAndFailoverTests(unittest.IsolatedAsyncioTestCase):
                 structure_transcript("متن جلسهٔ سوم با نکات علمی.", settings, session),
             ), timeout=2.0)
             self.assertLess(time.monotonic() - t0, 0.25)
-            # Gemini still services both overflowed calls, but the deliberately
-            # unsupported fixture response is replaced by the canonical
-            # source-preserving final fallback before it can be delivered.
-            self.assertEqual(n2.quality_state, "RECOVERED")
-            self.assertEqual(n3.quality_state, "RECOVERED")
-            self.assertIn("متن جلسهٔ دوم", n2.title)
-            self.assertIn("متن جلسهٔ سوم", n3.title)
+            # Route identity survives final verification: no whole-source
+            # fallback merely because a safe draft is too brief.
+            self.assertEqual(n2.title, "جزوهٔ مسیر پشتیبان")
+            self.assertEqual(n3.title, "جزوهٔ مسیر پشتیبان")
+            self.assertTrue(n2.sections and n3.sections)
             self.assertFalse(release_primary.is_set())
         finally:
             release_primary.set()
             n1 = await asyncio.wait_for(t_primary, timeout=2.0)
-        self.assertEqual(n1.quality_state, "RECOVERED")
-        self.assertIn("متن جلسهٔ اول", n1.title)
+        self.assertEqual(n1.title, "جزوهٔ مسیر اول")
+        self.assertTrue(n1.sections)
 
         llm_metrics = METRICS.snapshot()["providers"]["llm"]
         self.assertGreaterEqual(llm_metrics["avalai"]["overflow_skips"], 2)

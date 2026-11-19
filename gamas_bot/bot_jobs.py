@@ -48,6 +48,7 @@ from .learning import normalize_content_text
 from .logging_config import log_job_id
 from .media import MediaInfo, convert_to_pptx
 from .metrics import METRICS
+from .document_model import NormalizedDocument
 from .notes import (
     NoteQualityError,
     StructuredNotes,
@@ -68,7 +69,6 @@ from .progress import JobProgress, to_persian_digits
 from .stt import RawTranscript, STTError, largest_configured_upload
 from .telegram_text import render_pages
 from .telegram_transfer import UploadTooLargeError, _reported_upload_bytes
-from .textnorm import normalize_display
 from .titles import FALLBACK_BOOKLET, short_title
 from .transcript import build_document
 
@@ -477,8 +477,8 @@ class JobPipelineMixin:
         if await self.db.is_banned(user_id):
             await event.reply("⛔ حساب شما مسدود است.")
             return
-        cleaned = normalize_display(raw_text or "").strip()
-        if len(cleaned) < 20:
+        cleaned = raw_text or ""
+        if len(cleaned.strip()) < 20:
             await event.reply(
                 "متن ارسالی برای تولید جزوه بسیار کوتاه است؛ لطفاً متن کامل‌تر درس یا یادداشت را بفرستید."
             )
@@ -513,8 +513,8 @@ class JobPipelineMixin:
     ) -> None:
         """Convert raw user-supplied study text into PDF + Word + interactive HTML booklet."""
         assert progress is not None
-        raw_text = str(job.meta.get("raw_text") or "").strip()
-        if not raw_text:
+        raw_text = str(job.meta.get("raw_text") or "")
+        if not raw_text.strip():
             raise ValueError("متن ورودی خالی است.")
         await progress.update(15, "آماده‌سازی متن درس")
         raw = RawTranscript.from_text(raw_text, engine="direct_text")
@@ -525,10 +525,12 @@ class JobPipelineMixin:
             source_name="متن ارسالی",
             created_at=datetime.now(),
         )
+        normalized = NormalizedDocument.from_source_text(raw_text, source_type="txt", title=meta.source_name or "")
+        await self.db.save_transcription(job.submission_id, engine="direct_text", text=normalized.text, notes_json="")
         job.transition_to("generating_notes")
         await progress.update(40, "تولید جزوهٔ علمی ساختاریافته")
         notes = await self._generate_notes(
-            document.llm_document(),
+            normalized,
             job,
             progress,
             workdir=workdir,
@@ -538,7 +540,7 @@ class JobPipelineMixin:
         await self.db.save_transcription(
             job.submission_id,
             engine="direct_text",
-            text=document.plain(),
+            text=normalized.text,
             notes_json=notes.to_json() if notes else "",
             speaker_turns_json=None,
             diarization_attempted=False,
@@ -553,7 +555,7 @@ class JobPipelineMixin:
             reference,
             meta,
             progress,
-            plain_text=document.plain(),
+            plain_text=normalized.text,
         )
 
     async def _run_job(self, job: Job) -> None:
@@ -824,7 +826,7 @@ class JobPipelineMixin:
         job.transition_to("generating_notes")
         await progress.update(85, "تولید جزوهٔ ساختارمند")
         notes = await self._generate_notes(
-            document.llm_document(),
+            NormalizedDocument.from_transcript(document, source_type=job.kind, title=job.filename or ""),
             job,
             progress,
             workdir=workdir,
@@ -1159,7 +1161,7 @@ class JobPipelineMixin:
 
     async def _generate_notes(
         self,
-        document_text: str,
+        document_text: str | NormalizedDocument,
         job: Job,
         progress: Any,
         *,
@@ -1190,7 +1192,8 @@ class JobPipelineMixin:
                 on_stage=self._note_stage_callback(job, progress),
                 on_incomplete=self._note_incomplete_callback(job),
             )
-            notes = ensure_structured_booklet(notes, document_text)
+            source = document_text.text if isinstance(document_text, NormalizedDocument) else document_text
+            notes = ensure_structured_booklet(notes, source)
             quality_state = getattr(notes, "quality_state", "VERIFIED")
             if job_meta is not None:
                 job_meta["note_quality"] = quality_state
@@ -1323,7 +1326,7 @@ class JobPipelineMixin:
                 if getattr(self.settings, "note_strict_grounding", False):
                     notes, final_report = gate_notes(notes, source_text, strict=True, mode="full")
                     notes = enforce_final_acceptance(
-                        notes, final_report, mode="full", stage="render_boundary"
+                        notes, final_report, mode="full", stage="render_boundary", allow_incomplete=True
                     )
                 if not structurally_valid_booklet(notes):
                     raise StructuringError("booklet structure is invalid")
@@ -1378,10 +1381,13 @@ class JobPipelineMixin:
                     "\n\nنکته: بخشی از جزوه با بازیابی محافظه‌کارانه و فقط از متن منبع "
                     "ساخته شد؛ متن خام را نیز بررسی کنید.",
                 )
-            elif quality == "DEGRADED":
+            elif quality == "DEGRADED" and (not job.meta.get("note_incomplete") or any(
+                issue.code == "removed_unverified_content" for issue in
+                (notes.verification_report.issues if notes.verification_report else ())
+            )):
                 add_notice(
                     "notes_degraded",
-                    "\n\nنکته: ادعای بدون پشتوانه از جزوه حذف شد؛ برای جزئیات جاافتاده، "
+                    "\n\nنکته: بخشی از جزوه راستی‌آزمایی نشد؛ برای جزئیات جاافتاده، "
                     "متن خام را نیز بررسی کنید.",
                 )
             incomplete_reason = job.meta.get("note_incomplete")
@@ -1522,8 +1528,7 @@ class JobPipelineMixin:
             # points.  It is a virtual record (no automatic Telegram upload);
             # re-download routes use the persisted PDF rather than message ids.
             if pdf_ready or docx_ready:
-                learning_source = document.llm_document() if document is not None else ""
-                learning_text = normalize_content_text(learning_source)
+                learning_text = normalize_content_text(source_text)
                 try:
                     match = await self.db.library_submission_source_item(
                         job.user_id, job.submission_id

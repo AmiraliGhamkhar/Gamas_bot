@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-import math
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from gamas_bot.notes import (
@@ -24,7 +24,6 @@ from gamas_bot.notes import (
     CONTEXT_DIGEST_MAX_CHARS,
     MAX_CONTEXT_SPLITS,
     PRESENTATION_PROMPT,
-    PROMPT_RESERVE_TOKENS,
     StructuringError,
     effective_chunk_chars,
     effective_compile_max_chars,
@@ -100,19 +99,21 @@ def one_section(heading: str, paragraphs=(), bullets=()) -> NoteSection:
 
 def big_notes_json(title: str) -> str:
     """A valid note answer large enough to clear the compile threshold."""
+    # The fake route's label is not an educational measurement.
+    body_title = title.translate(str.maketrans("0123456789", "abcdefghij"))
     payload = {
         "title": title,
         "summary": f"خلاصهٔ نسبتاً طولانی برای بخش {title} از درس.",
         "sections": [
             {
-                "heading": f"بخش {number} از {title}",
+                "heading": f"بخش {number} از {body_title}",
                 "paragraphs": [
-                    f"پاراگراف {paragraph} از بخش {number} با توضیح کامل و محتوای آموزشی یکتای {title}."
-                    for paragraph in range(2)
+                    f"پاراگراف {paragraph} از بخش {number} با توضیح کامل و محتوای آموزشی یکتای {body_title}."
+                    for paragraph in ("اول", "دوم")
                 ],
-                "bullets": [f"نکتهٔ مهم بخش {number} از {title}"],
+                "bullets": [f"نکتهٔ مهم بخش {number} از {body_title}"],
             }
-            for number in range(3)
+            for number in ("اول", "دوم", "سوم")
         ],
         "key_points": ["نکتهٔ کلیدی"],
     }
@@ -297,7 +298,7 @@ class MergeTests(unittest.TestCase):
         self.assertGreater(len(merged.summary), 1200)
         self.assertTrue(merged.summary.endswith(last_summary))
 
-    def test_glossary_dedup_keeps_longest_definition(self):
+    def test_glossary_keeps_distinct_definitions_for_the_same_term(self):
         first = StructuredNotes(
             sections=[one_section("s", paragraphs=["x"])],
             glossary=[GlossaryEntry("HbA1c", "کوتاه")],
@@ -307,8 +308,8 @@ class MergeTests(unittest.TestCase):
             glossary=[GlossaryEntry("HbA1c", "تعریف بسیار طولانی‌تر و کامل‌تر")],
         )
         merged = merge_structured_notes([first, second])
-        self.assertEqual(len(merged.glossary), 1)
-        self.assertEqual(merged.glossary[0].definition, "تعریف بسیار طولانی‌تر و کامل‌تر")
+        self.assertEqual([entry.definition for entry in merged.glossary],
+                         ["کوتاه", "تعریف بسیار طولانی‌تر و کامل‌تر"])
 
     def test_compatible_tables_merge_rows(self):
         table_a = NoteTable(["h1", "h2"], [["a", "b"]])
@@ -384,10 +385,10 @@ class PromptTests(unittest.TestCase):
             build_system_prompt("full", context_block="موضوع همین بخش: «تست»"), static
         )
         self.assertEqual(build_presentation_system_prompt("full"), static)
-        self.assertEqual(build_compile_system_prompt("full"), edit_system_prompt())
+        self.assertNotEqual(build_compile_system_prompt("full"), edit_system_prompt())
         self.assertEqual(
             build_compile_system_prompt("full", presentation=True, source_locators=True),
-            edit_system_prompt(),
+            COMPILE_SYSTEM_PROMPT,
         )
         # Nothing per-job may leak into either prompt: a sentinel that exists
         # only in this test must not survive a single call.
@@ -475,20 +476,18 @@ class PromptTests(unittest.TestCase):
 
 
 class CompileAcceptanceTests(unittest.TestCase):
-    def test_safe_content_loss_is_left_for_post_compile_diagnostics(self):
+    def test_compile_rejects_safe_content_loss(self):
         merged = StructuredNotes(
             sections=[one_section(f"بخش {i}", paragraphs=[f"متن {i}"]) for i in range(10)]
         )
         gutted = StructuredNotes(sections=[one_section("همه", paragraphs=["یک خط"])])
-        self.assertTrue(compile_accepts(gutted, merged))
+        self.assertFalse(compile_accepts(gutted, merged))
 
     def test_accepts_restructured_result(self):
         merged = StructuredNotes(
             sections=[one_section(f"بخش {i}", paragraphs=[f"متن {i}"]) for i in range(10)]
         )
-        compiled = StructuredNotes(
-            sections=[one_section(f"بخش {i}", paragraphs=[f"متن {i}", f"توضیح {i}"]) for i in range(8)]
-        )
+        compiled = replace(merged, sections=tuple(reversed(merged.sections)))
         self.assertTrue(compile_accepts(compiled, merged))
 
     def test_rejects_empty(self):
@@ -502,7 +501,7 @@ class ContextBudgetTests(unittest.TestCase):
     def test_a_smaller_window_produces_smaller_chunks(self):
         system = build_system_prompt("full")
         wide = make_settings(note_context_tokens=200_000, note_max_output_tokens=4096)
-        narrow = make_settings(note_context_tokens=8192, note_max_output_tokens=2048)
+        narrow = make_settings(note_context_tokens=12_000, note_max_output_tokens=2048)
         wide_budget = effective_chunk_chars(wide, system_prompt=system)
         narrow_budget = effective_chunk_chars(narrow, system_prompt=system)
         self.assertEqual(wide_budget, wide.note_chunk_chars)  # window is not binding
@@ -532,10 +531,12 @@ class ContextBudgetTests(unittest.TestCase):
         settings = make_settings(note_context_tokens=16384, note_max_output_tokens=4096)
         system = build_system_prompt("full")
         budget = effective_chunk_chars(settings, system_prompt=system)
-        reserve_tokens = math.ceil(len(system) / 2.0) + PROMPT_RESERVE_TOKENS
-        available_tokens = settings.note_context_tokens - settings.note_max_output_tokens - reserve_tokens
-        self.assertGreater(available_tokens, 0)
-        self.assertEqual(budget, min(settings.note_chunk_chars, available_tokens * 2))
+        from gamas_bot.llm_quota import estimate_tokens
+
+        ratio = settings.llm_token_estimation_chars_per_token
+        used = sum(estimate_tokens(text, chars_per_token=ratio) for text in (system, "{}", "x" * budget))
+        self.assertLessEqual(used + settings.note_max_output_tokens + settings.note_capacity_safety_tokens,
+                             settings.note_context_tokens)
 
     def test_no_input_room_is_reported_instead_of_floored_over_budget(self):
         settings = make_settings(note_context_tokens=8192, note_max_output_tokens=8192)
@@ -599,12 +600,12 @@ class ContextOverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def document() -> str:
         return "\n\n".join(
-            f"موضوع {index}: " + "توضیح کامل و مثال برای درس. " * 30
+            f"نمونهٔ {index}: " + "توضیح کامل و مثال برای درس. " * 30
             for index in range(4)
         )
 
     async def test_overflow_splits_the_input_and_merges_the_answers(self):
-        settings = make_settings(note_chunk_chars=100_000)
+        settings = make_settings(note_chunk_chars=100_000, note_compile=False)
         document = self.document()
         session = FakeSession([
             context_overflow_response(),
@@ -634,7 +635,7 @@ class ContextOverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
         no context window, so the status is the only reliable signal — and the
         split recovery must still run, or the user loses the booklet.
         """
-        settings = make_settings(note_chunk_chars=100_000)
+        settings = make_settings(note_chunk_chars=100_000, note_compile=False)
         document = self.document()
         session = FakeSession([
             nara_oversized_response(),
@@ -685,6 +686,8 @@ class FakeSession:
     def post(self, url, **kwargs):
         self.calls.append({"url": url, **kwargs})
         scripted = self.contents.pop(0)
+        if callable(scripted):
+            scripted = scripted(kwargs["json"]["messages"][1]["content"])
         if isinstance(scripted, _FakeResponse):
             return _AsyncCM(scripted)
         return _AsyncCM(_FakeResponse(200, {
@@ -799,6 +802,11 @@ class ResponseSchemaTests(unittest.TestCase):
             self.assertIn(key, top)
 
 
+def editor_summary_reply(user: str) -> str:
+    first = json.loads(user)["sections"][0]
+    return json.dumps({"summaries": [{"id": first["id"], "quotes": first["paragraphs"][:1]}]}, ensure_ascii=False)
+
+
 class ProgressiveBookletTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_merge_is_handed_over_before_the_compile_runs(self):
         from gamas_bot.transcript import split_transcript
@@ -809,19 +817,9 @@ class ProgressiveBookletTests(unittest.IsolatedAsyncioTestCase):
             for index in range(4)
         )
         chunks = split_transcript(document, 400)
-        # The acceptance gate refuses a compile that keeps far fewer sections
-        # than the merge, so the answer carries at least as many.
-        compile_answer = {
-            "title": "جزوهٔ نهایی",
-            "summary": "خلاصهٔ نهایی",
-            "sections": [
-                {"heading": f"بخش یکپارچهٔ {number}", "paragraphs": ["متن یکپارچه."]}
-                for number in range(40)
-            ],
-        }
         session = FakeSession(
             [big_notes_json(f"جزوهٔ {i}") for i in range(len(chunks))]
-            + [json.dumps(compile_answer, ensure_ascii=False)]
+            + [editor_summary_reply]
         )
         seen: list[tuple[str, int]] = []
 
@@ -835,8 +833,8 @@ class ProgressiveBookletTests(unittest.IsolatedAsyncioTestCase):
         notes = await structure_transcript(
             document, settings, session, on_merged=on_merged
         )
-        # Under direct scientific mode, the compiled booklet is delivered cleanly.
-        self.assertEqual(notes.title, "جزوهٔ نهایی")
+        self.assertEqual(notes.title, seen[0][0])
+        self.assertEqual(notes.sections[0].key_points, notes.sections[0].paragraphs[:1])
         self.assertEqual(len(seen), 1)
         self.assertTrue(seen[0][0].startswith("جزوهٔ "))
         self.assertEqual(seen[0][1], len(chunks))
@@ -929,7 +927,8 @@ class ProgressiveBookletTests(unittest.IsolatedAsyncioTestCase):
             for index in range(4)
         )
         chunks = split_transcript(document, 400)
-        session = FakeSession([sample_notes_json(f"جزوهٔ {i}") for i in range(len(chunks))])
+        session = FakeSession([sample_notes_json(f"جزوهٔ {i}") for i in range(len(chunks))]
+                              + [sample_notes_json("جزوهٔ نهایی")])
 
         async def on_merged(_merged):
             raise RuntimeError("telegram is down")
@@ -961,25 +960,14 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         chunks = split_transcript(document, 400)
         self.assertGreater(len(chunks), 1)
-        compile_answer = {
-            "title": "جزوهٔ نهایی",
-            "summary": "خلاصهٔ نهایی",
-            "sections": [
-                {
-                    "heading": f"بخش یکپارچهٔ {number}",
-                    "paragraphs": [f"متن بازنویسی‌شدهٔ بخش {number} با همان محتوا."],
-                }
-                for number in range(max(2, len(chunks)))
-            ],
-        }
         session = FakeSession(
             [big_notes_json(f"جزوهٔ {i}") for i in range(len(chunks))]
-            + [json.dumps(compile_answer, ensure_ascii=False)]
+            + [editor_summary_reply]
         )
         notes = await structure_transcript(document, settings, session)
         # map calls + exactly one compile call.
         self.assertEqual(len(session.calls), len(chunks) + 1)
-        self.assertEqual(notes.title, "جزوهٔ نهایی")
+        self.assertEqual(notes.sections[0].key_points, notes.sections[0].paragraphs[:1])
         self.assertTrue(notes.sections)
 
     async def test_compile_runs_above_the_former_fixed_bound(self):
@@ -996,23 +984,15 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             for index in range(60)
         )
         chunks = split_transcript(document, 400)
-        compile_answer = {
-            "title": "جزوهٔ نهایی بزرگ",
-            "summary": "خلاصهٔ نهایی",
-            "sections": [
-                {"heading": f"بخش یکپارچهٔ {number}", "paragraphs": ["متن یکپارچه."]}
-                for number in range(max(2, len(chunks)))
-            ],
-        }
         session = FakeSession(
             [big_notes_json(f"جزوهٔ {i}") for i in range(len(chunks))]
-            + [json.dumps(compile_answer, ensure_ascii=False)]
+            + [editor_summary_reply]
         )
         notes = await structure_transcript(document, settings, session)
         # Map calls + exactly one compile call, despite the merged booklet
         # being far above the former fixed 48,000-char bound.
         self.assertEqual(len(session.calls), len(chunks) + 1)
-        self.assertEqual(notes.title, "جزوهٔ نهایی بزرگ")
+        self.assertEqual(notes.sections[0].key_points, notes.sections[0].paragraphs[:1])
         self.assertTrue(notes.sections)
 
     async def test_compile_failure_falls_back_to_merge(self):
@@ -1080,8 +1060,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertGreater(len(chunks), 1)
 
-        async def map_one(_session, _settings, chunk, **_kwargs):
-            if "موضوع 1:" in chunk:
+        async def map_one(_session, _settings, source, unit, **_kwargs):
+            if "موضوع 1:" in source.body(unit):
                 raise StructuringError("test map failure")
             return notes_from_dict(json.loads(sample_notes_json()))
 
@@ -1113,13 +1093,13 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         transcript = "در صدا هم دربارهٔ آموزش وزن‌ها توضیح داده شد."
         settings = make_settings(note_chunk_chars=100_000, note_compile=False)
-        session = FakeSession([sample_notes_json()])
+        session = FakeSession([sample_notes_json()] * 2)
 
         await structure_presentation(outline, transcript, settings, session)
 
-        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(len(session.calls), 2)
         request = session.calls[0]["json"]
-        user_content = request["messages"][1]["content"]
+        user_content = "\n".join(call["json"]["messages"][1]["content"] for call in session.calls)
         self.assertIn("## متن اسلایدها", user_content)
         self.assertIn("یادداشت گوینده: هر لایه ویژگی‌ها را", user_content)
         self.assertIn("## متن پیاده‌سازی‌شدهٔ صدای ارائه", user_content)
@@ -1268,7 +1248,7 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
         merged = merge_structured_notes([first, second])
         self.assertEqual(len(merged.sections), 2)
 
-    def test_compile_accepts_safe_content_loss_for_post_compile_diagnostics(self):
+    def test_compile_rejects_lost_definitions_and_prose(self):
         defs = (
             NoteDefinition("کیفیت", "توضیح اول"),
             NoteDefinition("پایایی", "توضیح دوم"),
@@ -1298,7 +1278,7 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
         )
-        self.assertTrue(compile_accepts(no_defs, merged))
+        self.assertFalse(compile_accepts(no_defs, merged))
 
         gutted_prose = StructuredNotes(
             sections=(
@@ -1306,11 +1286,11 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
                 NoteSection(heading="بخش ۲", paragraphs=("کوتاه دو.",)),
             )
         )
-        self.assertTrue(compile_accepts(gutted_prose, merged))
+        self.assertFalse(compile_accepts(gutted_prose, merged))
 
     async def test_narrow_window_drops_optional_digest_instead_of_overflowing(self):
         settings = make_settings(
-            note_context_tokens=8192,
+            note_context_tokens=12_000,
             note_max_output_tokens=2048,
             note_chunk_chars=100_000,
             note_compile=False,
@@ -1320,22 +1300,13 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
             + ("- توضیح آموزشی برای اسلاید. " * 55)
             for number in range(1, 6)
         )
-        document = build_presentation_document(outline, "")
-        base_system = build_presentation_system_prompt("full")
-        chunk_chars = effective_chunk_chars(settings, system_prompt=base_system)
-        expected_chunks = split_presentation_document(document, chunk_chars)
-        self.assertGreater(len(expected_chunks), 1)
-        session = FakeSession([
-            sample_notes_json(f"جزوهٔ بخش {index}")
-            for index in range(1, len(expected_chunks) + 1)
-        ])
-
-        await structure_presentation(outline, "", settings, session)
-
-        self.assertEqual(len(session.calls), len(expected_chunks))
+        session = FakeSession([sample_notes_json()] * 5)
+        notes = await structure_presentation(outline, "", settings, session)
+        self.assertEqual(len(session.calls), len(notes.input_ranges))
+        self.assertEqual(len(session.calls), 5)
         for call in session.calls:
             request = call["json"]
-            self.assertNotIn("موضوع‌های درس به ترتیب", request["messages"][0]["content"])
+            self.assertNotIn("موضوع‌های درس به ترتیب", request["messages"][1]["content"])
             self.assertTrue(request["messages"][1]["content"].startswith(PRESENTATION_PROMPT))
 
     async def test_output_budget_truncation_splits_chunk_and_recovers(self):
@@ -1351,10 +1322,12 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
             truncated,
             big_notes_json("نیمهٔ نخست"),
             big_notes_json("نیمهٔ دوم"),
+            big_notes_json("اسلاید دوم"),
         ])
         # CR-3: a legacy "summary" mode is accepted but always behaves as full.
         notes = await structure_presentation(outline, "", settings, session, mode="summary")
-        self.assertEqual(len(session.calls), 3)
+        self.assertEqual(len(session.calls), 4)
+        self.assertEqual(notes.semantic_recoveries[0].reason, "output_truncation")
         self.assertTrue(
             session.calls[0]["json"]["messages"][1]["content"].startswith(PRESENTATION_PROMPT)
         )
@@ -1596,6 +1569,7 @@ class StrictPipelineTests(unittest.IsolatedAsyncioTestCase):
             {
                 "heading": "دوز",
                 "paragraphs": [
+                    "دوز شروع دارو بررسی شد.",
                     "دوز شروع 500 mg همراه با وعدهٔ غذایی است.",
                     "بیمار نباید Metformin بگیرد.",
                 ],
@@ -1604,7 +1578,7 @@ class StrictPipelineTests(unittest.IsolatedAsyncioTestCase):
     }
 
     async def test_missing_facts_trigger_one_repair_and_are_restored(self):
-        settings = make_settings(note_strict_grounding=True)
+        settings = make_settings(note_strict_grounding=True, note_compile=False)
         session = FakeSession([
             json.dumps(self.LOSSY, ensure_ascii=False),
             json.dumps(self.REPAIRED, ensure_ascii=False),
@@ -1615,7 +1589,9 @@ class StrictPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("500 mg", text)
         self.assertIn("Metformin", text)
         repair_prompt = session.calls[1]["json"]["messages"][1]["content"]
-        self.assertIn("موارد جامانده", repair_prompt)
+        request = json.loads(repair_prompt)
+        self.assertEqual(request["section"]["heading"], "دوز")
+        self.assertIn("missing_number", {issue["code"] for issue in request["issues"]})
 
     async def test_warn_mode_never_calls_the_model_twice(self):
         settings = make_settings(note_strict_grounding=True, note_quality_gate="warn")
@@ -1821,9 +1797,9 @@ class SkeletonPromptTests(unittest.TestCase):
             "«کاربردی»، «آزمونی» یا «هشدار»",
         ):
             with self.subTest(edit_phrase=edit_phrase):
-                self.assertIn(edit_phrase, COMPILE_SYSTEM_PROMPT)
+                self.assertIn(edit_phrase, edit_system_prompt())
 
-    def test_compile_content_loss_is_measured_without_rejecting_safe_notes(self):
+    def test_compile_rejects_content_loss_even_when_shape_passes(self):
         """Body/structure counts expose omissions; the evidence gate marks them partial."""
         from gamas_bot.notes import (
             NoteCallout,
@@ -1895,7 +1871,7 @@ class SkeletonPromptTests(unittest.TestCase):
                 ),
             ),
         )
-        self.assertTrue(compile_accepts(gutted, two_sec_notes))
+        self.assertFalse(compile_accepts(gutted, two_sec_notes))
 
         # Completeness assessment counts table captions and practical tips as drafted text
         source = (
@@ -1921,7 +1897,8 @@ class CoverageFillTests(unittest.IsolatedAsyncioTestCase):
     }, ensure_ascii=False)
     FILL = json.dumps({
         "title": "ترمودینامیک",
-        "sections": [{"heading": "ترمودینامیک", "paragraphs": [
+        "sections": [{"heading": "مقدمه", "paragraphs": [
+            "سلام به کلاس",
             "جملهٔ مستقل شمارهٔ ۰ دربارهٔ ترمودینامیک و آنتروپی و تعادل گرمایی است."
         ]}],
     }, ensure_ascii=False)
@@ -1938,21 +1915,20 @@ class CoverageFillTests(unittest.IsolatedAsyncioTestCase):
                                  note_strict_grounding=False, note_completeness_fill=True)
         session = FakeSession([self.DRAFT, self.FILL])
         notes = await structure_transcript(self.SOURCE, settings, session)
-        # All detected coverage gaps are combined into exactly one fill call.
+        # The defective node receives one request even with several gaps.
         self.assertEqual(len(session.calls), 2)
         self.assertIn("ترمودینامیک", notes.to_markdown())
         fill_call = session.calls[1]["json"]["messages"]
-        system = fill_call[0]["content"]
-        user = fill_call[1]["content"]
-        self.assertIn("ممنوعیت‌های مطلق", system)     # forbidden-additions contract
-        self.assertIn("متن منبع", user)              # grounded, source-only input
+        request = json.loads(fill_call[1]["content"])
+        self.assertEqual(request["section"]["heading"], "مقدمه")
+        self.assertIn("ترمودینامیک", request["source_evidence"])
 
     async def test_fill_failure_is_non_fatal(self):
         settings = make_settings(note_chunk_chars=100_000, note_compile=False,
                                  note_strict_grounding=False, note_completeness_fill=True)
         # only the map answer is available; the fill request raises and must be
         # swallowed so the draft is still delivered (never a refunded job).
-        session = FakeSession([self.DRAFT])
+        session = FakeSession([self.DRAFT, "not JSON"])
         notes = await structure_transcript(self.SOURCE, settings, session)
         self.assertEqual(len(session.calls), 2)  # map + one failing fill
         self.assertEqual(notes.title, "ترمودینامیک")

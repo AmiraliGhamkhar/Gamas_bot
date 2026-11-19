@@ -199,6 +199,7 @@ class LearningWorkflowMixin:
             chunks_from_json,
             document.get("chunks_json"),
             max_chars=max_chars,
+            source_text=str(document["text"]),
         )
         if not chunks:
             chunks = await run_file_io(

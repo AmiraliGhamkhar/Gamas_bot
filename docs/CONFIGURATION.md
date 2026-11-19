@@ -81,6 +81,10 @@ failure. Their keys are never lent to an approved provider.
 | `NOTE_PDF_ENGINE` | typst |
 | `NOTE_MAX_REPAIR_ATTEMPTS` / `NOTE_ENABLE_DETERMINISTIC_FALLBACK` | 2 / true |
 | `NOTE_COMPILE` / `NOTE_PROGRESSIVE_BOOKLET` | false / false |
+| `NOTE_LLM_PLANNER` | false |
+| `NOTE_UNKNOWN_MODEL_CONTEXT_TOKENS` / `NOTE_UNKNOWN_MODEL_MAX_OUTPUT_TOKENS` | 32768 / 4096 |
+| `NOTE_CAPACITY_SAFETY_TOKENS` | 512 |
+| `NOTE_COMPILE_MAX_OUTPUT_TOKENS` / `NOTE_REPAIR_MAX_OUTPUT_TOKENS` | 0 / 0 (inherit the generation ceiling) |
 | `NOTE_HEDGE_AFTER_SECONDS` | 0 (legacy knob; dispatch never hedges even if nonzero) |
 
 Zero quota values mean no configured application cap, **not** unlimited
@@ -89,20 +93,52 @@ deployment. The effective concurrent limit is the smaller of the provider and
 primary/fallback-role caps. `LLM_TOKEN_ESTIMATION_CHARS_PER_TOKEN=1.5` controls
 conservative input estimation; the full requested output budget is reserved
 as well. Do not inflate operating budgets to match reference model windows.
-Compilation is optional and off by default; bounded map/merge, split/repair and
-structural validation are retained. By default (`NOTE_STRICT_GROUNDING=false`),
+The booklet map uses plan topics as its primary units. It subdivides only
+oversized units, preserving whole blocks and sentence boundaries where
+possible. `NOTE_CHUNK_CHARS` is still an operator transport ceiling, not a
+chunking target. Input allowances subtract the system prompt, request framing,
+wire schema, model/task output reserve, and safety margin. The native Gemini
+route checks its prompt with Google's `countTokens`; private proxies and other
+routes use the conservative configurable estimate. Unknown model IDs use the
+configurable ceilings above, not the provider default model's advertised size.
+`NOTE_COMPILE=true` opts into synthesis after deterministic merge and the
+configured validation/repair. It edits the approved draft, not the raw source.
+`NOTE_COMPILE_MAX_CHARS=0` derives the synthesis request ceiling from the routed
+context/output budgets; a positive ceiling can only lower it. Large drafts use
+whole-section topic groups, chapter outlines and a final complete ID manifest.
+The editor allows at most 24 calls per booklet (provider failover is separately
+bounded). An unfit section or outline stays intact and an attempted but
+incomplete synthesis is recorded as recovered. By default (`NOTE_STRICT_GROUNDING=false`),
 the bot operates in direct scientific booklet mode — preserving academic Persian
-rewriting, controlled clarifying completions, English scientific terms,
-comparative tables, professor emphasis and Q&A. Set `NOTE_STRICT_GROUNDING=true`
-to enable the full verbatim evidence, completeness and claim-rejection acceptance
-gate. `NOTE_PDF_ENGINE` chooses the primary graphical PDF renderer (`typst` by
-default, with automatic ReportLab fallback; set `reportlab` to force the legacy
-engine). `NOTE_MAX_REPAIR_ATTEMPTS` caps the ordered claim-faithfulness,
-coverage, and structural repair passes (they stop early). When
-`NOTE_ENABLE_DETERMINISTIC_FALLBACK=true`, an exhausted eligible provider chain
-yields a local source-preserving booklet rather than discarding successful
-chunks. `NOTE_COMPLETENESS_FILL` remains strictly source-grounded and may run
-while `NOTE_STRICT_GROUNDING=true`.
+rewriting, labeled non-factual clarification, English scientific terms, and
+source-supported tables, emphasis, and Q&A. Section writers do not send the raw
+text of other topics. The direct-mode writer rejects unsupported measurements
+and checks scoped measurements and source references before delivery. Strict
+mode (`NOTE_STRICT_GROUNDING=true`) also gates unsupported prose/terminology.
+With `NOTE_QUALITY_GATE=repair`, strict mode may make at most two small
+`BOOKLET_VERIFY` requests for unresolved claim-to-source comparisons. `warn`
+turns off both semantic verification calls and node repairs, not deterministic
+checks. Ambiguities left unresolved remain findings, not approvals.
+
+`NOTE_MAX_REPAIR_ATTEMPTS` caps repairs across the booklet (default 2, hard
+maximum 3); a defective node gets at most one request even when it has multiple
+issues. `NOTE_COMPLETENESS_FILL=true` opts direct mode into the same capped
+coverage repairs; it is not a separate quota or full-booklet fill pass. Rejected
+repairs leave verified material intact, and omitted facts are reported as a safe
+partial result. With `NOTE_ENABLE_DETERMINISTIC_FALLBACK=true`, unusable nodes can
+recover from their local source. `NOTE_PDF_ENGINE` chooses the primary graphical
+PDF renderer (`typst` by default, with automatic ReportLab fallback).
+
+
+Booklet topic planning is deterministic by default. `NOTE_LLM_PLANNER=true`
+allows local outline refinement only on contextual multi-chunk booklet runs
+with at least 250,000 source characters and no more than one fifth covered by
+heading/transition-backed topics. At most three weak windows qualify for a
+request, with 2–32 whole source blocks and at most 6,000 serialized input
+characters per window. The normal booklet provider chain and quota accounting
+apply. Titles must quote their assigned blocks verbatim; incomplete or invalid
+partitions leave the deterministic window intact. This is not an input size cap
+or permission to send an entire document for planning.
 
 ## Interactive HTML review sheet
 

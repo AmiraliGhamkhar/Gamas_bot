@@ -289,6 +289,7 @@ class ModelCapabilityProfile:
     structured_output_mode: str = "json_schema"
     supports_prompt_caching: bool = False
     supports_streaming: bool = True
+    capability_source: str = "config:registered model profile"
 
 
 #: Registered capability profiles for the three active production models only.
@@ -299,6 +300,7 @@ MODEL_PROFILES: dict[str, ModelCapabilityProfile] = {
         provider_slug="gemini",
         context_window=1_048_576,
         max_output_tokens=65_536,
+        capability_source="config:checked-in reference, docs/PROVIDERS.md (Gemini)",
         supports_system_prompt=True,
         send_sampling_params=False,
         gemini_response_format_style="response_format",
@@ -313,6 +315,7 @@ MODEL_PROFILES: dict[str, ModelCapabilityProfile] = {
         provider_slug="avalai",
         context_window=1_000_000,
         max_output_tokens=393_216,
+        capability_source="config:checked-in reference, docs/PROVIDERS.md (AvalAI)",
         supports_system_prompt=True,
         send_sampling_params=True,
         gemini_response_format_style="none",
@@ -327,6 +330,7 @@ MODEL_PROFILES: dict[str, ModelCapabilityProfile] = {
         provider_slug="openrouter",
         context_window=1_000_000,
         max_output_tokens=131_072,
+        capability_source="config:checked-in reference, docs/PROVIDERS.md (OpenRouter)",
         supports_system_prompt=True,
         send_sampling_params=True,
         gemini_response_format_style="none",
@@ -341,7 +345,11 @@ MODEL_PROFILES: dict[str, ModelCapabilityProfile] = {
 
 def register_model_profile(profile: ModelCapabilityProfile) -> None:
     """Register or override a model capability profile (OCP extension point)."""
-    MODEL_PROFILES[normalize_model_id(profile.model_id)] = profile
+    name = normalize_model_id(profile.model_id)
+    previous = MODEL_PROFILES.get(name)
+    if previous is not None and previous.provider_slug != profile.provider_slug:
+        name = f"{profile.provider_slug}:{name}"
+    MODEL_PROFILES[name] = profile
 
 
 def _default_model_profile_for_provider(
@@ -355,8 +363,8 @@ def _default_model_profile_for_provider(
         return ModelCapabilityProfile(
             model_id=model,
             provider_slug="gemini",
-            context_window=provider.context_window_tokens if provider else None,
-            max_output_tokens=provider.max_output_tokens_cap if provider else None,
+
+
             supports_system_prompt=provider.supports_system_prompt if provider else True,
             send_sampling_params=False,
             gemini_response_format_style="response_format",
@@ -371,8 +379,8 @@ def _default_model_profile_for_provider(
         return ModelCapabilityProfile(
             model_id=model,
             provider_slug="openrouter",
-            context_window=provider.context_window_tokens if provider else None,
-            max_output_tokens=provider.max_output_tokens_cap if provider else None,
+
+
             supports_system_prompt=provider.supports_system_prompt if provider else True,
             send_sampling_params=True,
             gemini_response_format_style="none",
@@ -385,8 +393,8 @@ def _default_model_profile_for_provider(
     return ModelCapabilityProfile(
         model_id=model,
         provider_slug=slug or "avalai",
-        context_window=provider.context_window_tokens if provider else None,
-        max_output_tokens=provider.max_output_tokens_cap if provider else None,
+
+
         supports_system_prompt=provider.supports_system_prompt if provider else True,
         send_sampling_params=provider.default_send_sampling_params if provider else True,
         gemini_response_format_style="none",
@@ -405,12 +413,11 @@ def get_model_profile(
 
     Exact matches in :data:`MODEL_PROFILES` take precedence. Unknown/future
     model IDs configured through environment overrides receive conservative
-    provider-derived defaults so operators can test new models without editing
-    source code.
+    provider-derived wire defaults, without borrowing another model’s capacity.
     """
     normalized = normalize_model_id(model)
-    registered = MODEL_PROFILES.get(normalized)
-    if registered is not None:
+    registered = MODEL_PROFILES.get(f"{provider_slug}:{normalized}") or MODEL_PROFILES.get(normalized)
+    if registered is not None and (not provider_slug or registered.provider_slug == provider_slug):
         return registered
     return _default_model_profile_for_provider(model, provider_slug)
 
@@ -457,9 +464,11 @@ class ProviderCapabilityProfile:
         _ = route
         return self.documented_stream_options
 
-    def clamp_output_tokens(self, route: NoteRoute, budget: int) -> int:
+    def clamp_output_tokens(self, route: NoteRoute, budget: int, settings: Settings | None = None) -> int:
         """Clamp requested output budget to the tighter of model & provider caps."""
         capped = max(1, int(budget))
+        if settings is not None:
+            return min(capped, model_capacity(route, settings).max_output_tokens)
         model_profile = self.model_profile_for(route)
         for cap in (self.max_output_tokens_cap, model_profile.max_output_tokens):
             if cap is not None:
@@ -586,3 +595,50 @@ def get_provider_profile(slug: str) -> ProviderCapabilityProfile:
     if slug not in APPROVED_LLM_PROVIDERS:
         raise ValueError(f"Unapproved LLM provider profile: {slug}")
     return PROVIDER_PROFILES[slug]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCapacity:
+    provider: str
+    model: str
+    context_window: int
+    max_output_tokens: int
+    safety_margin: int
+    capability_source: str
+
+    def available_input_tokens(
+        self, *, system_prompt_tokens: int, request_metadata_tokens: int, schema_tokens: int,
+        reserved_output_tokens: int,
+    ) -> int:
+        return (self.context_window - system_prompt_tokens - request_metadata_tokens - schema_tokens
+                - reserved_output_tokens - self.safety_margin)
+
+
+def model_capacity(route: NoteRoute, settings: Settings) -> ModelCapacity:
+    """Resolve the exact provider/model reference or the configured unknown-model policy."""
+    profile = get_provider_profile(route.slug)
+    model = profile.model_profile_for(route)
+    context = model.context_window or settings.note_unknown_model_context_tokens
+    output = model.max_output_tokens or settings.note_unknown_model_max_output_tokens
+    source = model.capability_source if model.context_window and model.max_output_tokens else (
+        "config:NOTE_UNKNOWN_MODEL_CONTEXT_TOKENS/NOTE_UNKNOWN_MODEL_MAX_OUTPUT_TOKENS"
+    )
+    return ModelCapacity(route.slug, route.model, context,
+                         output, settings.note_capacity_safety_tokens, source)
+
+
+def task_output_tokens(settings: Settings, task: str, requested: int | None = None) -> int:
+    """A task may tighten the application output ceiling independently of the model."""
+    ceiling = settings.note_max_output_tokens
+    task_ceiling = {
+        "BOOKLET_COMPILE": settings.note_compile_max_output_tokens,
+        "BOOKLET_REPAIR": settings.note_repair_max_output_tokens,
+        "BOOKLET_VERIFY": min(settings.note_repair_max_output_tokens or 512, 512),
+    }.get(task, 0)
+    if task_ceiling:
+        ceiling = min(ceiling, task_ceiling)
+    # Explicit budgets are used by other existing workflows and can exceed
+    # their regular default. The task ceiling, when set, still takes precedence.
+    if requested is not None:
+        return min(requested, task_ceiling) if task_ceiling else requested
+    return ceiling
