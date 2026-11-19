@@ -101,8 +101,10 @@ before changing a deployment. Offline tests do not verify live compatibility.
 AvalAI defaults: **35 RPM, 750000 TPM, 3 in flight**. OpenRouter defaults:
 **10 RPM, 15 RPD, 1 in flight**. Gemini defaults to **1 in flight** with
 RPM/TPM/RPD unset (zero); configure those from the actual AI Studio project,
-not an assumed free-tier guarantee. Local primary/fallback caps (3/1) also
-apply, so a fallback may have fewer effective slots than its provider cap.
+not an assumed free-tier guarantee. The local pool and the shared ledger
+both use the tighter of the provider limit and the primary/fallback limit
+(defaults 3/1), so an in-process job can wait for a real provider slot instead
+of being admitted locally and immediately denied by the ledger.
 
 The shared SQLite/WAL ledger uses `BEGIN IMMEDIATE` to reserve request/token
 budgets and in-flight capacity atomically across processes sharing the same
@@ -112,12 +114,22 @@ reconciled; absent usage on success retains the full token estimate. Failure
 releases unused tokens and in-flight capacity; request allowances remain
 counted conservatively. Conservative reservations can underutilize budget.
 Bounded transport/compatibility retries still consume provider requests.
+This ledger is separate from user credits: media keeps its existing single
+settlement by transcription duration, regardless of note retries or fallback.
 
 The SQLite circuit breaker opens after three consecutive transient/auth
 failures and permits one recovery probe after cooldown. Invalid requests and
 context/output-budget errors do not count as provider-health failures. Metrics
 aggregate task/provider/model counts, outcomes, estimates, usage and latency
-without storing prompts or user identifiers. Bounded booklet chunk/split/repair
+without storing prompts or user identifiers. Internal `llm request` records
+cover each completion attempt and native token-count request: stage, provider,
+model, retry count (within that provider), duration, error category, and actual
+input/output counts when provided. Otherwise the client estimates from the
+submitted request or received completion text; an unavailable output is logged
+as unknown, not as usage equal to the reserved maximum. `BOOKLET_PLAN` identifies
+optional LLM planning separately from `BOOKLET_GENERATION`, `BOOKLET_COMPILE`,
+`BOOKLET_VERIFY`, and `BOOKLET_REPAIR`. Booklet renderers make no provider calls;
+quiz and flashcard routes remain independent. Bounded booklet chunk/split/repair
 and grounding/completeness checks are unchanged.
 
 ### Prompt handling

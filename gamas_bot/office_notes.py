@@ -417,15 +417,16 @@ def _full_result_is_grounded(
         return False
     if not notes.has_content or not notes.sections:
         return False
-    notes, report = gate_notes(notes, source, strict=True, mode="full")
-    try:
-        enforce_final_acceptance(notes, report, mode="full", stage="office_final",
-                                 allow_incomplete=notes.verification_report is not None)
-    except NoteQualityError:
-        return False
-    if notes.verification_report is None and not _audit_meets_office_floor(report.audit, compact=False):
-        logger.warning("Office full booklet rejected by evidence gate %s", report.audit.summary())
-        return False
+    if notes.verification_report is None:
+        # Compatibility for callers returning a legacy report-less booklet.
+        notes, report = gate_notes(notes, source, strict=True, mode="full")
+        try:
+            enforce_final_acceptance(notes, report, mode="full", stage="office_final")
+        except NoteQualityError:
+            return False
+        if not _audit_meets_office_floor(report.audit, compact=False):
+            logger.warning("Office full booklet rejected by evidence gate %s", report.audit.summary())
+            return False
     allowed_set = set(allowed_locators)
     for section in notes.sections:
         missing_verified_locators = (notes.verification_report is not None
@@ -433,11 +434,14 @@ def _full_result_is_grounded(
         if not missing_verified_locators and not _valid_section_locators(section.source_locators, allowed_set):
             logger.warning("Office full booklet rejected invalid section source locators")
             return False
-        if section.source_locators:
+        if section.source_locators and notes.verification_report is None:
+            # Modern reports already check the exact block/range and its
+            # locator. The legacy coarse audit must use the public payload;
+            # stringifying a Section would scan its internal provenance IDs.
             locator_source = "\n\n".join(
                 locator_sources.get(locator, "") for locator in section.source_locators
             )
-            if locator_source and audit_notes(locator_source, section).fabricated:
+            if locator_source and audit_notes(locator_source, StructuredNotes(sections=(section,))).fabricated:
                 logger.warning("Office full booklet section failed its locator-local audit")
                 return False
     return True
@@ -533,9 +537,10 @@ async def generate_full_booklet(
         return fallback, True
     if not _full_result_is_grounded(generated, source, allowed, locator_sources):
         return fallback, True
+    if generated.verification_report is not None:
+        return generated, False  # render the same structured artifact that was verified
     gated, report = gate_notes(generated, source, strict=True, mode="full")
-    if (not gated.has_content or (gated.verification_report is None
-                                  and not _audit_meets_office_floor(report.audit, compact=False))):
+    if not gated.has_content or not _audit_meets_office_floor(report.audit, compact=False):
         logger.warning("Office full booklet using source fallback after final audit")
         return fallback, True
     return gated, False

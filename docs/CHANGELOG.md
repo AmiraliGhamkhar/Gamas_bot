@@ -4,6 +4,13 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Booklet orchestration and delivery.** Optional synthesis follows a local
+preflight and precedes final verification and repair. Model request attempts
+record stage, duration, retries and exact/estimated usage without changing
+user-credit settlement. PDF, Word and interactive review HTML render offline
+from the retained booklet. A failed PDF or Word render is not marked complete;
+raw and successful artifacts stay available for retrieval.
+
 **Bounded booklet verification.** Reports identify remaining issues by topic,
 section and source reference. Deterministic checks come first; strict repair mode
 uses small semantic checks only for ambiguous claims. Each defective node gets

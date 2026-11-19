@@ -254,3 +254,21 @@ def test_direct_mode_withholds_unsupported_measurement_in_summary_only():
     assert result.sections == notes.sections
     assert "999" not in result.to_json()
     assert not result.verification_report.passed
+
+
+def test_exact_markdown_table_needs_no_semantic_request_but_swapped_rows_do():
+    table_source = "| نمونه | جرم |\n| --- | --- |\n| خاک خشک | 125 g |\n| خاک مرطوب | 180 g |"
+    doc, plan, draft = artifact(table_source)
+    section = replace(draft.sections[0], paragraphs=(), table=n.NoteTable(
+        ["نمونه", "جرم"], [["خاک خشک", "125 g"], ["خاک مرطوب", "180 g"]],
+    ))
+    exact = replace(draft, sections=(section,))
+    with patch.object(n, "complete_json", side_effect=AssertionError("verbatim table must not be sent to a model")):
+        verified = asyncio.run(verify_and_repair(exact, doc, plan, n.SectionWriter(
+            make_settings(note_compile=False, note_strict_grounding=True), object(),
+        )))
+    assert verified.verification_report.passed
+    swapped_table = n.NoteTable(["نمونه", "جرم"], [["خاک خشک", "180 g"], ["خاک مرطوب", "125 g"]])
+    swapped = verify_booklet(replace(draft, sections=(replace(section, table=swapped_table),)), doc, plan)
+    assert not swapped.passed
+    assert any(issue.code in {"semantic_unverified", "number_mismatch"} for issue in swapped.issues)

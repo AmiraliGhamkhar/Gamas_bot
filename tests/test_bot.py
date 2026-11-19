@@ -607,6 +607,40 @@ class FileDeliveryTests(BotPipelineTestCase):
         self.assertEqual(artifacts["booklets_ready"], 0)
         self.assertEqual(artifacts["booklet_failures"], 1)
 
+    async def test_both_failed_renders_keep_raw_without_completing_the_job(self):
+        event = self.media_event()
+        self.bot.settings = replace(self.settings, avalai_api_key="note-key", note_compile=False)
+        raw = self._raw()
+        session = _LlmOnlySession(json.dumps({"title": "جزوهٔ آزمایش", "sections": [
+            {"heading": "درس", "paragraphs": [raw.text]},
+        ]}, ensure_ascii=False))
+        self.bot._http_session = lambda: session  # type: ignore[method-assign]
+        states = []
+        original = Job.transition_to
+
+        def record(job, state):
+            states.append(state)
+            return original(job, state)
+
+        with (mock.patch.object(Job, "transition_to", record),
+              mock.patch("gamas_bot.bot_jobs.build_notes_pdf", side_effect=RuntimeError("synthetic PDF failure")),
+              mock.patch("gamas_bot.bot_jobs.build_notes_docx", return_value=b"invalid")):
+            submission = await self.run_media_job(event, transcribe=raw)
+        self.assertEqual(states[-1], "failed")
+        self.assertNotIn("completed", states)
+        self.assertEqual((await self.db.submission(submission)).status, "partial")
+        self.assertEqual(len(session.llm_calls), 1)
+        self.assertIsNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
+        self.assertIsNone(await self.db.binary_artifact(submission, USER_ID, "docx"))
+        self.assertTrue((await self.db.transcription(submission))["notes_json"])
+        self.assertFalse(any("پردازش تمام شد" in text for text in event.replies + event.edits))
+        self.assertTrue(any("خروجی‌های در دسترس" in text for text in event.replies))
+        self.assertIn("سلام دوستان", await self.fetch_transcript(submission))
+        rows = await self.db.read_db.execute_fetchall(
+            "SELECT seconds FROM ledger WHERE user_id=? AND kind='debit'", (USER_ID,)
+        )
+        self.assertEqual([row[0] for row in rows], [100])
+
     async def test_caption_on_message_reply_fails_like_the_real_client(self):
         """The old call is rejected by the double, exactly like Telethon.
 
@@ -732,9 +766,19 @@ class NoteGenerationDeliveryTests(BotPipelineTestCase):
         # an unknown v2-era NOTE_BASE_URL host would be ignored as unapproved.
         return {"avalai_api_key": "note-key"}
 
-    async def test_notes_reach_persisted_pdf_and_docx_and_usage_is_settled_once(self):
+    async def test_audio_retry_and_provider_fallback_deliver_and_settle_once(self):
         event = self.media_event()
-        session = _SttAndLlmSession(
+        self.bot.settings = replace(self.settings, note_providers=("avalai", "openrouter"),
+                                    openrouter_api_key="offline-backup", note_compile=False)
+
+        class RetryAndFallbackSession(_SttAndLlmSession):
+            def post(self, url, **kwargs):
+                if url.endswith("/chat/completions") and "api.avalai.ir" in url:
+                    self.llm_calls.append({"url": url, **kwargs})
+                    return _FakeAsyncContext(_FakeAsyncResponse(503, {"error": {"message": "unavailable"}}))
+                return super().post(url, **kwargs)
+
+        session = RetryAndFallbackSession(
             {"choices": [{"message": {"content": sample_notes_json("جزوهٔ آزمون")}}]}
         )
         self.bot._http_session = lambda: session  # type: ignore[method-assign]
@@ -758,7 +802,7 @@ class NoteGenerationDeliveryTests(BotPipelineTestCase):
             "gamas_bot.bot.probe_media", new=self._fake_probe(100.0),
         ), mock.patch(
             "gamas_bot.bot.extract_audio_track", new=self._fake_extract(audio),
-        ):
+        ), mock.patch("gamas_bot.llm.MAX_TRANSIENT_RETRIES", 1), mock.patch("gamas_bot.llm._retry_delay_seconds", return_value=0):
             await self.bot._run_job(job)
 
         # Completion pushes no file. Both final bytes are persisted from the
@@ -778,7 +822,10 @@ class NoteGenerationDeliveryTests(BotPipelineTestCase):
         )
         keypoints = await self.bot.db.transcription(submission)
         self.assertIn("جزوهٔ آزمون", str((keypoints or {}).get("notes_json")))
-        self.assertTrue(any("/chat/completions" in call["url"] for call in session.llm_calls))
+        self.assertEqual(len(session.llm_calls), 3)
+        self.assertTrue(all("api.avalai.ir" in call["url"] for call in session.llm_calls[:2]))
+        self.assertIn("openrouter.ai", session.llm_calls[2]["url"])
+        self.assertEqual(job.state, "completed")
 
         row = await self.db.submission(submission)
         assert row is not None
@@ -2730,35 +2777,32 @@ class ReplyKeyboardRoutingTests(BotPipelineTestCase):
 class ReviewSheetDeliveryTests(BotPipelineTestCase):
     """The interactive HTML sheet: persisted at completion, fetched without regeneration."""
 
-    async def _completed_job_with_planner(self, *, planner_error: BaseException | None = None):
-        from tests.test_review_sheet import sample_notes, sample_payload
+    async def _completed_job_with_review(self, *, render_error: BaseException | None = None):
+        from tests.test_review_sheet import sample_notes
 
         self.bot.settings = replace(self.settings, avalai_api_key="note-key")
-        # The planner is patched, so a sentinel session stands in for aiohttp.
         self.bot._http_session = lambda: mock.sentinel.http_session  # type: ignore[method-assign]
-        planner = (
-            mock.AsyncMock(side_effect=planner_error)
-            if planner_error is not None
-            else mock.AsyncMock(return_value=sample_payload())
-        )
         event = self.media_event()
         notes = sample_notes()
-        # The render-boundary gate receives a real source containing every
-        # fixture claim; this tests review delivery without bypassing the same
-        # grounding contract used in production.
         raw = RawTranscript(words=(), text=notes.to_markdown(), engine="speechmatics")
-        with mock.patch(
-            "gamas_bot.bot.structure_transcript",
-            new=mock.AsyncMock(return_value=notes),
-        ), mock.patch("gamas_bot.review_sheet.complete_json", new=planner):
+        from gamas_bot.review_sheet_html import render_review_sheet_html
+
+        with (
+            mock.patch("gamas_bot.bot.structure_transcript", new=mock.AsyncMock(return_value=notes)),
+            mock.patch("gamas_bot.review_sheet.complete_json",
+                       new=mock.AsyncMock(side_effect=AssertionError("rendering asked a provider"))) as planner,
+            mock.patch("gamas_bot.review_sheet_html.render_review_sheet_html",
+                       side_effect=render_error or render_review_sheet_html),
+        ):
             submission = await self.run_media_job(event, transcribe=raw)
+        planner.assert_not_awaited()
         return event, submission, planner
 
     async def test_a_completed_job_persists_pdf_docx_and_the_review_sheet(self):
         from gamas_bot.artifact_validation import inspect_review_html
 
-        event, submission, planner = await self._completed_job_with_planner()
-        planner.assert_awaited_once()
+        event, submission, planner = await self._completed_job_with_review()
+        planner.assert_not_awaited()
         pdf = await self.db.binary_artifact(submission, USER_ID, "booklet")
         docx = await self.db.binary_artifact(submission, USER_ID, "docx")
         review = await self.db.binary_artifact(submission, USER_ID, "review_html")
@@ -2772,9 +2816,9 @@ class ReviewSheetDeliveryTests(BotPipelineTestCase):
         self.assertTrue(results)
         self.assertIn(texts.DELIVERY_ROW_REVIEW_HTML, results[-1])
 
-    async def test_a_failing_planner_keeps_pdf_and_docx_and_says_so(self):
-        event, submission, _planner = await self._completed_job_with_planner(
-            planner_error=RuntimeError("provider unavailable")
+    async def test_a_failing_review_renderer_keeps_pdf_and_docx_and_says_so(self):
+        event, submission, _planner = await self._completed_job_with_review(
+            render_error=RuntimeError("review renderer unavailable")
         )
         self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
         self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "docx"))
@@ -2783,7 +2827,7 @@ class ReviewSheetDeliveryTests(BotPipelineTestCase):
         self.assertIn(texts.NOTICE_REVIEW_HTML.strip(), results[-1])
 
     async def test_the_stored_sheet_is_sent_as_a_text_html_document_without_regeneration(self):
-        _event, submission, planner = await self._completed_job_with_planner()
+        _event, submission, planner = await self._completed_job_with_review()
         planner_calls = planner.await_count
         client = self.bot.client
         before = len(client.deliveries)
@@ -2802,7 +2846,7 @@ class ReviewSheetDeliveryTests(BotPipelineTestCase):
         self.assertEqual(bytes(stored["content"]).count(b"<script>"), 1)
 
     async def test_another_user_cannot_fetch_the_sheet(self):
-        _event, submission, _planner = await self._completed_job_with_planner()
+        _event, submission, _planner = await self._completed_job_with_review()
         other = 999
         await self.db.ensure_user(other)
         client = self.bot.client

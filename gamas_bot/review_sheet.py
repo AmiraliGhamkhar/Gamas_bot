@@ -7,8 +7,7 @@ organises the *validated* booklet for a timed revision session:
 * :func:`build_review_units` numbers every content item of the booklet with a
   stable reference (``s2.b3`` = section 2, bullet 3). The model receives these
   references, never raw HTML, and selects/organises them.
-* The planning model (one call per booklet, through the existing provider
-  routing) returns JSON that refers to those units and
+* The standalone planning model API returns JSON that refers to those units and
   adds the generated study material: section roles, exam traps, self-test
   questions and comparison pairs.
 * :func:`parse_review_plan` is the deterministic gate. Unknown references are
@@ -17,6 +16,7 @@ organises the *validated* booklet for a timed revision session:
   appear there too), minutes are allocated in exact integers, and anything
   that cannot be supported is omitted and counted instead of invented.
 
+Production booklet delivery uses an extractive plan, without a provider.
 Displayed text for selected units is copied verbatim from the booklet by the
 renderer. Only generated labels, traps, questions and pairs are model prose,
 and those are the only items that go through the grounding gate.
@@ -691,6 +691,59 @@ class ReviewSheetFile:
 Announce = Callable[[str], Awaitable[None]]
 
 
+def build_extractive_review_plan(notes: StructuredNotes, duration_minutes: int) -> ReviewSheetPlan | None:
+    """Prepare a timed review with exact booklet excerpts, not generated claims."""
+    if (notes.quality_state not in REVIEW_PLANNABLE_QUALITY
+            or (notes.verification_report is not None and not notes.verification_report.passed)):
+        return None
+    units = build_review_units(notes)
+    duration = _validated_duration(duration_minutes)
+    count = min(len(units), duration - SELF_TEST_MINUTES, MAX_EDUCATIONAL_SECTIONS,
+                max(MIN_EDUCATIONAL_SECTIONS, len(notes.sections)))
+    if count < MIN_EDUCATIONAL_SECTIONS:
+        return None
+    # Keep source order, giving each part of a long booklet a bounded slot.
+    groups = [units[i * len(units) // count:(i + 1) * len(units) // count][:MAX_UNITS_PER_SECTION]
+              for i in range(count)]
+    minutes = allocate_minutes([len(group) for group in groups], duration - SELF_TEST_MINUTES)
+    sections: list[ReviewSection] = []
+    questions: list[ReviewQuestion] = []
+    for index, (group, minute) in enumerate(zip(groups, minutes, strict=True)):
+        section_index = group[0].section_index
+        heading = ""
+        if group[-1].section_index == section_index:
+            heading = _bounded(notes.sections[section_index - 1].heading, _SECTION_TEXT_LIMITS["heading"])
+        heading = heading or f"بخش {index + 1}"
+        color = PALETTE[index % len(PALETTE)]
+        sections.append(ReviewSection(section_index, heading, f"بخش {index + 1}", "مرور مفهوم‌ها", minute,
+                                      DEFAULT_ICON, color, f"bg-{color}", group, (group[0].ref,), ()))
+        # A short cloze question uses the same exact excerpt as its answer.
+        for unit in group:
+            words = unit.text.split(maxsplit=4)
+            if (unit.kind != "table" and len(words) == 5 and len(unit.text) <= _ITEM_TEXT_LIMITS["answer"]
+                    and len(questions) < MAX_SELF_TEST_QUESTIONS):
+                stem = " ".join(words[:4])
+                if len(stem) <= 220:
+                    questions.append(ReviewQuestion(f"این عبارت را کامل کنید: «{stem} …»", unit.text, (unit.ref,)))
+                    break
+    if len(questions) < MIN_SELF_TEST_QUESTIONS:
+        return None
+    return ReviewSheetPlan(notes.display_title, duration, tuple(sections), tuple(questions), (),
+                           omitted_units=len(units) - sum(map(len, groups)), quality_state=notes.quality_state)
+
+
+async def render_booklet_review(
+    notes: StructuredNotes, *, reference: str, announce: Announce | None = None,
+    duration_minutes: int = DEFAULT_REVIEW_MINUTES,
+) -> ReviewSheetFile | None:
+    """Production renderer: no provider, settings or HTTP session required."""
+    plan = await asyncio.to_thread(build_extractive_review_plan, notes, duration_minutes)
+    if plan is None:
+        logger.info("review sheet skipped: no suitable extractive plan quality=%s", notes.quality_state)
+        return None
+    return await _render_review_plan(plan, notes.display_title, reference=reference, announce=announce)
+
+
 async def generate_review_sheet(
     notes: StructuredNotes,
     settings: Settings,
@@ -716,9 +769,6 @@ async def generate_review_sheet(
     if notes.quality_state not in REVIEW_PLANNABLE_QUALITY:
         logger.info("review sheet skipped: booklet quality is %s", notes.quality_state)
         return None
-    from .artifact_validation import inspect_review_html
-    from .review_sheet_html import render_review_sheet_html, review_sheet_filename
-
     if announce is not None:
         await announce(texts.REVIEW_STAGE_PLANNING)
     plan = await plan_review_sheet(
@@ -727,6 +777,15 @@ async def generate_review_sheet(
     if plan is None:
         logger.info("review sheet skipped: booklet does not support a grounded plan")
         return None
+    return await _render_review_plan(plan, notes.display_title, reference=reference, announce=announce)
+
+
+async def _render_review_plan(
+    plan: ReviewSheetPlan, title: str, *, reference: str, announce: Announce | None,
+) -> ReviewSheetFile:
+    from .artifact_validation import inspect_review_html
+    from .review_sheet_html import render_review_sheet_html, review_sheet_filename
+
     if announce is not None:
         await announce(texts.REVIEW_STAGE_RENDERING)
     content = (await asyncio.to_thread(render_review_sheet_html, plan)).encode("utf-8")
@@ -738,7 +797,7 @@ async def generate_review_sheet(
     for warning in report.warnings:
         logger.info("review sheet warning: %s", warning)
     return ReviewSheetFile(
-        filename=review_sheet_filename(notes.display_title, reference),
+        filename=review_sheet_filename(title, reference),
         content=content,
         section_count=report.section_count,
         warnings=report.warnings,

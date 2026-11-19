@@ -165,3 +165,32 @@ def test_inflight_budget_is_atomic_across_independent_processes(tmp_path):
     # The one-slot project is usable immediately after the winner releases it.
     next_call = reserve(path, "avalai", ProviderBudget(max_in_flight=1), 10)
     finish(next_call, actual_tokens=None, succeeded=False)
+
+
+def test_waiting_for_tighter_provider_slot_does_not_fail_over_or_reject(tmp_path):
+    async def scenario():
+        settings = make_settings(db_path=tmp_path / "provider-slots.sqlite", llm_primary_max_in_flight=3,
+                                 avalai_max_in_flight=1, llm_slot_wait_timeout=2)
+        route = SimpleNamespace(slug="avalai", label="AvalAI", model="test-model")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def handler(_route, _last):
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await release.wait()
+            return "ok"
+
+        first = asyncio.create_task(_dispatch_across_routes((route,), object(), settings, handler))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        second = asyncio.create_task(_dispatch_across_routes((route,), object(), settings, handler))
+        try:
+            await asyncio.wait({second}, timeout=0.08)
+        finally:
+            release.set()
+        outcomes = await asyncio.gather(first, second, return_exceptions=True)
+        assert outcomes == ["ok", "ok"] and calls == 2
+
+    asyncio.run(scenario())

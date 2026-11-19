@@ -46,7 +46,9 @@ Useful lines:
 
 - `GMS-#####` — job reference to quote in support.
 - `LLM request sending … requested_output_tokens=<n>` — the budget actually sent.
-- `note provider usage … output_tokens=<n>` — what the provider billed.
+- `llm request stage=… kind=…` — one completion attempt or native token-count
+  call, with retry index, duration, error and exact or estimated counts. These
+  logs report usage, not invoiced cost or a user-credit debit.
 - `note provider failed; trying the next one provider=… error=… detail=…` —
   failover with the HTTP status and a sanitized provider message.
 - `every configured note provider failed task=… categories=… detail=…` — the
@@ -56,8 +58,8 @@ Useful lines:
   stays available.
 - `note delivered incomplete reason=missing_numbers|missing_terms …` — the
   booklet was accepted and delivered, but the job is reported `partial`.
-- `note repair left unresolved after N attempt(s) …` — bounded repair reached
-  its limit without removing every unsupported signal.
+- `booklet verification issues=… withheld=… semantic_calls=…` — final retained
+  artifact and verification result; remaining issues can be delivered as partial.
 - `STT provider … failing over provider=… category=… detail=…` — transcription
   failover with its category (`authorization`, `quota`, `request`,
   `transient`, `response`).
@@ -114,9 +116,10 @@ connect two copies of one Telegram session.
 
 ## Interactive HTML review sheets
 
-Each completed AI booklet can store one `review_html` artifact next to its PDF and
-DOCX. The HTML is validated before it is stored: a hard error (for example an
-external resource, a model-written script or a Latin/Persian digit mismatch in a
+Each verified booklet with enough review material can store one `review_html`
+artifact next to its PDF and DOCX. The renderer makes no provider calls. HTML is
+validated before storage: a hard error (for example an unexpected script, an
+external resource or a Latin/Persian digit mismatch in a
 timing attribute) blocks storage and the notice `🌐 جزوه مرور تعاملی HTML آماده
 نشد` is shown while the PDF and DOCX stay delivered. Warnings are logged only.
 Look for `review HTML generation failed` or `review sheet skipped` in the logs
