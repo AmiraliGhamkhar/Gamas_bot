@@ -709,6 +709,13 @@ class Settings:
     note_ttfb_timeout: float = DEFAULT_NOTE_TTFB_TIMEOUT_SECONDS
     note_hedge_after: float = DEFAULT_NOTE_HEDGE_AFTER_SECONDS
     office_ai_concurrency: int = 3
+    # Deployment ceilings, not claims about undocumented model capabilities.
+    note_unknown_model_context_tokens: int = 32_768
+    note_unknown_model_max_output_tokens: int = 4_096
+    note_capacity_safety_tokens: int = 512
+    note_compile_max_output_tokens: int = 0
+    note_repair_max_output_tokens: int = 0
+    note_llm_planner: bool = False
     #: CR-4: after the map-reduce draft, re-scan the source and fill detected
     #: coverage gaps with bounded, strictly grounded LLM requests. Enabled in
     #: production by default; tests use the dataclass default (``False``) so
@@ -1378,6 +1385,12 @@ def from_env(env_file: str | None = None) -> Settings:
             "NOTE_CONCURRENCY", DEFAULT_NOTE_CONCURRENCY, minimum=1, maximum=8
         ),
         note_compile=_env_bool("NOTE_COMPILE", False),
+        note_unknown_model_context_tokens=_env_int("NOTE_UNKNOWN_MODEL_CONTEXT_TOKENS", 32_768, minimum=2048),
+        note_unknown_model_max_output_tokens=_env_int("NOTE_UNKNOWN_MODEL_MAX_OUTPUT_TOKENS", 4_096, minimum=256),
+        note_capacity_safety_tokens=_env_int("NOTE_CAPACITY_SAFETY_TOKENS", 512, minimum=0),
+        note_compile_max_output_tokens=_env_int("NOTE_COMPILE_MAX_OUTPUT_TOKENS", 0, minimum=0),
+        note_repair_max_output_tokens=_env_int("NOTE_REPAIR_MAX_OUTPUT_TOKENS", 0, minimum=0),
+        note_llm_planner=_env_bool("NOTE_LLM_PLANNER", False),
         note_compile_max_chars=_env_int(
             "NOTE_COMPILE_MAX_CHARS", 0, minimum=0, maximum=2_000_000
         ),

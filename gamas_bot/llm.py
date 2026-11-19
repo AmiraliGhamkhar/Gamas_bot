@@ -51,8 +51,11 @@ from .http_util import (
 )
 from .logging_config import collect_configured_secrets
 from .llm_profiles import (
+    ModelCapacity,
     fold_system_into_user,
     get_provider_profile,
+    model_capacity,
+    task_output_tokens,
     to_gemini_response_format_schema,
 )
 from .metrics import METRICS
@@ -887,7 +890,7 @@ class OpenAIDialect:
             model_profile.supports_streaming
             and float(getattr(settings, "note_ttfb_timeout", 0.0) or 0.0) > 0
         )
-        max_tokens = profile.clamp_output_tokens(route, settings.note_max_output_tokens)
+        max_tokens = profile.clamp_output_tokens(route, settings.note_max_output_tokens, settings)
         headers: dict[str, str] = {"Authorization": f"Bearer {key}"} if key else {}
         for header_name, header_value in profile.extra_headers:
             headers.setdefault(header_name, header_value)
@@ -1068,7 +1071,7 @@ class GeminiDialect:
         for header_name, header_value in profile.extra_headers:
             headers.setdefault(header_name, header_value)
         max_output_tokens = profile.clamp_output_tokens(
-            route, settings.note_max_output_tokens
+            route, settings.note_max_output_tokens, settings
         )
         generation_config: dict[str, Any] = {
             "maxOutputTokens": max_output_tokens,
@@ -1244,6 +1247,95 @@ def _build_request_for(
     return get_dialect(route.style).build_post_request(
         route, settings, safe_system, safe_user, schema=schema
     )
+
+
+def _capacity_parts(payload: dict) -> tuple[dict, dict]:
+    """Separate schema from non-content request overhead in the actual dialect."""
+    metadata = {key: value for key, value in payload.items()
+                if key not in {"messages", "contents", "systemInstruction", "response_format", "generationConfig"}}
+    response_format = payload.get("response_format", {})
+    if isinstance(response_format, dict) and response_format.get("type") != "json_schema":
+        metadata["response_format"] = response_format
+        response_format = {}
+    if generation := payload.get("generationConfig"):
+        metadata["generationConfig"] = {key: value for key, value in generation.items() if key != "responseFormat"}
+        response_format = generation.get("responseFormat", {})
+    if "messages" in payload:
+        metadata["messages"] = [{"role": item["role"], "content": ""} for item in payload["messages"]]
+    elif "contents" in payload:
+        metadata["contents"] = [{"role": "user", "parts": [{"text": ""}]}]
+        if "systemInstruction" in payload:
+            metadata["systemInstruction"] = {"parts": [{"text": ""}]}
+    return metadata, response_format
+
+
+def _estimated_budget(
+    settings: Settings, capacity: ModelCapacity, system: str, user_metadata: str,
+    payload: dict, *, output_tokens: int,
+) -> int:
+    metadata, schema = _capacity_parts(payload)
+    capacity = replace(capacity, context_window=min(capacity.context_window, settings.note_context_tokens))
+    ratio = settings.llm_token_estimation_chars_per_token
+    return capacity.available_input_tokens(
+        system_prompt_tokens=estimate_tokens(system, chars_per_token=ratio) if system else 0,
+        request_metadata_tokens=estimate_tokens(user_metadata + json.dumps(metadata, ensure_ascii=False), chars_per_token=ratio),
+        schema_tokens=estimate_tokens(json.dumps(schema, ensure_ascii=False), chars_per_token=ratio) if schema else 0,
+        reserved_output_tokens=output_tokens,
+    )
+
+
+def booklet_input_budget(
+    settings: Settings, *, system: str, user_metadata: str, schema: dict | None, task: str,
+) -> int:
+    """Estimated source-token allowance shared by viable configured failovers."""
+    output = task_output_tokens(settings, task)
+    candidates: list[int] = []
+    for route in note_routes(settings):
+        capacity = model_capacity(route, settings)
+        _, _, wire = _build_request_for(route, replace(settings, note_max_output_tokens=output), system, "", schema=schema)
+        candidates.append(_estimated_budget(
+            settings, capacity, system, user_metadata, wire,
+            output_tokens=request_payload_output_tokens(wire) or output,
+        ))
+    if not candidates:
+        # No transport is attempted without credentials. Size the source-only
+        # path with configured operating limits, not a made-up provider model.
+        local = ModelCapacity("", "", settings.note_context_tokens, output,
+                              settings.note_capacity_safety_tokens, "config:booklet operating limits")
+        return _estimated_budget(settings, local, system, user_metadata, {"response_format": {
+            "type": "json_schema", "schema": schema,
+        }} if schema else {}, output_tokens=output)
+    return min((budget for budget in candidates if budget > 0), default=0)
+
+
+async def _native_prompt_tokens(
+    route: NoteRoute, session: aiohttp.ClientSession, headers: dict[str, str], wire: dict,
+) -> int | None:
+    """Google's documented countTokens accepts the corresponding GenerateContentRequest.
+
+    Do not probe gateways/private proxies for undocumented counting endpoints.
+    A failed count is advisory; the existing generation transport is unchanged.
+    """
+    host = urlsplit(route.base_url)
+    if (route.style != "gemini" or route.slug != "gemini" or host.scheme != "https"
+            or host.netloc != "generativelanguage.googleapis.com"):
+        return None
+    model = "models/" + _gemini_model_id(route.model)
+    try:
+        async with session.post(
+            _endpoint(route.base_url, model + ":countTokens"), headers=headers,
+            json={"generateContentRequest": {"model": model, **wire}},
+            timeout=aiohttp.ClientTimeout(total=3), allow_redirects=False,
+        ) as response:
+            if response.status == 200:
+                response_body = await _read_json_body(response)
+                count = response_body.get("totalTokens") if isinstance(response_body, dict) else None
+                if type(count) is int and count > 0:
+                    return count
+            logger.info("native token count unavailable provider=%s status=%d", route.slug, response.status)
+    except (aiohttp.ClientError, TimeoutError, ValueError, TypeError) as exc:
+        logger.info("native token count unavailable provider=%s error=%s", route.slug, type(exc).__name__)
+    return None
 
 
 def _build_request(
@@ -2120,6 +2212,7 @@ async def _complete_on_route(
     user: str,
     retry_on_timeout: bool = True,
     schema: dict | None = None,
+    adaptive_capacity: bool = False,
 ) -> str:
     """One completion from one provider, with its own bounded retry budget.
 
@@ -2132,6 +2225,19 @@ async def _complete_on_route(
     answer in seconds.
     """
     url, headers, payload = _build_request_for(route, settings, system, user, schema=schema)
+    if adaptive_capacity:
+        capacity = model_capacity(route, settings)
+        output = request_payload_output_tokens(payload) or settings.note_max_output_tokens
+        counted = await _native_prompt_tokens(route, session, headers, payload)
+        if counted is None:
+            remaining = _estimated_budget(settings, capacity, system, "", payload, output_tokens=output)
+            oversized = estimate_tokens(user, chars_per_token=settings.llm_token_estimation_chars_per_token) > remaining
+        else:
+            # Native count includes the submitted system/user instructions.
+            # Still reserve the serialized framing/schema conservatively.
+            oversized = counted > _estimated_budget(settings, capacity, "", "", payload, output_tokens=output)
+        if oversized:
+            raise LLMContextOverflowError("درخواست از بودجهٔ ورودی مدل بیشتر است.")
     profile = get_provider_profile(route.slug)
     model_profile = profile.model_profile_for(route)
     allow_streaming = model_profile.supports_streaming
@@ -2464,6 +2570,7 @@ async def _dispatch_across_routes(
     task: str = "",
     estimated_input_tokens: int = 0,
     reserved_output_tokens: int = 0,
+    preserve_budget_failure: bool = False,
 ) -> _T:
     """Execute *call_route* across *routes* with non-blocking capacity reservation."""
     pool = pool_for("llm", pool_owner if pool_owner is not None else settings)
@@ -2674,7 +2781,10 @@ async def _dispatch_across_routes(
             " | ".join(descriptions),
             " | ".join(_failure_detail(failure) for failure in failures),
         )
-    raise type(failures[0])("؛ ".join(descriptions))
+    failure = failures[0]
+    if preserve_budget_failure:
+        failure = next((issue for issue in failures if isinstance(issue, (LLMContextOverflowError, LLMOutputBudgetError))), failure)
+    raise type(failure)("؛ ".join(descriptions))
 
 
 async def complete(
@@ -2805,9 +2915,9 @@ def extract_json_object(text: str) -> str:
     raise LLMResponseError("پاسخ مدل شامل هیچ شیء JSON نبود.")
 
 
-def _parse_json_object(text: str) -> dict:
+def _parse_json_object(text: str, *, strict: bool = False) -> dict:
     """Parse strict JSON and enforce the object shape used by note prompts."""
-    if _orjson is not None and isinstance(text, str):
+    if not strict and _orjson is not None and isinstance(text, str):
         stripped = text.strip()
         if stripped.startswith("{") and stripped.endswith("}"):
             try:
@@ -2820,12 +2930,21 @@ def _parse_json_object(text: str) -> dict:
     def reject_constant(value: str) -> None:
         raise ValueError(f"non-standard JSON constant: {value}")
 
+    def unique_keys(pairs: list[tuple[str, Any]]) -> dict:
+        payload: dict = {}
+        for key, value in pairs:
+            if key in payload:
+                raise ValueError("duplicate JSON object key")
+            payload[key] = value
+        return payload
+
     try:
         payload = json.loads(
-            extract_json_object(text),
+            text if strict else extract_json_object(text),
             parse_constant=reject_constant,
+            object_pairs_hook=unique_keys if strict else None,
         )
-    except (LLMResponseError, ValueError, TypeError) as exc:
+    except (LLMResponseError, ValueError, TypeError, RecursionError) as exc:
         raise LLMResponseError("پاسخ مدل شامل JSON معتبر نبود.") from exc
     if not isinstance(payload, dict):
         raise LLMResponseError("پاسخ مدل باید یک شیء JSON باشد.")
@@ -2841,6 +2960,8 @@ async def _complete_json_on_route(
     user: str,
     retry_on_timeout: bool,
     schema: dict | None = None,
+    strict_json: bool = False,
+    adaptive_capacity: bool = False,
 ) -> dict:
     """One provider's two-attempt JSON turn (used by the hedged path)."""
     last_exc: LLMError | None = None
@@ -2850,9 +2971,9 @@ async def _complete_json_on_route(
         try:
             raw = await _complete_on_route(
                 route, session, settings, system=system, user=prompt,
-                retry_on_timeout=retry_on_timeout, schema=schema,
+                retry_on_timeout=retry_on_timeout, schema=schema, adaptive_capacity=adaptive_capacity,
             )
-            return _parse_json_object(raw)
+            return _parse_json_object(raw, strict=strict_json)
         except LLMRequestError:
             raise
         except LLMError as exc:
@@ -2866,6 +2987,7 @@ async def _complete_json_on_route(
 TASK_PROVIDER_ORDER = {
     "BOOKLET_GENERATION": ("avalai", "gemini", "openrouter"),
     "BOOKLET_REPAIR": ("avalai", "gemini", "openrouter"),
+    "BOOKLET_VERIFY": ("avalai", "gemini", "openrouter"),
     "BOOKLET_COMPILE": ("avalai", "gemini", "openrouter"),
     "BOOKLET_REVIEW_PLAN": ("avalai", "gemini", "openrouter"),
     "KEY_POINTS": ("gemini", "avalai", "openrouter"),
@@ -2918,6 +3040,8 @@ async def complete_json(
     wait_for_capacity: bool = True,
     task: str = "",
     sampling_temperature: float | None = None,
+    strict_json: bool = False,
+    adaptive_capacity: bool = False,
 ) -> dict:
     """A completion parsed as strict JSON, with bounded per-provider recovery.
 
@@ -2926,12 +3050,15 @@ async def complete_json(
     retries and request-parameter compatibility adjustments remain bounded.
     Task policy overrides preferences, and OpenRouter is always the last route.
     Callers decide how to degrade after the eligible chain is exhausted.
+    ``strict_json`` requires the entire response to be a JSON object with
+    unique keys, rather than extracting an object from surrounding text.
     """
     pool_owner = settings
-    if max_output_tokens is not None:
-        if max_output_tokens <= 0:
-            raise ValueError("max_output_tokens must be positive")
-        settings = replace(settings, note_max_output_tokens=int(max_output_tokens))
+    if max_output_tokens is not None and max_output_tokens <= 0:
+        raise ValueError("max_output_tokens must be positive")
+    requested_output = task_output_tokens(settings, task, max_output_tokens)
+    if requested_output != settings.note_max_output_tokens:
+        settings = replace(settings, note_max_output_tokens=requested_output)
     configured_routes = note_routes(settings)
     routes = _ordered_routes(configured_routes, prefer_provider, task=task)
     if not routes:
@@ -2948,7 +3075,7 @@ async def complete_json(
             system=system,
             user=user,
             retry_on_timeout=is_last,
-            schema=schema,
+            schema=schema, strict_json=strict_json, adaptive_capacity=adaptive_capacity,
         )
 
     estimated_input = estimate_tokens(
@@ -2956,7 +3083,7 @@ async def complete_json(
         chars_per_token=getattr(settings, "llm_token_estimation_chars_per_token", 2.0),
     )
     output_reserve = min(
-        int(settings.note_max_output_tokens),
+        max(get_provider_profile(route.slug).clamp_output_tokens(route, requested_output, settings) for route in routes),
         max(1, int(getattr(settings, "note_context_tokens", settings.note_max_output_tokens))),
     )
     token = None
@@ -2970,6 +3097,7 @@ async def complete_json(
             task=task or "UNSPECIFIED",
             estimated_input_tokens=estimated_input,
             reserved_output_tokens=output_reserve,
+            preserve_budget_failure=adaptive_capacity,
         )
     finally:
         if token is not None:

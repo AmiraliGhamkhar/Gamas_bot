@@ -669,14 +669,11 @@ def _diagram_lines(archive: zipfile.ZipFile, part_name: str) -> list[str]:
         if text is None:
             continue
         lines.extend(_lines_of(text))
-        if len(lines) >= 200:
-            lines.append("…")
-            break
     return lines
 
 
 def _chart_lines(archive: zipfile.ZipFile, part_name: str) -> list[str]:
-    """Read a chart's title, labels, series names and bounded cached values."""
+    """Read all supported cached chart labels and values within the ZIP part bound."""
     payload = _read_member(archive, part_name, 8_000_000)
     if not payload:
         return []
@@ -709,10 +706,7 @@ def _chart_lines(archive: zipfile.ZipFile, part_name: str) -> list[str]:
                 category_order.append(text)
         category_order = list(dict.fromkeys(category_order))
         if category_order:
-            shown = category_order[:60]
-            if len(category_order) > 60:
-                shown.append("…")
-            lines.append("دسته‌های نمودار: " + "، ".join(shown))
+            lines.append("دسته‌های نمودار: " + "، ".join(category_order))
 
         series_names: list[str] = []
         for entry in chart.iter(f"{{{CHART_NS}}}ser"):
@@ -744,14 +738,11 @@ def _chart_lines(archive: zipfile.ZipFile, part_name: str) -> list[str]:
                     index = position
                 points.append((index, text))
             if points:
-                shown_points = points[:60]
                 value_labels = [
                     f"{category_by_index[index]}={value}"
                     if index in category_by_index else value
-                    for index, value in shown_points
+                    for index, value in points
                 ]
-                if len(points) > 60:
-                    value_labels.append("…")
                 label = f"مقادیر سری «{name}»: " if name else "مقادیر نمودار: "
                 lines.append(label + "، ".join(value_labels))
         if series_names:

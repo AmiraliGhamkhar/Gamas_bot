@@ -590,60 +590,36 @@ class PipelinePerfOptimizationsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(":streamGenerateContent", posted_urls[0])
         self.assertIn("alt=sse", posted_urls[0])
 
-    async def test_compile_in_groups_runs_concurrently_and_preserves_order(self):
+    async def test_synthesis_groups_run_concurrently_and_preserve_order(self):
         from gamas_bot import notes as notes_mod
-        from gamas_bot.notes import LectureContext, NoteSection, StructuredNotes
+        from gamas_bot.document_model import NormalizedDocument, plan_from_document
+        from gamas_bot.notes import NoteSection, StructuredNotes
 
-        sections = tuple(
-            NoteSection(
-                heading=f"بخش {i}",
-                paragraphs=(f"متن آموزشی بخش {i} دربارهٔ شبکه و پروتکل.",),
-            )
-            for i in range(1, 5)
-        )
-        merged = StructuredNotes(title="جزوه", sections=sections)
+        sections = tuple(NoteSection(heading=f"بخش {i}", paragraphs=("شرح درس. " * 67 + str(i),))
+                         for i in range(1, 5))
+        merged = StructuredNotes(title="جزوهٔ آزمایشی", sections=sections)
+        document = NormalizedDocument.from_text("متن منبع برای مبانی شبکه")
         active = 0
         max_active = 0
 
-        async def fake_compile_once(
-            _session, _settings, _context, group, *, mode, presentation, budget,
-            source_locators=None,
-        ):
+        async def editor(_session, _settings, *, user, **kwargs):
             nonlocal active, max_active
-            active += 1
-            max_active = max(max_active, active)
-            first_heading = group.sections[0].heading
-            idx = int(first_heading.split()[-1])
-            await asyncio.sleep(0.03 * (5 - idx))
-            active -= 1
-            return group
+            prompt = json.loads(user)
+            if prompt["level"] == "topic_group":
+                self.assertEqual(len(prompt["sections"]), 1)
+                idx = int(prompt["sections"][0]["heading"].split()[-1])
+                active += 1
+                max_active = max(max_active, active)
+                await asyncio.sleep(0.01 * (5 - idx))
+                active -= 1
+            return {}
 
-        settings = make_settings(note_concurrency=4, note_strict_grounding=False)
-        with (
-            mock.patch.object(
-                notes_mod,
-                "compile_groups",
-                return_value=[
-                    StructuredNotes(title="جزوه", sections=(s,)) for s in sections
-                ],
-            ),
-            mock.patch.object(notes_mod, "_compile_once", fake_compile_once),
-        ):
-            assembled = await notes_mod._compile_in_groups(
-                merged,
-                LectureContext(),
-                "متن منبع",
-                settings,
-                object(),  # type: ignore[arg-type]
-                mode="full",
-                presentation=False,
-                budget=500,
-            )
-        self.assertGreater(max_active, 1)
-        self.assertEqual(
-            [s.heading for s in assembled.sections],
-            ["بخش 1", "بخش 2", "بخش 3", "بخش 4"],
-        )
+        settings = make_settings(note_concurrency=2, note_compile=True, note_compile_max_chars=950)
+        router = notes_mod.SectionWriter(settings, object())
+        with mock.patch.object(notes_mod, "complete_json", editor):
+            assembled = await notes_mod.synthesize_booklet(merged, plan_from_document(document), document, router)
+        self.assertEqual(max_active, 2)
+        self.assertEqual(assembled.sections, merged.sections)
 
     def test_source_evidence_index_cache_hits_and_matches_audit(self):
         from gamas_bot.notes import NoteSection, NoteTable, PracticalTip, StructuredNotes, gate_notes

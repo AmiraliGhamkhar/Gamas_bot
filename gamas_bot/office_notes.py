@@ -19,6 +19,7 @@ from .config import Settings
 from .doc_extract import DocChunk, DocSection, chunk_sections
 from .learning import MAX_MODEL_INPUT_CHARS
 from .llm import LLMError, complete_json
+from .document_model import NormalizedDocument, SourceBlock
 from .notes import (
     MAX_SOURCE_LOCATORS_PER_SECTION,
     NoteQualityError,
@@ -62,8 +63,7 @@ async def _notify(callback: Any, *args: Any) -> None:
 MAX_COMPACT_INPUT_CHARS = 20_000
 MAX_COMPACT_POINTS_PER_CHUNK = 32
 MAX_COMPACT_POINT_CHARS = 6_000
-#: Refuse note generation above this complete-source ceiling. The original
-#: file remains downloadable; no note path may silently discard its tail.
+#: Non-note Office exports still use a separate total source safety limit.
 MAX_OFFICE_NOTE_SOURCE_CHARS = 250_000
 #: A compact result that retains more than this share of source characters is
 #: not a useful revision sheet; it is rejected rather than mislabelled.
@@ -170,20 +170,27 @@ def _locator_labels(text: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(" ".join(match.group(1).split()) for match in _LOCATOR_LINE.finditer(text)))
 
 
-def _strip_chunk_locators(chunk: OfficeSourceChunk) -> str:
-    """Remove only labels explicitly attached by the document extractor.
+def _attached_locator_matches(chunk: OfficeSourceChunk) -> list[re.Match[str]]:
+    """Recognize the first attached marker per label, not literal repeats in the body."""
+    expected = set(chunk.locators)
+    matches = []
+    for match in _LOCATOR_LINE.finditer(chunk.text):
+        label = match.group(1).strip()
+        if label in expected:
+            expected.remove(label)
+            matches.append(match)
+    return matches
 
-    Pasted text may itself contain a line such as ``[صفحهٔ ۲]``. It is source
-    text, not metadata, unless the extractor supplied that exact label.
-    """
-    if not chunk.locators:
-        return chunk.text.strip()
-    allowed = set(chunk.locators)
-    cleaned = _LOCATOR_LINE.sub(
-        lambda match: "" if match.group(1).strip() in allowed else match.group(0),
-        chunk.text,
-    )
-    return cleaned.strip()
+
+def _strip_chunk_locators(chunk: OfficeSourceChunk) -> str:
+    """Remove only attached markers; identical later lines remain source text."""
+    parts = []
+    cursor = 0
+    for match in _attached_locator_matches(chunk):
+        parts.append(chunk.text[cursor:match.start()])
+        cursor = match.end()
+    parts.append(chunk.text[cursor:])
+    return "".join(parts).strip()
 
 
 def source_text(chunks: Iterable[OfficeSourceChunk], *, include_locators: bool = True) -> str:
@@ -259,6 +266,9 @@ def _rechunk_source_chunks(
     """Split at the original source labels so note calls stay bounded."""
     bounded: list[OfficeSourceChunk] = []
     for chunk in chunks:
+        if len(chunk.text) <= max_chars and len(chunk.locators) <= MAX_SOURCE_LOCATORS_PER_SECTION:
+            bounded.append(chunk)
+            continue
         if not chunk.locators:
             # A locator-shaped line in user-pasted text is ordinary content.
             bounded.extend(
@@ -266,12 +276,7 @@ def _rechunk_source_chunks(
                 for part in _split_plain_text(chunk.text, max_chars=max_chars)
             )
             continue
-        expected = set(chunk.locators)
-        matches = [
-            match
-            for match in _LOCATOR_LINE.finditer(chunk.text)
-            if match.group(1).strip() in expected
-        ]
+        matches = _attached_locator_matches(chunk)
         if not matches:
             # Preserve trusted locator metadata if an older extraction cache
             # stored the sources separately from the text marker.
@@ -361,12 +366,7 @@ def _locator_source_map(chunks: Iterable[OfficeSourceChunk]) -> dict[str, str]:
     for chunk in chunks:
         if not chunk.locators:
             continue
-        expected = set(chunk.locators)
-        matches = [
-            match
-            for match in _LOCATOR_LINE.finditer(chunk.text)
-            if match.group(1).strip() in expected
-        ]
+        matches = _attached_locator_matches(chunk)
         if matches:
             for index, match in enumerate(matches):
                 end = matches[index + 1].start() if index + 1 < len(matches) else len(chunk.text)
@@ -419,15 +419,18 @@ def _full_result_is_grounded(
         return False
     notes, report = gate_notes(notes, source, strict=True, mode="full")
     try:
-        enforce_final_acceptance(notes, report, mode="full", stage="office_final")
+        enforce_final_acceptance(notes, report, mode="full", stage="office_final",
+                                 allow_incomplete=notes.verification_report is not None)
     except NoteQualityError:
         return False
-    if not _audit_meets_office_floor(report.audit, compact=False):
+    if notes.verification_report is None and not _audit_meets_office_floor(report.audit, compact=False):
         logger.warning("Office full booklet rejected by evidence gate %s", report.audit.summary())
         return False
     allowed_set = set(allowed_locators)
     for section in notes.sections:
-        if not _valid_section_locators(section.source_locators, allowed_set):
+        missing_verified_locators = (notes.verification_report is not None
+                                     and not section.source_locators and bool(section.source_block_ids))
+        if not missing_verified_locators and not _valid_section_locators(section.source_locators, allowed_set):
             logger.warning("Office full booklet rejected invalid section source locators")
             return False
         if section.source_locators:
@@ -440,6 +443,30 @@ def _full_result_is_grounded(
     return True
 
 
+def _normalize_office_source(
+    chunks: Iterable[OfficeSourceChunk], title: str, source_type: str, document_id: str | None,
+) -> NormalizedDocument:
+    blocks: list[SourceBlock] = []
+    for chunk in chunks:
+        text = chunk.text.strip()
+        if not text:
+            continue
+        markers = _attached_locator_matches(OfficeSourceChunk(text, chunk.locators))
+        starts = sorted({0, *(match.start() for match in markers), len(text)})
+        labels = {match.start(): match.group(1) for match in markers}
+        for start, end in zip(starts, starts[1:], strict=False):
+            label = labels.get(start, "")
+            match = re.match(r"(صفحهٔ|اسلاید)\s*(\d+)", label)
+            kind = "paragraph" if match is None else "page" if match[1] == "صفحهٔ" else "slide"
+            number = int(match[2]) if match is not None else None
+            blocks.append(SourceBlock(
+                "", kind, ("\n\n" if blocks and start == 0 else "") + text[start:end], 0, 0,
+                page_number=number if kind == "page" else None,
+                slide_number=number if kind == "slide" else None,
+            ))
+    return NormalizedDocument.from_blocks(blocks, source_type=source_type, title=title, document_id=document_id)
+
+
 async def generate_full_booklet(
     chunks: list[OfficeSourceChunk],
     *,
@@ -448,6 +475,8 @@ async def generate_full_booklet(
     session: Any,
     on_stage: StageCallback | None = None,
     on_incomplete: IncompleteCallback | None = None,
+    source_type: str = "txt",
+    document_id: str | None = None,
 ) -> tuple[StructuredNotes, bool]:
     """Run the existing full booklet pipeline, with a complete safe fallback.
 
@@ -459,12 +488,6 @@ async def generate_full_booklet(
     exactly like the audio flow.
     """
     source = source_text(chunks, include_locators=True)
-    source_chars = len(source_text(chunks, include_locators=False))
-    if source_chars > MAX_OFFICE_NOTE_SOURCE_CHARS:
-        raise StructuringError(
-            "متن استخراج‌شده از سقف تولید جزوهٔ آزاد بیشتر است؛ فایل اصلی را دریافت کنید "
-            "و سند را به چند بخش کوچک‌تر تقسیم و دوباره بفرستید."
-        )
     fallback = basic_source_booklet(chunks, title=title)
     fallback = ensure_structured_booklet(fallback, source)
     if getattr(settings, "note_strict_grounding", False):
@@ -489,7 +512,7 @@ async def generate_full_booklet(
     allowed = tuple(dict.fromkeys((*locators_in_chunks(chunks), *locator_sources)))
     try:
         generated = await structure_document(
-            source,
+            _normalize_office_source(chunks, title, source_type, document_id),
             settings,
             session,
             mode="full",
@@ -511,7 +534,8 @@ async def generate_full_booklet(
     if not _full_result_is_grounded(generated, source, allowed, locator_sources):
         return fallback, True
     gated, report = gate_notes(generated, source, strict=True, mode="full")
-    if not _audit_meets_office_floor(report.audit, compact=False) or not gated.has_content:
+    if (not gated.has_content or (gated.verification_report is None
+                                  and not _audit_meets_office_floor(report.audit, compact=False))):
         logger.warning("Office full booklet using source fallback after final audit")
         return fallback, True
     return gated, False
@@ -654,11 +678,6 @@ async def generate_compact_notes(
         raise StructuringError("متن قابل استفاده‌ای برای یادداشت مرور سریع پیدا نشد.")
     chunks = _rechunk_source_chunks(chunks, max_chars=MAX_COMPACT_INPUT_CHARS)
     source_length = sum(len(_strip_chunk_locators(chunk)) for chunk in chunks)
-    if source_length > MAX_OFFICE_NOTE_SOURCE_CHARS:
-        raise StructuringError(
-            "متن استخراج‌شده از سقف تولید یادداشت مرور سریع بیشتر است؛ فایل اصلی را دریافت کنید "
-            "و سند را به چند بخش کوچک‌تر تقسیم کنید."
-        )
     fallback_sections: list[CompactSection] = []
     provider_active = settings.note_configured and session is not None
     for index, chunk in enumerate(chunks, start=1):

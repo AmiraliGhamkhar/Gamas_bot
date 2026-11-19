@@ -412,8 +412,12 @@ class MultiFormatScientificRenderTests(unittest.TestCase):
 class DirectScientificModeTests(unittest.IsolatedAsyncioTestCase):
     async def test_direct_scientific_mode_preserves_enrichment_tables_and_qa(self) -> None:
         """With note_strict_grounding=False (default), scientific clarifications stay intact."""
-        raw_input = "امروز درباره متفورمین حرف زدیم که خط اول دیابت نوع دو هست و زیر سی نباید بدیم."
-        enriched = _rich_scientific_notes().to_json()
+        fixture = _rich_scientific_notes()
+        # Phase 4 keeps rich scientific structure when the lesson actually
+        # supports it. The older one-line fixture did not contain the example
+        # dose or the other topics and could not justify these assertions.
+        raw_input = " ".join(fixture.to_markdown().split())
+        enriched = fixture.to_json()
 
         class _Resp:
             status = 200

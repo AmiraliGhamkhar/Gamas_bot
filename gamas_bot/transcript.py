@@ -375,7 +375,6 @@ class TranscriptDocument:
         )
 
 
-
 # ---------------------------------------------------------------------------
 # Speaker turns
 # ---------------------------------------------------------------------------
@@ -1023,22 +1022,28 @@ def _split_single_line_paragraph(paragraph: str, max_chars: int) -> list[str]:
     pieces: list[str] = []
     for sentence_start, sentence_end in sentence_spans(paragraph):
         sentence = paragraph[sentence_start:sentence_end].strip()
-        while len(sentence) > max_chars:
-            window = sentence[:max_chars]
-            cut = window.rfind(" ")
-            if cut < max_chars // 2:
-                cut = max_chars  # a single monster word: hard cut, no loss
-            pieces.append(sentence[:cut].strip())
-            sentence = sentence[cut:].strip()
-        if sentence:
-            pieces.append(sentence)
+        start = 0
+        while len(sentence) - start > max_chars:
+            boundary = start + max_chars
+            cut = sentence.rfind(" ", start, boundary)
+            if cut <= start or cut - start < max_chars // 2:
+                cut = boundary  # a single monster word: hard cut, no loss
+            piece = sentence[start:cut].strip()
+            if piece:
+                pieces.append(piece)
+            start = cut
+            while start < len(sentence) and sentence[start].isspace():
+                start += 1
+        tail = sentence[start:].strip()
+        if tail:
+            pieces.append(tail)
     packed: list[str] = []
     for piece in pieces:
         if packed and len(packed[-1]) + len(piece) + 1 <= max_chars:
             packed[-1] = packed[-1] + " " + piece
         else:
             packed.append(piece)
-    return packed or [paragraph[:max_chars]]
+    return packed
 
 
 def _split_long_paragraph(paragraph: str, max_chars: int) -> list[str]:
@@ -1063,7 +1068,7 @@ def _split_long_paragraph(paragraph: str, max_chars: int) -> list[str]:
                 packed[-1] = packed[-1] + separator + piece
             else:
                 packed.append(piece)
-    return packed or [paragraph[:max_chars]]
+    return packed
 
 
 def split_transcript(text: str, max_chars: int = TRANSCRIPT_CHUNK_CHARS) -> list[str]:

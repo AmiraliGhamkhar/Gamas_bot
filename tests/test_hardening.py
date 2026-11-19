@@ -242,7 +242,9 @@ class ChunkCapTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_pathological_chunk_count_is_refused_instead_of_billed(self):
         from gamas_bot.notes import StructuringError, structure_transcript
 
-        settings = make_settings(note_chunk_chars=200, note_context_tokens=200_000)
+        settings = make_settings(
+            note_chunk_chars=200, note_context_tokens=200_000, note_enable_deterministic_fallback=False,
+        )
         document = "\n\n".join(f"جملهٔ شمارهٔ {index} دربارهٔ درس." for index in range(4000))
         with self.assertRaises(StructuringError):
             await structure_transcript(document, settings, session=object())

@@ -36,6 +36,7 @@ from .bot_ui import (
     QUIZ_COUNTS,
     TELEGRAM_CAPTION_LIMIT,
 )
+from .document_model import NormalizedDocument
 from .doc_extract import (
     SOURCE_TYPE_LABELS_FA,
     DocExtractError,
@@ -224,13 +225,14 @@ class DocumentOfficeWorkflowMixin:
                     source_type,
                     max_unpacked_bytes=int(self.settings.doc_unpacked_max_bytes),
                 )
-            text = await run_file_io(lambda: extracted.text)
+            title = document_title(filename, source_type)
+            normalized = await run_file_io(NormalizedDocument.from_extracted, extracted, title=title, document_id=digest)
+            text = normalized.text
             if not text.strip():
                 raise DocExtractError(texts.DOCUMENT_EXTRACTION_EMPTY)
             chunks = await run_file_io(
                 chunk_sections, extracted.sections, max_chars=MAX_MODEL_INPUT_CHARS
             )
-            title = document_title(filename, source_type)
             document, created = await self._save_document(
                 user_id,
                 source_type=source_type,
@@ -258,6 +260,8 @@ class DocumentOfficeWorkflowMixin:
                 len(chunks),
                 created,
             )
+            if extracted.pages_without_text:
+                document = {**document, "pages_without_text": extracted.pages_without_text}
             return document, created
 
     def _document_card_text(self, document: dict) -> str:
@@ -272,6 +276,12 @@ class DocumentOfficeWorkflowMixin:
             f"نوع: {label} | {to_persian_digits(int(document.get('page_count') or 0))} {unit}",
             texts.DOCUMENT_EXTRACTED_COUNT.format(count=to_persian_digits(int(document.get('text_chars', len(str(document.get('text') or '')))))),
         ]
+        pages_without_text = document.get("pages_without_text")
+        if pages_without_text:
+            lines.append(
+                f"⚠️ {to_persian_digits(len(pages_without_text))} صفحه لایهٔ متن نداشت؛ "
+                "این صفحه‌ها از روی تصویر خوانده نشدند."
+            )
         if self.settings.office_enabled:
             lines.append(texts.DOCUMENT_FREE_NOTICE)
         if not self.settings.note_configured:
@@ -1108,6 +1118,7 @@ class DocumentOfficeWorkflowMixin:
             chunks_from_json,
             document.get("chunks_json"),
             max_chars=MAX_MODEL_INPUT_CHARS,
+            source_text=original_text,
         )
         source = "\n\n".join(chunk.text for chunk in cached) if cached else original_text
         if len(source) > MAX_OFFICE_NOTE_SOURCE_CHARS:
@@ -1176,17 +1187,11 @@ class DocumentOfficeWorkflowMixin:
                 event, "متن قابل‌استفاده‌ای برای جزوه پیدا نشد.", alert=True
             )
             return
-        if len(source_text) > MAX_OFFICE_NOTE_SOURCE_CHARS:
-            await self._ack(  # type: ignore[attr-defined]
-                event,
-                "متن استخراج‌شده از سقف تولید جزوهٔ آزاد بیشتر است؛ فایل اصلی را دریافت کنید و سند را به چند بخش کوچک‌تر تقسیم کنید. هیچ بخشی کوتاه یا حذف نشده است.",
-                alert=True,
-            )
-            return
         cached = await run_file_io(
             chunks_from_json,
             document.get("chunks_json"),
             max_chars=MAX_MODEL_INPUT_CHARS,
+            source_text=source_text,
         )
         chunks = await run_file_io(
             office_source_chunks,
@@ -1264,6 +1269,8 @@ class DocumentOfficeWorkflowMixin:
                     ),
                     on_stage=_note_stage,
                     on_incomplete=_note_incomplete,
+                    source_type=str(document.get("source_type") or "txt"),
+                    document_id=f"document:{document_id}",
                 )
                 notes = replace(notes, title=title)
                 full_notes = notes

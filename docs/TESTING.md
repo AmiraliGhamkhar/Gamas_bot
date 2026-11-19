@@ -51,7 +51,20 @@ prompt boundary, provider-failure logging, the bounded repair loop, the final
 acceptance gate (fact, prose claim and `warn` mode), local salvage, incomplete
 delivery and the new job stages; `tests/test_note_evidence.py` pins original
 number/term spans and evidence windows; `tests/test_booklet_recovery.py` covers
-source-only fallback and high-risk clause cleanup. `tests/test_review_sheet.py` covers the review-sheet planner (strict plan
+source-only fallback and high-risk clause cleanup. `tests/test_normalized_source.py`
+pins the live source contract: exact ranges, JSON round trips, incomplete
+cache detection, PowerPoint tails, typed model-budget recovery and the
+no-paid-request fallback for pathological chunk counts. `tests/test_content_plan.py`
+covers deterministic topic boundaries, source signals and repeats, strict plan
+round trips and invalid provenance, bounded prompt projection, and fake-provider
+coverage of the default-off local planner. `tests/test_semantic_segments.py`
+pins topic-first mapping, page/slide boundaries, exact offset partitions,
+context-only overlap, isolated overflow retries, route-specific budgets, and
+Gemini native counting via a fake session. `tests/test_section_writer.py` covers
+parallel topic isolation, schema and provenance, route fallbacks, unsupported
+measurements, and checkpoint round trips that retry only failed ranges.
+`tests/test_review_sheet.py` covers
+the review-sheet planner (strict plan
 parsing, grounding, minute allocation, quality states), the deterministic
 renderer, the HTML validator (hard errors and warnings), the `review_html`
 artifact contract and the migration 033 fresh, populated and replay paths.
@@ -83,6 +96,37 @@ concurrency regressions exercise real local capacity pools and temporary data;
 they do not establish production throughput. `python -m scripts.concurrency_bench`
 is an optional **synthetic** pipeline benchmark, not a recommended deployment
 profile or a live-provider test.
+
+### Section Writer checkpoints
+
+`structure_document`, `structure_transcript`, and `structure_presentation`
+accept an optional `on_section_checkpoint` async callback. A trusted caller can
+persist `checkpoint.to_payload()` and resume with
+`section_checkpoint=SectionCheckpoint.from_payload(payload)`. Resume requires
+the same document, plan, writer policy, and fitted layout. When fallback is
+disabled, `SectionGenerationError` carries the failed ranges and checkpoint;
+when local fallback succeeds, `StructuredNotes.failed_sections` records the
+recovery and stays out of booklet JSON. Checkpoints contain source-derived
+text and must be stored privately. Telegram's existing final-artifact store
+is not used for partial work, and no database migration is needed.
+
+### Merge and synthesis
+
+`tests/test_booklet_synthesis.py` exercises structural merge, identifier and
+value conflicts, source references, round-tripping, and strict edit validation.
+The large-booklet and LLM performance suites use scripted replies to cover
+whole-section routing, chapter and final outlines, and bounded concurrency.
+Context and output exhaustion are tested separately; neither a truncated reply
+nor a smaller replacement draft is an accepted edit.
+
+### Booklet verification and node repair
+
+`tests/test_booklet_verification.py` uses offline plans and fake replies. It
+covers explicit checks (schema, scope, coverage and measurement/date mismatches),
+evidence copied to the one affected node, preservation of siblings, malformed or
+truncated replies, total repair caps, and semantic calls only for ambiguous
+claims. Bot delivery tests assert that a safe incomplete booklet is still
+rendered and reported as partial.
 
 ## Live verification is separate
 

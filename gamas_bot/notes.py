@@ -28,15 +28,18 @@ the raw-text priority is built on.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
-import math
 import re
-import time
+import unicodedata
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field as dataclass_field, replace
+from typing import TYPE_CHECKING
 
 import aiohttp
+
+from .document_model import ContentPlan, NormalizedDocument, PlannedTopic, SourceBlock, SourceRange, normalize_source_text, plan_from_document
 
 try:
     import orjson as _orjson
@@ -50,7 +53,6 @@ except ImportError:  # pragma: no cover - optional fast-path
 # itself lives in ``_prompt_block`` so that it cannot be assembled differently
 # per call site — see that module's docstring for the cache contract.
 from ._prompt_block import (  # noqa: F401  (re-exported public prompt surface)
-    CHUNK_CONTEXT_RESERVE_CHARS,
     COMPILE_SYSTEM_PROMPT,
     CONTEXT_DIGEST_MAX_CHARS,
     CONTEXT_HEAD_CHARS,
@@ -61,6 +63,7 @@ from ._prompt_block import (  # noqa: F401  (re-exported public prompt surface)
     PRESENTATION_CHUNK_TOPIC_MAX_CHARS,
     PRESENTATION_PROMPT,
     SOURCE_DIGEST_HEADING,
+    SINGLE_CHUNK_HEADER,
     build_chunk_message,
     build_compile_system_prompt,
     build_edit_message,
@@ -68,6 +71,8 @@ from ._prompt_block import (  # noqa: F401  (re-exported public prompt surface)
     build_presentation_system_prompt,
     edit_system_prompt,
     notes_system_prompt,
+    section_writer_system_prompt,
+    synthesis_system_prompt,
 )
 
 from .config import Settings, resolve_note_mode
@@ -75,8 +80,11 @@ from .llm import (
     LLMContextOverflowError,
     LLMError,
     LLMOutputBudgetError,
+    booklet_input_budget,
     complete_json,
 )
+from .llm_quota import estimate_tokens
+from .note_planning import maybe_refine_plan
 from .notes_evidence import (
     MIN_CLAIM_SUPPORT,
     NoteQualityReport,
@@ -99,8 +107,12 @@ from .notes_evidence import (
     validate_tip,
 )
 from .progress import to_persian_digits
+from .semantic_segments import SemanticRecovery, SemanticSource, SemanticUnit, build_semantic_topics
 from .textnorm import normalize_for_compare
 from .transcript import split_transcript
+
+if TYPE_CHECKING:
+    from .booklet_verification import VerificationReport
 
 logger = logging.getLogger(__name__)
 
@@ -166,29 +178,12 @@ COMPILE_HARD_MAX_CHARS = 160000
 #: PRESENTATION_CHUNK_TOPIC_MAX_CHARS, CONTEXT_DIGEST_MAX_CHARS,
 #: NEIGHBOUR_CONTEXT_CHARS)
 
-#: Conservative characters-per-token ratio for a Persian/English lecture.
-#: Persian tokenizes less efficiently than English on every mainstream
-#: tokenizer, and an over-estimate produces a request the provider rejects, so
-#: this is deliberately low (real Persian text is usually closer to 2.5–3).
-CHARS_PER_TOKEN = 2.0
-#: Prompt scaffolding that is neither the system prompt nor the transcript
-#: (position markers, the JSON envelope, provider boilerplate).
-PROMPT_RESERVE_TOKENS = 512
 #: How many times one oversized request may be halved before the step gives up
 #: (1 → 2 → 4 requests, each cut at a paragraph/sentence boundary).
 MAX_CONTEXT_SPLITS = 2
-#: Hard ceiling on map requests for one booklet. A tiny window (or a tiny
-#: ``NOTE_CHUNK_CHARS``) otherwise turns a long lecture into hundreds of paid
-#: requests; the caller then delivers the raw transcript it already has.
+#: Bound paid map work per booklet. Above this, recover from the complete
+#: source locally (or fail explicitly if deterministic fallback is disabled).
 MAX_NOTE_CHUNKS = 200
-
-#: How many editorial levels a booklet above the compile budget may cost. A
-#: merged booklet that does not fit one request is compiled in whole-section
-#: groups (level 1); the only deeper level that can help is one final merge of
-#: those groups, which is attempted *only* when the compile actually shortened
-#: the booklet enough to fit. Re-grouping an over-budget document cannot shrink
-#: it, so no further level is ever attempted.
-MAX_COMPILE_LEVELS = 2
 
 #: Hard ceiling on practical tips in one booklet; a long lecture may contain
 #: more advice than a study document should surface at once.
@@ -202,10 +197,7 @@ MAX_REPAIR_SECTIONS = 6
 MAX_REPAIR_SIGNALS = 40
 #: Source characters of context handed to the repair pass per missing signal.
 REPAIR_WINDOW_CHARS = 160
-#: Absolute hard cap for ordered repair passes. Deployments retain the
-#: conservative two-call default through ``NOTE_MAX_REPAIR_ATTEMPTS``; the third
-#: slot is available only for the structural cleanup pass when explicitly
-#: enabled, and no loop may exceed this ceiling.
+#: Absolute hard cap on node-repair requests, independent of provider failover.
 MAX_NOTE_REPAIR_ATTEMPTS = 3
 
 # Normalized, command-driven repair codes. They deliberately describe an
@@ -397,6 +389,10 @@ class NoteDefinition:
         return cls(term, definition, _bounded_text(payload.get("term_en"), MAX_TITLE_CHARS))
 
 
+def _table_identity(table: NoteTable) -> tuple[str, tuple[str, ...], tuple[tuple[str, ...], ...]]:
+    return table.caption, tuple(table.headers), tuple(tuple(row) for row in table.rows)
+
+
 def _normalise_tables(payload: dict) -> tuple[NoteTable | None, tuple[NoteTable, ...]]:
     """Read ``table`` (legacy) and ``tables`` (v4) into primary + extras.
 
@@ -407,18 +403,16 @@ def _normalise_tables(payload: dict) -> tuple[NoteTable | None, tuple[NoteTable,
     """
     primary = NoteTable.from_payload(payload.get("table"))
     extra: list[NoteTable] = []
-    seen: set[tuple[str, ...]] = set()
-    if primary is not None:
-        seen.add(primary.signature())
+    seen = {_table_identity(primary)} if primary is not None else set()
     raw_tables = payload.get("tables")
     if isinstance(raw_tables, dict):
         # A model that returns one table under ``tables`` means a list of one.
         raw_tables = [raw_tables]
     for item in raw_tables if isinstance(raw_tables, (list, tuple)) else ():
         table = NoteTable.from_payload(item)
-        if table is None or table.signature() in seen:
+        if table is None or _table_identity(table) in seen:
             continue
-        seen.add(table.signature())
+        seen.add(_table_identity(table))
         if primary is None:
             primary = table
         else:
@@ -445,6 +439,12 @@ class NoteSection:
     #: Exact page/slide/section labels from an extracted source. Populated only
     #: by document-note generation; audio-note output remains unchanged.
     source_locators: tuple[str, ...] = ()
+    # Generation provenance (not provider/stored JSON or renderer fields).
+    section_id: str = dataclass_field(default="", compare=False, repr=False)
+    topic_id: str = dataclass_field(default="", compare=False, repr=False)
+    parent_topic_id: str | None = dataclass_field(default=None, compare=False, repr=False)
+    source_block_ids: tuple[str, ...] = dataclass_field(default=(), compare=False, repr=False)
+
 
     @property
     def all_tables(self) -> tuple[NoteTable, ...]:
@@ -545,6 +545,14 @@ class PracticeQuestion:
 
 
 @dataclass(frozen=True, slots=True)
+class MergeConflict:
+    """A conflict surfaced without choosing a winner or dropping either value."""
+
+    kind: str
+    identifiers: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class StructuredNotes:
     """The validated note structure the LLM must produce as strict JSON."""
 
@@ -570,6 +578,13 @@ class StructuredNotes:
     #: Internal outcome only. It intentionally is not serialized into the
     #: established StructuredNotes JSON contract or renderer input.
     quality_state: str = QUALITY_VERIFIED
+    #: Input provenance, not a claim that each range appears in the output.
+    #: Kept out of the provider/stored JSON and renderer contract.
+    input_ranges: tuple[SourceRange, ...] = dataclass_field(default=(), compare=False, repr=False)
+    semantic_recoveries: tuple[SemanticRecovery, ...] = dataclass_field(default=(), compare=False, repr=False)
+    failed_sections: tuple[FailedSection, ...] = dataclass_field(default=(), compare=False, repr=False)
+    merge_conflicts: tuple[MergeConflict, ...] = dataclass_field(default=(), compare=False, repr=False)
+    verification_report: VerificationReport | None = dataclass_field(default=None, compare=False, repr=False)
 
     @property
     def display_title(self) -> str:
@@ -744,7 +759,7 @@ class StructuredNotes:
 
     @classmethod
     def from_payload(
-        cls, payload: object
+        cls, payload: object, *, provider_reply: bool = False
     ) -> "StructuredNotes":
         """Validate and normalise a model-supplied JSON payload."""
         if not isinstance(payload, dict):
@@ -804,7 +819,8 @@ class StructuredNotes:
         notes = cls(
             title=_bounded_text(payload.get("title"), MAX_TITLE_CHARS),
             subtitle=_bounded_text(payload.get("subtitle"), MAX_TITLE_CHARS),
-            summary=_bounded_text(payload.get("summary")),
+            summary=(_bounded_text(payload.get("summary")) if provider_reply else
+                     scrub_backend_artifacts(str(payload.get("summary") or ""))),
             sections=sections,
             key_points=tuple(_string_list(payload.get("key_points"))),
             glossary=glossary,
@@ -1162,31 +1178,30 @@ def _dedupe_by_key(values, key) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _literal_key(value: str) -> str:
+    # Case, superscripts, punctuation and units are semantically significant.
+    return unicodedata.normalize("NFC", value).strip()
+
+
 def _dedupe_definitions(definitions: tuple[NoteDefinition, ...]) -> tuple[NoteDefinition, ...]:
-    by_term: dict[str, NoteDefinition] = {}
-    order: list[str] = []
+    seen: set[tuple[str, str, str]] = set()
+    result: list[NoteDefinition] = []
     for entry in definitions:
-        term_key = _compare_key(entry.term)
-        if not term_key:
-            continue
-        existing = by_term.get(term_key)
-        if existing is None:
-            by_term[term_key] = entry
-            order.append(term_key)
-        elif len(entry.definition) > len(existing.definition):
-            by_term[term_key] = entry
-    return tuple(by_term[term] for term in order)
+        key = (_literal_key(entry.term), _literal_key(entry.definition), _literal_key(entry.term_en))
+        if key not in seen:
+            seen.add(key)
+            result.append(entry)
+    return tuple(result)
 
 
 def _dedupe_callouts(callouts: tuple[NoteCallout, ...]) -> tuple[NoteCallout, ...]:
     seen: set[tuple[str, str]] = set()
     result: list[NoteCallout] = []
     for callout in callouts:
-        identity = (callout.kind, _compare_key(callout.text))
-        if identity in seen:
-            continue
-        seen.add(identity)
-        result.append(callout)
+        identity = (callout.kind, _literal_key(callout.text))
+        if identity not in seen:
+            seen.add(identity)
+            result.append(callout)
     return tuple(result)
 
 
@@ -1194,11 +1209,10 @@ def _dedupe_table_rows(rows: list[list[str]]) -> list[list[str]]:
     seen: set[tuple[str, ...]] = set()
     result: list[list[str]] = []
     for row in rows:
-        identity = tuple(_compare_key(cell) for cell in row)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        result.append(row)
+        identity = tuple(_literal_key(cell) for cell in row)
+        if identity not in seen:
+            seen.add(identity)
+            result.append(row)
     return result
 
 
@@ -1212,262 +1226,239 @@ def _merge_table_group(
     in one section are kept as separate tables instead of being flattened into
     bullets — a table is the shape the lecturer's comparison actually has.
     """
-    primary: NoteTable | None = None
-    extras: list[NoteTable] = []
+    combined: list[NoteTable] = []
     for table in tables:
-        if primary is None:
-            primary = table
-            continue
-        if table.signature() == primary.signature():
-            primary = NoteTable(
-                list(primary.headers),
-                _dedupe_table_rows([list(row) for row in primary.rows] + [list(row) for row in table.rows]),
-                primary.caption or table.caption,
-            )
-            continue
-        for index, existing in enumerate(extras):
-            if existing.signature() == table.signature():
-                extras[index] = NoteTable(
-                    list(existing.headers),
-                    _dedupe_table_rows(
-                        [list(row) for row in existing.rows] + [list(row) for row in table.rows]
-                    ),
-                    existing.caption or table.caption,
+        headers = tuple(map(_literal_key, table.headers))
+        caption = _literal_key(table.caption)
+        for index, current in enumerate(combined):
+            if (headers == tuple(map(_literal_key, current.headers))
+                    and caption == _literal_key(current.caption)):
+                combined[index] = NoteTable(
+                    list(current.headers),
+                    _dedupe_table_rows([list(row) for row in (*current.rows, *table.rows)]),
+                    current.caption,
                 )
                 break
         else:
-            extras.append(table)
-    return primary, tuple(extras)
+            combined.append(table)
+    return (combined[0], tuple(combined[1:])) if combined else (None, ())
 
 
 def _combine_sections(first: NoteSection, second: NoteSection) -> NoteSection:
     table, tables = _merge_table_group(first.all_tables + second.all_tables)
     return replace(
         first,
-        paragraphs=_dedupe_by_key(first.paragraphs + second.paragraphs, _compare_key),
-        bullets=_dedupe_by_key(first.bullets + second.bullets, _compare_key),
+        paragraphs=_dedupe_by_key(first.paragraphs + second.paragraphs, _literal_key),
+        bullets=_dedupe_by_key(first.bullets + second.bullets, _literal_key),
         definitions=_dedupe_definitions(first.definitions + second.definitions),
-        examples=_dedupe_by_key(first.examples + second.examples, _compare_key),
-        steps=_dedupe_by_key(first.steps + second.steps, _compare_key),
-        formulas=_dedupe_by_key(first.formulas + second.formulas, _compare_key),
-        key_points=_dedupe_by_key(first.key_points + second.key_points, _compare_key),
+        examples=_dedupe_by_key(first.examples + second.examples, _literal_key),
+        steps=first.steps if first.steps == second.steps else first.steps + second.steps,
+        formulas=_dedupe_by_key(first.formulas + second.formulas, _literal_key),
+        key_points=_dedupe_by_key(first.key_points + second.key_points, _literal_key),
         callouts=_dedupe_callouts(first.callouts + second.callouts),
         table=table,
         tables=tables,
+        source_block_ids=tuple(dict.fromkeys(first.source_block_ids + second.source_block_ids)),
         source_locators=tuple(
             dict.fromkeys(first.source_locators + second.source_locators)
-        )[:MAX_SOURCE_LOCATORS_PER_SECTION],
+        ),
     )
 
 
-def _block_keys(section: NoteSection) -> tuple[str, ...]:
-    keys: list[str] = []
-    keys.extend("p|" + _compare_key(value) for value in section.paragraphs if value)
-    keys.extend("b|" + _compare_key(value) for value in section.bullets if value)
-    keys.extend(
-        "d|" + _compare_key(entry.term) + "|" + _compare_key(entry.definition)
-        for entry in section.definitions
-    )
-    keys.extend("e|" + _compare_key(value) for value in section.examples if value)
-    keys.extend("s|" + _compare_key(value) for value in section.steps if value)
-    keys.extend("f|" + _compare_key(value) for value in section.formulas if value)
-    keys.extend("k|" + _compare_key(value) for value in section.key_points if value)
-    keys.extend("c|" + callout.kind + "|" + _compare_key(callout.text) for callout in section.callouts)
-    for table in section.all_tables:
-        headers = "|".join(_compare_key(header) for header in table.headers)
-        keys.extend(
-            headers + "||" + "|".join(_compare_key(cell) for cell in row)
-            for row in table.rows
-        )
-    return tuple(key for key in keys if not key.endswith("|"))
+_LITERAL_CONT_PREFIX = re.compile(r"^(?:ادامه[ٔ‌ی]*|دنباله[ٔ‌ی]*|continued|cont\.)(?=[\s:：،—-]|$)[\s:：،—-]*", re.I)
+_LITERAL_CONT_SUFFIX = re.compile(r"\s*[(«](?:ادامه|دنباله|continued|cont\.)[)»]$", re.I)
 
 
-def _same_logical_section(first: NoteSection, second: NoteSection, *, across_chunk: bool) -> bool:
-    if not heading_topic_key(first.heading) and not heading_topic_key(second.heading):
+def _literal_continuation_title(text: str) -> str:
+    return _LITERAL_CONT_SUFFIX.sub("", _LITERAL_CONT_PREFIX.sub("", _literal_key(text)))
+
+
+def _same_logical_section(first: NoteSection, second: NoteSection) -> bool:
+    if (first.section_id != second.section_id or first.topic_id != second.topic_id
+            or first.parent_topic_id != second.parent_topic_id):
         return False
-    if headings_share_a_topic(first.heading, second.heading):
+    if first.steps and second.steps and first.steps != second.steps:
+        return False  # do not turn separate procedures into one sequence
+    if len(set(first.source_locators + second.source_locators)) > MAX_SOURCE_LOCATORS_PER_SECTION:
+        return False  # keep distinct structures rather than clipping references
+    if _literal_key(first.heading) == _literal_key(second.heading):
         return True
-    return across_chunk and headings_overlap(first.heading, second.heading)
+    # Only a literal continuation marker is structural. Similar headings do
+    # not establish that two sections or subjects are interchangeable.
+    a, b = map(_literal_continuation_title, (first.heading, second.heading))
+    return bool(a and a == b) or (not second.topic_id and not b and bool(a))
 
 
-def _merge_sections(
-    sections: list[NoteSection],
-    *,
-    chunk_starts: frozenset[int] = frozenset(),
-) -> tuple[NoteSection, ...]:
-    """Merge sections additively, in order, with conservative de-duplication."""
+def _merge_sections(sections: list[NoteSection], conflicts: list[MergeConflict]) -> tuple[NoteSection, ...]:
+    """Combine adjacent equivalent sections, keeping source order and references."""
     merged: list[NoteSection] = []
-    seen_text: set[str] = set()
-    seen_blocks: set[str] = set()
-    pending_chunk_boundary = False
-    for position, section in enumerate(sections):
-        if position in chunk_starts:
-            pending_chunk_boundary = True
-        paragraphs = _dedupe_by_key(section.paragraphs, _compare_key)
-        bullets = _dedupe_by_key(section.bullets, _compare_key)
-        paragraphs = tuple(
-            value for value in paragraphs if _compare_key(value) not in seen_text
-        )
-        seen_text.update(_compare_key(value) for value in paragraphs)
-        bullets = tuple(value for value in bullets if _compare_key(value) not in seen_text)
-        seen_text.update(_compare_key(value) for value in bullets)
-        cleaned = replace(
-            section,
-            paragraphs=paragraphs,
-            bullets=bullets,
-            definitions=_dedupe_definitions(section.definitions),
-            examples=_dedupe_by_key(section.examples, _compare_key),
-            steps=_dedupe_by_key(section.steps, _compare_key),
-            formulas=_dedupe_by_key(section.formulas, _compare_key),
-            key_points=_dedupe_by_key(section.key_points, _compare_key),
-            callouts=_dedupe_callouts(section.callouts),
-        )
-        if not cleaned.has_content:
+    explicit = {section.section_id for section in sections if section.section_id}
+    seen_ids: dict[str, NoteSection] = {}
+    conflicting_ids: set[str] = set()
+    parent_by_topic: dict[str, str | None] = {}
+    for section in sections:
+        if not section.has_content:
             continue
-        keys = _block_keys(cleaned)
-        if keys and seen_blocks and all(key in seen_blocks for key in keys):
-            continue
-        seen_blocks.update(keys)
-        across_chunk = pending_chunk_boundary
-        pending_chunk_boundary = False
-        if merged and _same_logical_section(
-            merged[-1], cleaned, across_chunk=across_chunk
-        ):
-            merged[-1] = _combine_sections(merged[-1], cleaned)
+        topic = section.topic_id
+        if topic and topic in parent_by_topic and parent_by_topic[topic] != section.parent_topic_id:
+            conflicts.append(MergeConflict("topic_parent", (topic,)))
+        elif topic:
+            parent_by_topic[topic] = section.parent_topic_id
+        identity = section.section_id
+        if identity and identity in seen_ids:
+            original = seen_ids[identity]
+            same = (original == replace(section, source_locators=original.source_locators) and original.topic_id == topic
+                    and original.parent_topic_id == section.parent_topic_id)
+            if not same:
+                # Do not let aliases obscure two different sections. Preserve
+                # both, allocate a deterministic ID, report the collision.
+                counter = 2
+                while f"{identity}~{counter}" in explicit:
+                    counter += 1
+                alias = f"{identity}~{counter}"
+                explicit.add(alias)
+                conflicting_ids.update((identity, alias))
+                conflicts.append(MergeConflict("section_id", (identity, alias)))
+                section = replace(section, section_id=alias)
+            elif merged and merged[-1].section_id == identity and _same_logical_section(merged[-1], section):
+                merged[-1] = _combine_sections(merged[-1], section)
+                continue
+            else:
+                # An explicitly repeated ID away from its original position is
+                # still kept in source order with its own record.
+                counter = 2
+                while f"{identity}~{counter}" in explicit:
+                    counter += 1
+                alias = f"{identity}~{counter}"
+                explicit.add(alias)
+                section = replace(section, section_id=alias)
+        elif identity:
+            seen_ids[identity] = section
+        if (merged and merged[-1].section_id not in conflicting_ids and section.section_id not in conflicting_ids
+                and _same_logical_section(merged[-1], section)):
+            merged[-1] = _combine_sections(merged[-1], section)
         else:
-            merged.append(cleaned)
+            merged.append(section)
     return tuple(merged)
 
 
-_SENTENCE_SPAN = re.compile(r"(?:[!?؟…]+|؛|(?<!\d)\.(?!\d))[»)\]”\"']*")
+_SYNTHESIS_NUMBER = re.compile(r"(?<![\w.])[+−-]?\d+(?:[.٫]\d+)?(?![\d.])")
+
+
+def _section_reference(section: NoteSection, position: int) -> str:
+    return section.section_id or f"@position:{position}"
+
+
+def _potential_value_conflicts(sections: Sequence[NoteSection]) -> list[MergeConflict]:
+    """Find literal value variants, not semantic contradictions or a winner."""
+    seen: dict[tuple[str, str], tuple[str, str]] = {}
+    conflicts: list[MergeConflict] = []
+    for index, section in enumerate(sections, 1):
+        ref = _section_reference(section, index)
+        facts = (*section.paragraphs, *section.bullets, *section.key_points, *section.formulas)
+        for fact in facts:
+            text = _literal_key(fact.rstrip("."))
+            numbers = tuple(_SYNTHESIS_NUMBER.finditer(text))
+            if len(numbers) != 1:
+                continue
+            match = numbers[0]
+            left, right = text[:match.start()], text[match.end():]
+            if not (left.strip() and right.strip()):
+                continue
+            value = "".join(str(unicodedata.decimal(c)) if c.isdecimal() else c for c in match[0])
+            value = value.replace("٫", ".").replace("−", "-").lstrip("+")
+            if "." in value:
+                value = value.rstrip("0").rstrip(".")
+            first_value, first_ref = seen.setdefault((left, right), (value, ref))
+            if first_value != value:
+                conflicts.append(MergeConflict("potential_value_conflict", (first_ref, ref)))
+    return conflicts
 
 
 def _merge_summaries(notes: list[StructuredNotes]) -> str:
-    parts: list[str] = []
-    seen: set[str] = set()
-    for item in notes:
-        if not item.summary:
-            continue
-        start = 0
-        for match in _SENTENCE_SPAN.finditer(item.summary):
-            text = item.summary[start : match.end()].strip()
-            start = match.end()
-            if not text:
-                continue
-            identity = _compare_key(text)
-            if identity in seen:
-                continue
-            seen.add(identity)
-            parts.append(text)
-        tail = item.summary[start:].strip()
-        if tail:
-            identity = _compare_key(tail)
-            if identity not in seen:
-                seen.add(identity)
-                parts.append(tail)
-    # Each map prompt bounds this to a short chunk-local summary. Do not cut the
-    # merged field at an arbitrary character offset: the last chunk's overview
-    # would disappear without a visible failure.
-    return " ".join(parts)
+    # Whole summaries only: matching sentences can play different roles in
+    # their respective explanations, and punctuation is not a safe split.
+    return " ".join(_dedupe_by_key([item.summary for item in notes if item.summary], _literal_key))
 
 
 def _dedupe_glossary(notes: list[StructuredNotes]) -> tuple[GlossaryEntry, ...]:
-    by_term: dict[str, GlossaryEntry] = {}
-    term_order: list[str] = []
-    for item in notes:
-        for entry in item.glossary:
-            key = _compare_key(entry.term)
-            if not key:
-                continue
-            if key not in by_term:
-                by_term[key] = entry
-                term_order.append(key)
-            elif len(entry.definition) > len(by_term[key].definition):
-                by_term[key] = GlossaryEntry(
-                    entry.term, entry.definition, entry.term_en or by_term[key].term_en
-                )
-            elif entry.term_en and not by_term[key].term_en:
-                by_term[key] = GlossaryEntry(
-                    by_term[key].term, by_term[key].definition, entry.term_en
-                )
-    return tuple(by_term[term] for term in term_order)
+    by_key: dict[tuple[str, str, str], GlossaryEntry] = {}
+    for note in notes:
+        for entry in note.glossary:
+            key = (_literal_key(entry.term), _literal_key(entry.definition), _literal_key(entry.term_en))
+            by_key.setdefault(key, entry)
+    return tuple(by_key.values())
 
 
-def _dedupe_practice_questions(
-    questions: Sequence[PracticeQuestion],
-) -> tuple[PracticeQuestion, ...]:
-    by_q: dict[str, PracticeQuestion] = {}
-    order: list[str] = []
+def _dedupe_practice_questions(questions: Sequence[PracticeQuestion]) -> tuple[PracticeQuestion, ...]:
+    by_key: dict[tuple[str, str, str], PracticeQuestion] = {}
     for item in questions:
-        key = _compare_key(item.question)
-        if not key:
-            continue
-        if key not in by_q:
-            by_q[key] = item
-            order.append(key)
-        elif len(item.answer) > len(by_q[key].answer):
-            by_q[key] = PracticeQuestion(
-                item.question, item.answer, item.kind or by_q[key].kind
-            )
-    return tuple(by_q[k] for k in order)
+        key = (_literal_key(item.question), _literal_key(item.answer), item.kind)
+        by_key.setdefault(key, item)
+    return tuple(by_key.values())
 
 
 def _dedupe_tips(tips: Sequence[PracticalTip]) -> tuple[PracticalTip, ...]:
-    """One copy of each tip; a longer basis wins because it is better evidence."""
-    by_text: dict[str, PracticalTip] = {}
-    order: list[str] = []
+    by_key: dict[tuple[str, str, str], PracticalTip] = {}
     for tip in tips:
-        key = _compare_key(tip.text)
-        if not key:
-            continue
-        if key not in by_text:
-            by_text[key] = tip
-            order.append(key)
-        elif len(tip.basis) > len(by_text[key].basis):
-            by_text[key] = tip
-    return tuple(by_text[key] for key in order)
+        key = (_literal_key(tip.text), _literal_key(tip.basis), tip.kind)
+        by_key.setdefault(key, tip)
+    return tuple(by_key.values())
 
 
 def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
-    """Combine per-chunk notes into one document, preserving order."""
+    """Combine validated pieces in source order without paraphrasing their contents."""
     if not notes:
         raise StructuringError("پاسخ سرویس تولید جزوه خالی بود.")
+    conflicts = [conflict for item in notes for conflict in item.merge_conflicts
+                 if conflict.kind != "potential_value_conflict"]
+    sections = _merge_sections([section for item in notes for section in item.sections], conflicts)
+    conflicts.extend(_potential_value_conflicts(sections))
     if len(notes) == 1:
-        return notes[0]
-    chunk_starts: set[int] = set()
-    cursor = 0
-    for item in notes[:-1]:
-        cursor += len(item.sections)
-        chunk_starts.add(cursor)
+        if not notes[0].has_content:
+            raise StructuringError("ساختار جزوهٔ دریافتی خالی بود.")
+        only = notes[0]
+        diagnostics = tuple(dict.fromkeys(conflicts))
+        glossary = _dedupe_glossary(notes)
+        if glossary == only.glossary and diagnostics == only.merge_conflicts and len(sections) == len(only.sections) and all(
+            new is old for new, old in zip(sections, only.sections, strict=True)
+        ):
+            return only
+        return replace(only, sections=sections, merge_conflicts=diagnostics, glossary=glossary)
+    quality = max((item.quality_state for item in notes), key=lambda state: {
+        QUALITY_VERIFIED: 0, QUALITY_REPAIRED: 1, QUALITY_DEGRADED: 2, QUALITY_RECOVERED: 3,
+    }.get(state, 0))
     merged = StructuredNotes(
+        quality_state=quality,
         title=next((item.title for item in notes if item.title), ""),
         subtitle=next((item.subtitle for item in notes if item.subtitle), ""),
         summary=_merge_summaries(notes),
-        sections=_merge_sections(
-            [section for item in notes for section in item.sections],
-            chunk_starts=frozenset(chunk_starts),
-        ),
+        sections=sections,
+        merge_conflicts=tuple(dict.fromkeys(conflicts)),
+        input_ranges=tuple(dict.fromkeys(span for item in notes for span in item.input_ranges)),
+        semantic_recoveries=tuple(dict.fromkeys(event for item in notes for event in item.semantic_recoveries)),
+        failed_sections=tuple(dict.fromkeys(failure for item in notes for failure in item.failed_sections)),
         key_points=_dedupe_by_key(
-            [point for item in notes for point in item.key_points], _compare_key
+            [point for item in notes for point in item.key_points], _literal_key
         ),
         glossary=_dedupe_glossary(notes),
         # CR-3: every merged booklet is FULL, regardless of legacy stored values.
         note_mode="full",
         learning_objectives=_dedupe_by_key(
-            [item for note in notes for item in note.learning_objectives], _compare_key
+            [item for note in notes for item in note.learning_objectives], _literal_key
         ),
         review_questions=_dedupe_by_key(
-            [item for note in notes for item in note.review_questions], _compare_key
+            [item for note in notes for item in note.review_questions], _literal_key
         ),
         practice_questions=_dedupe_practice_questions(
             [item for note in notes for item in note.practice_questions]
         ),
         practical_tips=_dedupe_tips([tip for note in notes for tip in note.practical_tips]),
         common_mistakes=_dedupe_by_key(
-            [item for note in notes for item in note.common_mistakes], _compare_key
+            [item for note in notes for item in note.common_mistakes], _literal_key
         ),
         final_review=_dedupe_by_key(
-            [item for note in notes for item in note.final_review], _compare_key
+            [item for note in notes for item in note.final_review], _literal_key
         ),
     )
     if not merged.has_content:
@@ -1482,7 +1473,7 @@ def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
 
 def _load_json_payload(payload: dict, *, mode: str = "full") -> StructuredNotes:
     try:
-        notes = StructuredNotes.from_payload(payload)
+        notes = StructuredNotes.from_payload(payload, provider_reply=True)
     except (KeyError, TypeError) as exc:
         raise StructuringError("پاسخ سرویس تولید جزوه ساختار معتبری نداشت.") from exc
     if not notes.sections:
@@ -1503,10 +1494,11 @@ _LEADING_WRAPPER_HEADINGS_RE = re.compile(r"^(?:\s*#{1,6}\s+[^\n]+\n+)+")
 
 @dataclass(frozen=True, slots=True)
 class LectureContext:
-    """A compact orientation built deterministically from the chunk openings."""
+    """Bounded chunk orientation, separate from the complete content plan."""
 
     title: str = ""
     topics: tuple[str, ...] = ()
+    plan: ContentPlan | None = None
 
     @property
     def is_empty(self) -> bool:
@@ -1516,6 +1508,9 @@ class LectureContext:
         if 0 < index <= len(self.topics):
             return self.topics[index - 1]
         return ""
+
+
+_SENTENCE_SPAN = re.compile(r"(?:[!?؟…]+|؛|(?<!\d)\.(?!\d))[»)\]”\"']*")
 
 
 def _chunk_topic_summary(chunk: str) -> str:
@@ -1541,17 +1536,34 @@ def _chunk_topic_summary(chunk: str) -> str:
     return " ".join(first_sentence.split())
 
 
-def build_context(chunks: list[str]) -> LectureContext:
-    """Topics = slide headings in each chunk (for decks) or the opening sentence.
+def build_context(
+    chunks: list[str], *, plan: ContentPlan | None = None,
+    source_ranges: Sequence[SourceRange] = (),
+) -> LectureContext:
+    """Project a full source plan onto the existing positional prompt digest.
 
-    This is the v3 simplification of v2's orientation LLM call: the slide
-    headings or opening of a chunk state its topics, so the digest is
-    deterministic, free and instant.
+    Callers without source ranges keep the original slide/opening hints.
+    Prompt limits never truncate or change the canonical plan.
     """
+    if plan is not None and len(source_ranges) != len(chunks):
+        raise ValueError("context source ranges must align with chunks")
+    by_block = {
+        block_id: topic.title for topic in (plan.topics if plan is not None else ())
+        for block_id in topic.source_block_ids
+    }
     topics: list[str] = []
     used_chars = 0
-    for chunk in chunks:
-        topic = _chunk_topic_summary(chunk)
+    for index, chunk in enumerate(chunks):
+        topic = ""
+        if plan is not None:
+            titles = dict.fromkeys(by_block[block_id] for block_id in source_ranges[index].block_ids if block_id in by_block)
+            for title in titles:
+                addition = ("؛ " if topic else "") + title
+                if len(topic) + len(addition) > PRESENTATION_CHUNK_TOPIC_MAX_CHARS:
+                    break
+                topic += addition
+        if not topic:
+            topic = _chunk_topic_summary(chunk)
         if not topic:
             # Keep one slot per input chunk: topic_for(index) is positional.
             topics.append("")
@@ -1566,7 +1578,7 @@ def build_context(chunks: list[str]) -> LectureContext:
             continue
         topics.append(topic)
         used_chars += addition_chars
-    return LectureContext(title="", topics=tuple(topics))
+    return LectureContext(title=plan.title if plan is not None else "", topics=tuple(topics), plan=plan)
 
 
 def context_block_for(
@@ -1847,64 +1859,18 @@ async def fill_coverage_gaps(
     *,
     semaphore: asyncio.Semaphore | None = None,
 ) -> StructuredNotes:
-    """Fill all detected coverage gaps in one grounded, bounded request.
+    """Compatibility entry point; coverage now uses the same per-node cap."""
+    from .booklet_verification import verify_and_repair
 
-    Failure is non-fatal: retain the audited draft and never spin up one request
-    per missing fact. The repaired payload is locally grounded before merging.
-    """
-    report = assess_completeness(source, notes)
-    if report.meets_threshold:
-        return notes
-    gaps = report.missing_units[:MAX_COVERAGE_GAPS]
-    if not gaps:
-        # Skeleton-only shortfall: an LLM would have to invent structure. Keep
-        # the grounded draft; never fabricate a glossary/summary to pass a gate.
-        logger.info("note completeness %s (skeleton-only shortfall; no fill)", report.summary())
-        return notes
-    message = build_fill_document(gaps, notes, source)
-    try:
-        if semaphore is not None:
-            async with semaphore:
-                payload = await complete_json(
-                    session, settings,
-                    system=COVERAGE_FILL_SYSTEM_PROMPT,
-                    user=message,
-                    schema=_response_schema(settings),
-                    task="BOOKLET_REPAIR",
-                    sampling_temperature=0.0,
-                )
-        else:
-            payload = await complete_json(
-                session, settings,
-                system=COVERAGE_FILL_SYSTEM_PROMPT,
-                user=message,
-                schema=_response_schema(settings),
-                task="BOOKLET_REPAIR",
-                sampling_temperature=0.0,
-            )
-        filled = _load_json_payload(payload)
-    except Exception as exc:  # noqa: BLE001 - preserve the audited draft
-        logger.warning("coverage fill request failed: %s", type(exc).__name__)
-        return notes
-    if not filled.has_content:
-        return notes
-    if getattr(settings, "note_strict_grounding", False):
-        filled, filled_report = gate_notes(
-            filled, source, strict=True, mode=settings.note_mode
-        )
-        if acceptance_failure(filled_report) is not None:
-            filled, _ = scrub_unsupported_content(filled, filled_report)
-            filled, filled_report = gate_notes(
-                filled, source, strict=True, mode=settings.note_mode
-            )
-        if not filled.has_content or acceptance_failure(filled_report) is not None:
-            logger.warning("coverage fill rejected by grounding gate")
-            return notes
-    merged = merge_structured_notes([notes, filled])
-    if merged.quality_state == QUALITY_VERIFIED:
-        merged = replace(merged, quality_state=QUALITY_REPAIRED)
-    logger.info("note completeness after fill: %s", assess_completeness(source, merged).summary())
-    return merged
+    document = NormalizedDocument.from_source_text(source)
+    plan = plan_from_document(document)
+    if len(plan.topics) == 1 and not any(section.topic_id for section in notes.sections):
+        topic = plan.topics[0]
+        notes = replace(notes, sections=tuple(replace(
+            section, topic_id=topic.id, source_block_ids=topic.unit_ids,
+        ) for section in notes.sections))
+    router = SectionWriter(replace(settings, note_completeness_fill=True), session, semaphore=semaphore)
+    return await verify_and_repair(notes, document, plan, router)
 
 
 # ===========================================================================
@@ -2009,15 +1975,7 @@ def compact_notes_payload(notes: StructuredNotes) -> dict:
 
 
 def build_compile_document(context: LectureContext, notes: StructuredNotes) -> str:
-    """The editorial compile input: the source digest, then the merged notes.
-
-    The order is the template order of the booklet agent: the transcript-like
-    material first, the artifact being edited last, so the mutable scaffolding
-    stays a stable prefix and the model reads the draft immediately before it
-    starts writing. The edit instructions live in the system prompt; the
-    per-request "leave these out / put these back" material is appended by the
-    repair builder.
-    """
+    """Legacy draft envelope retained for callers sizing targeted repair."""
     return build_edit_message(build_source_digest(context), _notes_draft_json(notes))
 
 
@@ -2078,20 +2036,41 @@ def _notes_body_chars(notes: StructuredNotes) -> int:
 
 
 def compile_accepts(compiled: StructuredNotes, merged: StructuredNotes) -> bool:
-    """Check mandatory shape before the source-aware post-compile audit.
+    """Check educational payload and owning references, not a size/shape proxy.
 
-    Safe but incomplete editorial output remains eligible for delivery: the
-    evidence/completeness report marks omissions as partial instead of replacing
-    the entire booklet solely because a lexical or size ratio declined.
-    ``merged`` remains in the signature for compatibility with older callers.
+    Additive excerpts and annotations are validated separately by the edit
+    interpreter. Original ordered bodies, steps, tables and booklet metadata
+    cannot be replaced, even by a candidate with the same apparent coverage.
     """
-    _ = merged
-    if not compiled.has_content or not compiled.sections:
+    if not compiled.has_content or len(compiled.sections) != len(merged.sections):
         return False
-    # Completeness is diagnosed by the evidence audit after compile. A terse
-    # editorial answer is preferable to rejecting a safe booklet outright.
-    # Keep only mandatory structure here; unsafe claims still pass through the
-    # bounded audit/repair/salvage path below.
+    if replace(compiled, sections=(), title=merged.title, quality_state=merged.quality_state) != replace(merged, sections=()):
+        return False
+    if (compiled.input_ranges != merged.input_ranges or compiled.semantic_recoveries != merged.semantic_recoveries
+            or compiled.failed_sections != merged.failed_sections or compiled.merge_conflicts != merged.merge_conflicts):
+        return False
+
+    def identity(section: NoteSection) -> tuple:
+        return (section.section_id, section.topic_id, section.parent_topic_id,
+                tuple(dict.fromkeys(section.paragraphs)), tuple(dict.fromkeys(section.bullets)),
+                tuple(section.definitions), tuple(section.examples),
+                tuple(section.steps), tuple(section.formulas))
+
+    by_body: dict[tuple, list[NoteSection]] = {}
+    for section in compiled.sections:
+        by_body.setdefault(identity(section), []).append(section)
+    for original in merged.sections:
+        candidates = by_body.get(identity(original), [])
+        for index, candidate in enumerate(candidates):
+            if (set(original.key_points) <= set(candidate.key_points)
+                    and set(original.callouts) <= set(candidate.callouts)
+                    and all(table in candidate.all_tables for table in original.all_tables)
+                    and set(original.source_locators) <= set(candidate.source_locators)
+                    and set(original.source_block_ids) <= set(candidate.source_block_ids)):
+                candidates.pop(index)
+                break
+        else:
+            return False
     return True
 
 
@@ -2175,7 +2154,7 @@ def gate_notes(
             tables=tuple(accepted_tables[1:]),
             source_locators=locators if strict else section.source_locators,
         )
-        if cleaned_section.has_content:
+        if cleaned_section.has_content or not strict:
             sections.append(cleaned_section)
 
     tips: list[PracticalTip] = []
@@ -2212,7 +2191,7 @@ def gate_notes(
         # The model emits its tips in importance order; the cap keeps the first
         # ones. Sorting by ``len(basis)`` (the old behaviour) promoted tips with
         # the longest justification, not the most useful advice.
-        practical_tips=tuple(tips[:MAX_PRACTICAL_TIPS]),
+        practical_tips=tuple(tips[:MAX_PRACTICAL_TIPS] if strict else tips),
         learning_objectives=objectives,
         review_questions=review_questions,
     )
@@ -2359,14 +2338,18 @@ def enforce_final_acceptance(
     *,
     mode: str = "full",
     stage: str = "final",
+    allow_incomplete: bool = False,
+    check_grounding: bool = True,
 ) -> StructuredNotes:
     """Return *notes*, or raise :class:`NoteQualityError`.
 
-    This is the single final gate: every path that could deliver a structured
-    booklet (single chunk, merged chunks, and a compiled booklet) ends here.
-    ``stage`` is diagnostic only and appears in the log line.
+    This is the final strict gate for an accepted synthesis baseline. Optional
+    editorial edits must subsequently preserve the artifact and pass the same checks.
+    ``allow_incomplete`` permits safe partial delivery; completeness still has
+    a separate report. ``stage`` is diagnostic only.
     """
-    reason = acceptance_failure(report)
+    reason = ((safety_failure(report) if allow_incomplete else acceptance_failure(report))
+              if check_grounding else None)
     if reason is None and not structurally_valid_booklet(notes):
         violations = booklet_output_violations(notes)
         reason = violations[0] if violations else "invalid_booklet_structure"
@@ -3048,7 +3031,7 @@ def is_usable_transcript(source: str) -> bool:
     scaffolding, then require at least one word or hard source signal.
     """
     raw = (source or "").strip()
-    if len(raw) < 2:
+    if not raw:
         return False
     material = _FALLBACK_LOCATOR.sub(" ", raw)
     material = mask_structural(material)
@@ -3057,8 +3040,7 @@ def is_usable_transcript(source: str) -> bool:
         " ", material, flags=re.IGNORECASE,
     )
     folded = normalize_for_compare(material)
-    has_letters = any(char.isalpha() for char in folded)
-    return has_letters and bool(content_words(folded) or extract_signals(material))
+    return bool(content_words(folded) or extract_signals(material))
 
 
 def _fallback_title(source: str) -> str:
@@ -3256,69 +3238,36 @@ def ensure_structured_booklet(notes: StructuredNotes, source: str) -> Structured
 def effective_chunk_chars(
     settings: Settings, *, system_prompt: str, extra_reserve_chars: int = 0
 ) -> int:
-    """The character budget of one note request, derived from the context window.
-
-    A character count says nothing about whether a request fits: the expected
-    output, the system prompt and the contextual material all live in the same
-    window. This subtracts them from ``NOTE_CONTEXT_TOKENS`` and converts what is
-    left with a deliberately conservative ratio, so a model with a smaller window
-    receives smaller chunks instead of a request the provider rejects.
-    ``NOTE_CHUNK_CHARS`` remains an upper bound — a smaller configured chunk is
-    never grown. The budget is never floored to a minimum that would exceed the
-    model's configured window.
-    """
-    reserve_characters = len(system_prompt) + max(0, extra_reserve_chars)
-    reserve_tokens = math.ceil(reserve_characters / CHARS_PER_TOKEN) + PROMPT_RESERVE_TOKENS
-    available_tokens = (
-        settings.note_context_tokens - settings.note_max_output_tokens - reserve_tokens
+    """Transport guardrail; the semantic plan, not this number, chooses topics."""
+    tokens = booklet_input_budget(
+        settings, system=system_prompt, user_metadata=" " * max(0, extra_reserve_chars),
+        schema=_response_schema(settings), task="BOOKLET_GENERATION",
     )
-    if available_tokens <= 0:
+    if tokens <= 0:
         raise StructuringError(
-            "پنجرهٔ زمینهٔ مدل پس از کسر دستور جزوه و سقف پاسخ، فضایی برای متن ورودی ندارد؛ "
-            "NOTE_MAX_OUTPUT_TOKENS را کم کنید یا NOTE_CONTEXT_TOKENS را افزایش دهید."
+            "پنجرهٔ زمینهٔ مدل پس از کسر دستور جزوه، ساختار و سقف پاسخ، فضایی برای متن ورودی ندارد."
         )
-    context_budget = max(1, int(available_tokens * CHARS_PER_TOKEN))
-    # ``NOTE_CHUNK_CHARS`` may be smaller than the window allows; it is never grown.
-    return max(1, min(settings.note_chunk_chars, context_budget))
+    return max(1, min(settings.note_chunk_chars, int(tokens * settings.llm_token_estimation_chars_per_token)))
 
 
 def effective_compile_max_chars(
     settings: Settings, *, mode: str = "full", presentation: bool = False
 ) -> int:
-    """The character budget of the merged notes in one compile request.
+    """Editorial character ceiling; route dispatch also checks actual token budgets."""
+    from .booklet_synthesis import synthesis_schema
 
-    The compile (reduce) request lives in the same window as every other note
-    request: its system prompt, the topic digest wrapped around the merged
-    notes and the reserved output all compete with the notes themselves. The
-    budget is therefore derived with the same math as
-    :func:`effective_chunk_chars` (minus the ``NOTE_CHUNK_CHARS`` cap, which
-    sizes map chunks, not the reduce input) instead of the former fixed
-    character bound, which silently disabled the editorial pass for every
-    booklet above it however large the model's window was.
-
-    ``NOTE_COMPILE_MAX_CHARS`` (> 0) is an additional operator cap; it cannot
-    enlarge the request beyond the context-derived budget. The correct system
-    prompt for the mode and source type is reserved, as is the bounded topic
-    digest. The derived budget is also bounded by ``COMPILE_HARD_MAX_CHARS``, so
-    a very large configured window cannot turn the reduce step into one
-    unbounded request. A merged booklet above this budget is compiled in whole
-    section groups instead of being skipped (see :func:`_compile_pass`).
-    """
-    reserve_characters = len(edit_system_prompt()) + EDIT_MESSAGE_RESERVE_CHARS
-    reserve_tokens = math.ceil(reserve_characters / CHARS_PER_TOKEN) + PROMPT_RESERVE_TOKENS
-    available_tokens = (
-        settings.note_context_tokens - settings.note_max_output_tokens - reserve_tokens
+    available_tokens = booklet_input_budget(
+        settings, system=synthesis_system_prompt(), user_metadata="",
+        schema=synthesis_schema() if settings.note_structured_output else None, task="BOOKLET_COMPILE",
     )
     if available_tokens <= 0:
         return 0
-    derived = min(int(available_tokens * CHARS_PER_TOKEN), COMPILE_HARD_MAX_CHARS)
+    derived = min(int(available_tokens * settings.llm_token_estimation_chars_per_token), COMPILE_HARD_MAX_CHARS)
     if settings.note_compile_max_chars > 0:
         return min(settings.note_compile_max_chars, derived)
     return derived
 
 
-#: Hard ceiling on concurrent note requests. More in-flight requests than a
-#: provider will serve only converts a serial queue into 429s.
 MAX_NOTE_CONCURRENCY = 8
 
 
@@ -3334,566 +3283,335 @@ def _note_semaphore(settings: Settings, chunks: int) -> asyncio.Semaphore:
     return asyncio.Semaphore(max(1, min(configured, MAX_NOTE_CONCURRENCY, max(1, chunks))))
 
 
+@dataclass(frozen=True, slots=True)
+class FailedSection:
+    topic_id: str
+    source_range: SourceRange
+    error_type: str
+    recovered: bool = False
+
+
+_SectionKey = tuple[str, int, int]
+
+
+def _section_key(unit: SemanticUnit) -> _SectionKey:
+    return unit.topic_id, unit.source_range.start_offset, unit.source_range.end_offset
+
+
+@dataclass(slots=True)
+class SectionCheckpoint:
+    """Job-local progress. Serialize via a caller-owned, trusted checkpoint store.
+
+    It is not a booklet artifact. Only verified response shapes are retained;
+    local fallback and failed provider replies are not cached as successes.
+    """
+
+    fingerprint: str = ""
+    plan: ContentPlan | None = None
+    completed: dict[_SectionKey, StructuredNotes] = dataclass_field(default_factory=dict)
+    split_reasons: dict[_SectionKey, str] = dataclass_field(default_factory=dict)
+
+    def to_payload(self) -> dict:
+        return {
+            "version": 1, "fingerprint": self.fingerprint,
+            "plan": self.plan.to_payload() if self.plan is not None else None,
+            "completed": [[list(key), notes.to_payload()] for key, notes in sorted(self.completed.items())],
+            "splits": [[list(key), reason] for key, reason in sorted(self.split_reasons.items())],
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> SectionCheckpoint:
+        if not isinstance(payload, dict) or payload.get("version") != 1 or not isinstance(payload.get("fingerprint"), str):
+            raise ValueError("invalid section checkpoint")
+        plan = ContentPlan.from_payload(payload["plan"]) if payload.get("plan") is not None else None
+        checkpoint = cls(payload["fingerprint"], plan)
+        for field in ("completed", "splits"):
+            items = payload.get(field)
+            if not isinstance(items, list):
+                raise ValueError("invalid section checkpoint entries")
+            seen: set[_SectionKey] = set()
+            for item in items:
+                if not isinstance(item, list) or len(item) != 2:
+                    raise ValueError("invalid section checkpoint entry")
+                key, data = item
+                if (not isinstance(key, list) or len(key) != 3 or not isinstance(key[0], str)
+                        or type(key[1]) is not int or type(key[2]) is not int or not 0 <= key[1] < key[2]):
+                    raise ValueError("invalid section checkpoint range key")
+                identity = (key[0], key[1], key[2])
+                if identity in seen:
+                    raise ValueError("duplicate section checkpoint range key")
+                seen.add(identity)
+                if field == "completed" and isinstance(data, dict):
+                    checkpoint.completed[identity] = _load_json_payload(data)
+                elif field == "splits" and data in ("context_overflow", "output_truncation"):
+                    checkpoint.split_reasons[identity] = data
+                else:
+                    raise ValueError("invalid section checkpoint entry value")
+        if checkpoint.completed.keys() & checkpoint.split_reasons.keys():
+            raise ValueError("completed section cannot also require splitting")
+        if not checkpoint.fingerprint and (checkpoint.completed or checkpoint.split_reasons):
+            raise ValueError("unbound section checkpoint")
+        return checkpoint
+
+
+class SectionGenerationError(StructuringError):
+    """An incomplete map can be resumed, but cannot be delivered as a booklet."""
+
+    def __init__(self, failures: tuple[FailedSection, ...], checkpoint: SectionCheckpoint) -> None:
+        super().__init__("یک یا چند موضوع ساخته نشد؛ جزوهٔ ناقص به‌عنوان خروجی کامل تحویل داده نمی‌شود.")
+        self.failures = failures
+        self.checkpoint = checkpoint
+
+
+CheckpointCallback = Callable[[SectionCheckpoint], Awaitable[None]]
+
+
+_SECTION_LOCATOR_LINE = re.compile(
+    r"(?m)^[ \t]*\[((?:صفحهٔ|اسلاید|بخش|page|slide|section)[ \t]+[^\]\n]{1,100})\][ \t]*$", re.I,
+)
+
+
+def _section_provenance(notes: StructuredNotes, source: SemanticSource, unit: SemanticUnit) -> StructuredNotes:
+    # Bind to real blocks, even if an oversized page was split after its
+    # locator line. Bracket delimiters are input syntax, not the stored label.
+    refs = unit.source_range.block_ids
+    locators = dict.fromkeys(
+        " ".join(label.strip("[]").split())
+        for block_id in refs
+        for label in ((source.locators_by_id[block_id],) if block_id in source.locators_by_id else
+                      _SECTION_LOCATOR_LINE.findall(source.blocks_by_id[block_id].text))
+    )
+    allowed = tuple(locators)[:MAX_SOURCE_LOCATORS_PER_SECTION]
+    return replace(notes, input_ranges=(unit.source_range,), sections=tuple(replace(
+        section, source_locators=allowed, topic_id=unit.topic_id, parent_topic_id=unit.parent_id,
+        section_id=f"{unit.topic_id}:{unit.source_range.start_offset}:{unit.source_range.end_offset}:{index}",
+        source_block_ids=refs,
+    ) for index, section in enumerate(notes.sections, 1)))
+
+
+def _section_prompt_metadata(topic: PlannedTopic, plan: ContentPlan, position: int, *, strict: bool) -> str:
+    # The plan projection is deliberately structural. No other topic's prose,
+    # examples, numbers, or source text is included in this writer's request.
+    return "موضوع و طرح (فقط ساختار): " + json.dumps({
+        "topic": {"id": topic.id, "title": topic.title, "parent_id": topic.parent_id,
+                  "dimensions_if_evidenced": topic.required_dimensions},
+        "plan": {"position": position, "topic_count": len(plan.topics),
+                 "previous_id": plan.topics[position - 2].id if position > 1 else None,
+                 "next_id": plan.topics[position].id if position < len(plan.topics) else None},
+        "strict_grounding": strict,
+    }, ensure_ascii=False, separators=(",", ":"))
+
+
+class SectionWriter:
+    """Bind topic-local generation to the existing provider router and semaphore."""
+
+    def __init__(
+        self, settings: Settings, session: aiohttp.ClientSession, *, mode: str = "full",
+        semaphore: asyncio.Semaphore | None = None, checkpoint: SectionCheckpoint | None = None,
+        on_checkpoint: CheckpointCallback | None = None,
+    ) -> None:
+        self.settings = settings
+        self.session = session
+        self.mode = mode
+        self.semaphore = semaphore or _note_semaphore(settings, settings.note_concurrency)
+        self.checkpoint = checkpoint if checkpoint is not None else SectionCheckpoint()
+        self.recoveries: list[SemanticRecovery] = []
+        self.failures: list[FailedSection] = []
+        self._binding: tuple[NormalizedDocument, ContentPlan] | None = None
+        self._on_checkpoint = on_checkpoint
+        self._checkpoint_lock = asyncio.Lock()
+
+    async def save_checkpoint(self) -> None:
+        if self._on_checkpoint is not None:
+            async with self._checkpoint_lock:
+                try:
+                    await self._on_checkpoint(self.checkpoint)
+                except Exception as exc:
+                    logger.warning("section checkpoint store failed error=%s", type(exc).__name__)
+
+    def bind(self, document: NormalizedDocument, plan: ContentPlan, units: Sequence[SemanticUnit] = ()) -> None:
+        if self._binding is not None and self._binding[0] is document and self._binding[1] is plan:
+            return
+        digest = hashlib.sha256(document.text.encode("utf-8", errors="surrogatepass"))
+        digest.update(plan.to_json().encode("utf-8", errors="surrogatepass"))
+        digest.update(section_writer_system_prompt().encode("utf-8"))
+        digest.update(str((self.mode, self.settings.note_strict_grounding)).encode("ascii"))
+        for unit in units:
+            digest.update(repr(_section_key(unit)).encode("utf-8"))
+        fingerprint = digest.hexdigest()
+        if self.checkpoint.fingerprint and self.checkpoint.fingerprint != fingerprint:
+            raise ValueError("section checkpoint belongs to a different source or plan")
+        self.checkpoint.fingerprint = fingerprint
+        self.checkpoint.plan = plan
+        self._binding = (document, plan)
+
+    def failure(self, source: SemanticSource, unit: SemanticUnit, exc: Exception) -> StructuredNotes:
+        recovered: StructuredNotes | None = None
+        if self.settings.note_enable_deterministic_fallback:
+            try:
+                recovered = deterministic_fallback_notes(source.body(unit))
+            except StructuringError:
+                pass
+        failure = FailedSection(unit.topic_id, unit.source_range, type(exc).__name__, recovered is not None)
+        self.failures.append(failure)
+        logger.warning("section writer topic=%s range=%d:%d outcome=%s error=%s", unit.topic_id,
+                       unit.source_range.start_offset, unit.source_range.end_offset,
+                       "FALLBACK" if recovered is not None else "FAILED", failure.error_type)
+        if recovered is None:
+            raise SectionGenerationError((failure,), self.checkpoint) from exc
+        return _section_provenance(recovered, source, unit)
+
+    async def write_unit(
+        self, topic: PlannedTopic, source: SemanticSource, unit: SemanticUnit, plan: ContentPlan,
+        *, position: int, index: int, total: int, header: str = "", standalone: bool = False,
+    ) -> StructuredNotes:
+        metadata = _section_prompt_metadata(topic, plan, position, strict=self.settings.note_strict_grounding)
+
+        def render(part: SemanticUnit) -> str:
+            body = source.body(part)
+            if total == 1:
+                return build_chunk_message(body, index=1, total=1, header=(header or SINGLE_CHUNK_HEADER) + "\n" + metadata)
+            return build_chunk_message(body, index=index, total=total, topic=topic.title,
+                                       context_block=metadata, header=header)
+
+        try:
+            result = await _structure_piece(
+                self.session, self.settings, source, unit, system_prompt=section_writer_system_prompt(),
+                mode=self.mode, semaphore=self.semaphore, render=render, recovery_events=self.recoveries,
+                writer=self, standalone=standalone,
+            )
+        except SectionGenerationError:
+            raise
+        except (LLMError, StructuringError) as exc:
+            # A caller-supplied/legacy piece implementation may raise before
+            # handing off to the normal leaf failure handler.
+            return self.failure(source, unit, exc)
+        return result if result.input_ranges else _section_provenance(result, source, unit)
+
+
+async def generate_section(
+    topic: PlannedTopic, document: NormalizedDocument, plan: ContentPlan, router: SectionWriter,
+) -> NoteSection:
+    """Write one planned topic, using the same mapper as booklet generation.
+
+    The booklet path retains rich metadata and separate nested sections; the
+    one-section adapter combines their typed content for single-topic callers.
+    """
+    if plan.topic(topic.id) != topic:
+        raise ValueError("planned topic is not part of the supplied plan")
+    units = build_semantic_topics(document, plan)
+    unit = next((unit for unit in units if unit.topic_id == topic.id), None)
+    if unit is None:
+        raise ValueError("topic is not an independent semantic unit")
+    router.bind(document, plan)
+    source = SemanticSource(document)
+    position = plan.topics.index(topic) + 1
+    metadata = _section_prompt_metadata(topic, plan, position, strict=router.settings.note_strict_grounding)
+    budget = effective_chunk_chars(router.settings, system_prompt=section_writer_system_prompt(),
+                                   extra_reserve_chars=len(metadata) + 200)
+    units = source.fit([unit], lambda body: len(body) <= budget, max_probe_chars=budget)
+    if len(units) > MAX_NOTE_CHUNKS:
+        notes = router.failure(source, unit, StructuringError("موضوع از سقف درخواست‌های بخش بیشتر است."))
+    else:
+        results = await asyncio.gather(*(router.write_unit(topic, source, part, plan, position=position, index=index,
+                                                           total=len(units), standalone=True) for index, part in enumerate(units, 1)),
+                                       return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        notes = merge_structured_notes([result for result in results if isinstance(result, StructuredNotes)])
+    section = notes.sections[0]
+    for following in notes.sections[1:]:
+        section = _combine_sections(section, following)
+    return section
+
+
 async def _structure_piece(
     session: aiohttp.ClientSession,
     settings: Settings,
-    document: str,
+    source: SemanticSource,
+    unit: SemanticUnit,
     *,
     system_prompt: str,
     mode: str,
     semaphore: asyncio.Semaphore,
+    render: Callable[[SemanticUnit], str],
+    recovery_events: list[SemanticRecovery],
+    overlap_chars: int = 0,
     depth: int = 0,
-    presentation: bool = False,
-    render: Callable[[str], str],
+    writer: SectionWriter | None = None,
+    standalone: bool = False,
 ) -> StructuredNotes:
-    """One note request, with bounded recovery from an oversized or dense input.
+    """Generate one unit; overflow replaces just its exact owned interval.
 
-    ``document`` is raw source text, never a rendered message: ``render`` turns
-    it into the user message (see ``build_chunk_message``) so that a split can
-    re-render both halves with the same header and topic instead of cutting a
-    message in two.
-
-    A context overflow or output-budget truncation is the provider failure that
-    smaller input chunks can fix, so the input is cut at a slide/paragraph/
-    sentence boundary and the halves are requested instead. The depth is
-    bounded and an input with no safe cut point is given up: an unchanged
-    oversized request is never re-sent.
+    A truncated response cannot prove which claims or sections finished. Never
+    stitch JSON fragments: request smaller independent source sections and
+    validate every response through the same StructuredNotes loader.
     """
-    try:
-        async with semaphore:
-            payload = await complete_json(
-                session,
-                settings,
-                system=system_prompt,
-                user=render(document),
-                schema=_response_schema(settings),
-                task="BOOKLET_GENERATION",
-            )
-        return _load_json_payload(payload, mode=mode)
-    except (LLMContextOverflowError, LLMOutputBudgetError) as exc:
-        if depth >= MAX_CONTEXT_SPLITS:
-            raise
-        splitter = split_presentation_document if presentation else split_transcript
-        half_budget = max(1, len(document) // 2)
-        if presentation:
-            first_marker = _SLIDE_TOPIC_HEADING_RE.search(document)
-            if first_marker and first_marker.start() > 0:
-                balanced = (len(document) + first_marker.start()) // 2 + 2
-                candidate = splitter(document, balanced)
-                pieces = candidate if len(candidate) >= 2 else splitter(document, half_budget)
-            else:
-                pieces = splitter(document, half_budget)
-        else:
-            pieces = splitter(document, half_budget)
-        if len(pieces) < 2:
-            raise
-        logger.warning(
-            "note request exceeded model budget; splitting into %d part(s) depth=%d (%s)",
-            len(pieces), depth + 1, exc,
-        )
-        tasks = [
-            asyncio.ensure_future(
-                _structure_piece(
-                    session, settings, piece,
-                    system_prompt=system_prompt, mode=mode,
-                    semaphore=semaphore, depth=depth + 1,
-                    presentation=presentation, render=render,
-                )
-            )
-            for piece in pieces
-        ]
+    key = _section_key(unit)
+    checkpoint = writer.checkpoint if writer is not None else None
+    if checkpoint is not None and key in checkpoint.completed:
+        return _section_provenance(checkpoint.completed[key], source, unit)
+    reason = checkpoint.split_reasons.get(key) if checkpoint is not None else None
+    if reason is None:
         try:
-            parts = await asyncio.gather(*tasks)
-        except BaseException:
-            # ``gather`` propagates immediately but leaves the siblings running:
-            # they would keep the semaphore, the HTTP session and the provider
-            # quota busy for a result nobody reads.
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            async with semaphore:
+                payload = await complete_json(
+                    session, settings, system=system_prompt, user=render(unit),
+                    schema=_response_schema(settings), task="BOOKLET_GENERATION", adaptive_capacity=True,
+                )
+            notes = _load_json_payload(payload, mode=mode)
+            if standalone and settings.note_strict_grounding:
+                notes, report = gate_notes(notes, source.body(unit), strict=True, mode=mode)
+                if (issue := safety_failure(report)) or not notes.sections:
+                    raise NoteQualityError("بخش مستقل شاهد کافی ندارد.", reason=issue or "invalid_structure")
+            elif standalone and not settings.note_strict_grounding:
+                # Direct mode retains lexical enrichment, but cannot establish
+                # unsupported measurements or high-risk clinical instructions.
+                audit = audit_notes(source.body(unit), notes)
+                clinical = classify_claim_risk(notes.to_json()) == "high"
+                if any(signal.kind == "number" and (signal.unit or clinical) for signal in audit.fabricated):
+                    raise NoteQualityError("اندازه‌گیری بدون شاهد در بخش.", reason="unsupported_facts")
+                if (clinical and any(
+                        claim.risk == "high" for claim in prose_claim_evidence(source.body(unit), notes))):
+                    raise NoteQualityError("دستور بالینی بدون شاهد در بخش.", reason="unsupported_claims")
+            if checkpoint is not None:
+                checkpoint.completed[key] = notes
+                assert writer is not None
+                await writer.save_checkpoint()
+            return _section_provenance(notes, source, unit)
+        except (LLMContextOverflowError, LLMOutputBudgetError) as exc:
+            if depth >= MAX_CONTEXT_SPLITS or unit.source_range.end_offset - unit.source_range.start_offset < 2:
+                if writer is not None:
+                    return writer.failure(source, unit, exc)
+                raise
+            reason = "context_overflow" if isinstance(exc, LLMContextOverflowError) else "output_truncation"
+            if checkpoint is not None:
+                checkpoint.split_reasons[key] = reason
+                assert writer is not None
+                await writer.save_checkpoint()
+        except (LLMError, StructuringError) as exc:
+            if writer is not None:
+                return writer.failure(source, unit, exc)
             raise
-        return merge_structured_notes(list(parts))
-
-
-async def _audit_and_repair(
-    notes: StructuredNotes,
-    source: str,
-    settings: Settings,
-    session: aiohttp.ClientSession,
-    *,
-    mode: str,
-    presentation: bool,
-    semaphore: asyncio.Semaphore,
-    source_locators: bool = False,
-) -> tuple[StructuredNotes, NoteQualityReport]:
-    """Run ordered, bounded repairs and preserve the best known-safe artifact."""
-    notes = ensure_structured_booklet(notes, source)
-    if not settings.note_strict_grounding:
-        return notes, gate_notes(notes, source, strict=False, mode=mode)[1]
-
-    # ``warn`` no longer permits known fabricated facts to reach final delivery.
-    # It suppresses provider edits, while deterministic removal still protects
-    # the user from a source-disproved assertion.
-    strict = settings.note_quality_gate == "repair"
-    # Validation/removal is always strict once strict grounding is enabled;
-    # ``warn`` only suppresses LLM repair calls, never delivery safety.
-    gated, report = gate_notes(notes, source, strict=True, mode=mode)
-    attempts = 0
-    max_attempts = min(
-        MAX_NOTE_REPAIR_ATTEMPTS,
-        max(0, int(getattr(settings, "note_max_repair_attempts", MAX_NOTE_REPAIR_ATTEMPTS))),
-    )
-    if strict:
-        for pass_name in ("claim_repair", "coverage_repair", "structural_cleanup"):
-            # Critical and structural commands get one minimal edit attempt.
-            # Coverage may need the bounded remaining call budget because one
-            # response can safely restore only part of a large set of signals.
-            repeat_coverage = pass_name == "coverage_repair"
-            while attempts < max_attempts:
-                issues = _repair_issues_for_pass(
-                    build_repair_issues(gated, report, source), pass_name
-                )
-                if not issues:
-                    break
-                before = report
-                attempts += 1
-                candidate, candidate_report = await _repair_once(
-                    gated, report, source, settings, session,
-                    mode=mode, presentation=presentation, semaphore=semaphore,
-                    source_locators=source_locators,
-                    issues=issues, pass_name=pass_name,
-                )
-                if candidate is gated and candidate_report is report:
-                    logger.info(
-                        "note repair stage=%s attempt=%d/%d result=no_change issues=%d",
-                        pass_name, attempts, max_attempts, len(issues),
-                    )
-                    break
-                gated, report = candidate, candidate_report
-                logger.info(
-                    "note repair stage=%s attempt=%d/%d issues=%d repaired=%d unresolved=%d quality=%s",
-                    pass_name,
-                    attempts,
-                    max_attempts,
-                    len(issues),
-                    max(0, _critical_issue_count(before) - _critical_issue_count(report)),
-                    len(build_repair_issues(gated, report, source)),
-                    gated.quality_state,
-                )
-                if not repeat_coverage or not notes_need_repair(report, mode=mode):
-                    break
-
-    # A failed semantic repair is not a failed booklet. First remove only the
-    # exact disproved spans/claims and re-audit; if anything unsafe remains (or
-    # the local edits leave no valid structure), use the source-only fallback
-    # rather than reject an otherwise usable transcript.
-    # Missing coverage is repairable by the dedicated bounded completeness pass
-    # after map/reduce. Only source-disproved prose requires immediate local
-    # removal or a source-only fallback here.
-    if safety_failure(report) is not None:
-        scrubbed, removed = scrub_unsupported_content(gated, report, source=source)
-        signal_only_failure = bool(report.audit.fabricated) and not report.unsupported_claims
-        if removed:
-            try:
-                if scrubbed.sections:
-                    scrubbed = ensure_structured_booklet(scrubbed, source)
-            except StructuringError:
-                pass
-            if structurally_valid_booklet(scrubbed):
-                gated, report = gate_notes(scrubbed, source, strict=True, mode=mode)
-                quality = (
-                    QUALITY_RECOVERED
-                    if scrubbed.quality_state == QUALITY_RECOVERED or signal_only_failure
-                    else QUALITY_DEGRADED
-                )
-                gated = replace(gated, quality_state=quality)
-            else:
-                gated, report = scrubbed, report
-        if (
-            safety_failure(report) is not None
-            or not structurally_valid_booklet(gated)
-        ) and getattr(settings, "note_enable_deterministic_fallback", True):
-            fallback = deterministic_fallback_notes(source)
-            fallback, report = gate_notes(fallback, source, strict=True, mode=mode)
-            gated = replace(fallback, quality_state=QUALITY_RECOVERED)
-            logger.warning(
-                "note audit outcome=RECOVERED baseline=source_preserving_fallback "
-                "scrubbed_local_spans=%d",
-                removed,
-            )
-    if notes_need_repair(report, mode=mode):
-        logger.warning(
-            "note repair complete attempts=%d unresolved=%d critical=%d quality=%s",
-            attempts,
-            len(build_repair_issues(gated, report, source)),
-            _critical_issue_count(report),
-            gated.quality_state,
-        )
-    if not structurally_valid_booklet(gated):
-        if getattr(settings, "note_enable_deterministic_fallback", True):
-            fallback = deterministic_fallback_notes(source)
-            gated, report = gate_notes(fallback, source, strict=True, mode=mode)
-            gated = replace(gated, quality_state=QUALITY_RECOVERED)
-        else:
-            raise StructuringError("ساختار جزوه برای رندر معتبر نبود.")
-    # This is an early repair/audit boundary, not a delivery boundary. Preserve
-    # a structurally safe but incomplete draft so ``finalize`` can run the
-    # bounded completeness pass; the one canonical final acceptance gate makes
-    # the delivery decision afterwards.
-    return gated, report
-
-def repair_request_document(
-    notes: StructuredNotes,
-    report: NoteQualityReport,
-    source: str,
-    *,
-    budget: int,
-    mode: str = "full",
-    issues: Sequence[RepairIssue] | None = None,
-    pass_name: str = "claim_repair",
-) -> tuple[str, Sequence[NoteSection]] | None:
-    """Return the smallest command-driven repair request that fits *budget*."""
-    if budget <= 0:
-        return None
-    selected_issues = tuple(issues or build_repair_issues(notes, report, source))
-    if not selected_issues:
-        return None
-    whole = build_repair_document(
-        notes, report, source, mode=mode, issues=selected_issues, pass_name=pass_name
-    )
-    if len(whole) <= budget:
-        return whole, notes.sections
-    chosen = repair_target_indexes(notes, report, source)
-    # Direct claim/path identity outranks relevance scoring: a source window
-    # may share no vocabulary with an invented sentence, but its section still
-    # must be present in the command.
-    direct = {
-        int(issue.section_id[1:]) - 1
-        for issue in selected_issues
-        if issue.section_id.startswith("s") and issue.section_id[1:].isdigit()
-        and 0 <= int(issue.section_id[1:]) - 1 < len(notes.sections)
-    }
-    chosen = list(dict.fromkeys([*sorted(direct), *chosen]))[:MAX_REPAIR_SECTIONS]
-    while chosen:
-        sections = [notes.sections[index] for index in sorted(chosen)]
-        document = build_repair_document(
-            notes, report, source, mode=mode, sections=sections,
-            issues=selected_issues, pass_name=pass_name,
-        )
-        if len(document) <= budget:
-            logger.info(
-                "note repair stage=%s request_chars=%d budget=%d sections=%d/%d issues=%d",
-                pass_name, len(document), budget, len(sections), len(notes.sections), len(selected_issues),
-            )
-            return document, sections
-        # Never drop a directly implicated section before lower-priority
-        # relevance choices. A request that cannot even carry one direct target
-        # is not sent; the deterministic scrub/fallback remains safer.
-        removable = [index for index in reversed(chosen) if index not in direct]
-        if not removable:
-            break
-        chosen.remove(removable[0])
-    logger.warning(
-        "note repair skipped stage=%s request_chars=%d budget=%d issues=%d",
-        pass_name, len(whole), budget, len(selected_issues),
-    )
-    return None
-
-
-def merge_repaired_sections(
-    notes: StructuredNotes, repaired: Sequence[NoteSection]
-) -> tuple[StructuredNotes, int]:
-    """Put the repaired sections back where they came from, by heading.
-
-    Headings are the only stable identity across the request (the model may
-    reflow a paragraph, never the section it belongs to). A section the model
-    returns that matches nothing is not merged — inventing a section is exactly
-    the failure this merge must not amplify. Returns the notes and the number of
-    sections that could not be placed.
-    """
-    indexes: dict[str, int] = {}
-    for index, section in enumerate(notes.sections):
-        key = heading_topic_key(section.heading)
-        if key and key not in indexes:
-            indexes[key] = index
-    merged = list(notes.sections)
-    placed: set[int] = set()
-    unplaced = 0
-    for section in repaired:
-        match = indexes.get(heading_topic_key(section.heading))
-        if match is None:
-            # A reworded heading still refers to one topic: accept the unique
-            # unplaced section it clearly overlaps, never an ambiguous one.
-            candidates = [
-                position
-                for position, original in enumerate(notes.sections)
-                if position not in placed
-                and headings_overlap(section.heading, original.heading)
-            ]
-            match = candidates[0] if len(candidates) == 1 else None
-        if match is None or match in placed:
-            unplaced += 1
-            continue
-        merged[match] = section
-        placed.add(match)
-    return replace(notes, sections=tuple(merged)), unplaced
-
-
-async def _repair_once(
-    notes: StructuredNotes,
-    report: NoteQualityReport,
-    source: str,
-    settings: Settings,
-    session: aiohttp.ClientSession,
-    *,
-    mode: str,
-    presentation: bool,
-    semaphore: asyncio.Semaphore,
-    source_locators: bool = False,
-    issues: Sequence[RepairIssue] | None = None,
-    pass_name: str = "claim_repair",
-) -> tuple[StructuredNotes, NoteQualityReport]:
-    """One bounded repair request; the caller keeps its state on any failure."""
-    budget = effective_compile_max_chars(settings, mode=mode, presentation=presentation)
-    selected_issues = tuple(issues or build_repair_issues(notes, report, source))
-    request = repair_request_document(
-        notes, report, source, budget=budget, mode=mode,
-        issues=selected_issues, pass_name=pass_name,
-    )
-    if request is None:
-        return notes, report
-    repair_document, repaired_sections = request
-    targeted = len(repaired_sections) < len(notes.sections)
-    _ = source_locators
-    system_prompt = edit_system_prompt()
-    try:
-        async with semaphore:
-            payload = await complete_json(
-                session,
-                settings,
-                system=system_prompt,
-                user=repair_document,
-                schema=_response_schema(settings),
-                task="BOOKLET_REPAIR",
-                sampling_temperature=0.0,
-            )
-        candidate = _load_json_payload(payload, mode=mode)
-    except (LLMError, StructuringError) as exc:
-        logger.warning(
-            "note repair stage=%s command=%s issues=%d result=failed error=%s",
-            pass_name,
-            ",".join(sorted({issue.code for issue in selected_issues})),
-            len(selected_issues),
-            type(exc).__name__,
-        )
-        return notes, report
-    if targeted:
-        candidate, unplaced = merge_repaired_sections(notes, candidate.sections)
-        if unplaced:
-            logger.warning(
-                "repair returned %d section(s) with no place in the booklet; ignored",
-                unplaced,
-            )
-    candidate, candidate_report = gate_notes(candidate, source, strict=True, mode=mode)
-    if repair_improves(candidate_report, report):
-        fixed = max(0, _critical_issue_count(report) - _critical_issue_count(candidate_report))
-        logger.info(
-            "note repair stage=%s command=%s issues=%d fixed=%d unresolved=%d quality=%s",
-            pass_name,
-            ",".join(sorted({issue.code for issue in selected_issues})),
-            len(selected_issues),
-            fixed,
-            len(build_repair_issues(candidate, candidate_report, source)),
-            QUALITY_REPAIRED,
-        )
-        return replace(candidate, quality_state=QUALITY_REPAIRED), candidate_report
-    logger.info(
-        "note repair stage=%s command=%s issues=%d result=rejected unresolved=%d",
-        pass_name,
-        ",".join(sorted({issue.code for issue in selected_issues})),
-        len(selected_issues),
-        len(build_repair_issues(candidate, candidate_report, source)),
-    )
-    return notes, report
-
-
-async def _compile_once(
-    session: aiohttp.ClientSession,
-    settings: Settings,
-    context: LectureContext,
-    notes: StructuredNotes,
-    *,
-    mode: str,
-    presentation: bool,
-    budget: int,
-    source_locators: bool = False,
-) -> StructuredNotes | None:
-    """One editorial compile request, or ``None`` when it cannot be sent.
-
-    The deterministic acceptance gate is applied here, so every caller (the
-    whole-booklet path and each group of a grouped compile) gets the same
-    "restructure, never gut" guarantee.
-    """
-    document = build_compile_document(context, notes)
-    if budget <= 0 or len(document) > budget:
-        logger.warning(
-            "compile skipped: request_chars=%d budget=%d sections=%d",
-            len(document), budget, len(notes.sections),
-        )
-        return None
-    # One static editorial prompt for every source kind (see
-    # ``_prompt_block.edit_system_prompt``): the digest, the draft and the
-    # locator contract all live in the user message.
-    _ = source_locators
-    try:
-        payload = await complete_json(
-            session,
-            settings,
-            system=edit_system_prompt(),
-            user=document,
-            schema=_response_schema(settings),
-            task="BOOKLET_COMPILE",
-            prefer_provider=getattr(settings, "note_compile_provider", ""),
-            sampling_temperature=0.1,
-        )
-        compiled = _load_json_payload(payload, mode=mode)
-    except (LLMError, StructuringError) as exc:
-        logger.warning("compile pass failed (%s); delivering deterministic merge", type(exc).__name__)
-        return None
-    if not compile_accepts(compiled, notes):
-        return None
-    return compiled
-
-
-def compile_groups(
-    notes: StructuredNotes, context: LectureContext, *, budget: int
-) -> list[StructuredNotes]:
-    """Partition a booklet into contiguous whole-section groups that fit.
-
-    A section is never split: it is the unit the acceptance gate and the merge
-    both reason about. A section that cannot fit on its own is returned as a
-    single-section group, which the caller keeps verbatim (with a warning)
-    rather than dropping content it cannot re-send.
-    """
-    if budget <= 0:
-        return []
-    base = len(build_compile_document(context, StructuredNotes()))
-    groups: list[StructuredNotes] = []
-    current: list[NoteSection] = []
-    current_chars = base
-    for section in notes.sections:
-        cost = len(json.dumps(section_payload(section), ensure_ascii=False))
-        extra = cost + (2 if current else 0)  # ", " between array items
-        if current and current_chars + extra > budget:
-            groups.append(StructuredNotes(sections=tuple(current)))
-            current = [section]
-            current_chars = base + cost
-            continue
-        current.append(section)
-        current_chars += extra
-    if current:
-        groups.append(StructuredNotes(sections=tuple(current)))
-    return groups
-
-
-def _gate_compiled(
-    compiled: StructuredNotes | None,
-    baseline_notes: StructuredNotes,
-    baseline_report: NoteQualityReport | None,
-    document: str,
-    settings: Settings,
-    *,
-    mode: str,
-) -> StructuredNotes | None:
-    """Return a safe editorial answer; completeness loss is reported as partial."""
-    if compiled is None:
-        return None
-    if not settings.note_strict_grounding:
-        return compiled
-    compiled, compiled_report = gate_notes(compiled, document, strict=True, mode=mode)
-    _ = baseline_report  # retained for API compatibility; completeness is absolute, not comparative
-    # Safety remains a hard gate. Lost source facts and lower lexical/sentence
-    # coverage are measured after compile, but only downgrade the final result;
-    # the already-safe editorial artifact is not discarded on completeness alone.
-    if compiled_report.audit.fabricated or compiled_report.unsupported_claims:
-        logger.warning("compiled notes rejected: they assert source-unsupported content")
-        return None
-    if baseline_notes.quality_state != QUALITY_VERIFIED:
-        return replace(compiled, quality_state=baseline_notes.quality_state)
-    if completeness_failure(compiled_report, mode=mode) is not None:
-        return replace(compiled, quality_state=QUALITY_DEGRADED)
-    return compiled
-
-
-async def _compile_in_groups(
-    merged: StructuredNotes,
-    context: LectureContext,
-    document: str,
-    settings: Settings,
-    session: aiohttp.ClientSession,
-    *,
-    mode: str,
-    presentation: bool,
-    budget: int,
-    semaphore: asyncio.Semaphore | None = None,
-    source_locators: bool = False,
-) -> StructuredNotes:
-    """Level 1: compile whole-section groups concurrently; keep any group that fails."""
-    groups = compile_groups(merged, context, budget=budget)
-    logger.warning(
-        "compile pass grouped: merged_chars=%d budget=%d groups=%d",
-        len(json.dumps(compact_notes_payload(merged), ensure_ascii=False)),
-        budget,
-        len(groups),
-    )
-    sem = semaphore or asyncio.Semaphore(max(1, settings.note_concurrency))
-
-    async def compile_group(group: StructuredNotes) -> StructuredNotes | None:
-        async with sem:
-            return await _compile_once(
-                session, settings, context, group,
-                mode=mode, presentation=presentation, budget=budget,
-                source_locators=source_locators,
-            )
-
-    tasks = [asyncio.create_task(compile_group(group)) for group in groups]
-    try:
-        compiled_groups_list = await asyncio.gather(*tasks)
-    except BaseException:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-
-    sections: list[NoteSection] = []
-    compiled_groups = 0
-    for group, compiled in zip(groups, compiled_groups_list, strict=True):
-        if compiled is None:
-            sections.extend(group.sections)
-            continue
-        if settings.note_strict_grounding:
-            _, group_report = gate_notes(compiled, document, strict=True, mode=mode)
-            if group_report.audit.fabricated or group_report.unsupported_claims:
-                logger.warning(
-                    "compiled group rejected: it asserts source-unsupported content"
-                )
-                sections.extend(group.sections)
-                continue
-        sections.extend(compiled.sections)
-        compiled_groups += 1
-    if not compiled_groups:
-        return merged
-    assembled = replace(merged, sections=tuple(sections))
-    if not assembled.has_content:
-        return merged
-    logger.info(
-        "compile pass grouped: compiled=%d/%d sections=%d",
-        compiled_groups, len(groups), len(assembled.sections),
-    )
-    if compiled_groups < len(groups):
-        assembled = replace(assembled, quality_state=QUALITY_RECOVERED)
-    return assembled
+    children = source.bisect(unit, overlap_chars=overlap_chars)
+    if not children or depth >= MAX_CONTEXT_SPLITS:
+        raise StructuringError("بازهٔ نامعتبر در بازیابی بخش.")
+    event = SemanticRecovery(unit.topic_id, reason, unit.source_range, tuple(child.source_range for child in children))
+    recovery_events.append(event)
+    logger.info("section writer split reason=%s topic=%s range=%d:%d depth=%d", reason, unit.topic_id,
+                unit.source_range.start_offset, unit.source_range.end_offset, depth + 1)
+    outcomes = await asyncio.gather(*(_structure_piece(
+        session, settings, source, child, system_prompt=system_prompt, mode=mode, semaphore=semaphore,
+        render=render, recovery_events=recovery_events, overlap_chars=overlap_chars, depth=depth + 1, writer=writer, standalone=standalone,
+    ) for child in children), return_exceptions=True)
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+    parts = [item for item in outcomes if isinstance(item, StructuredNotes)]
+    return replace(merge_structured_notes(parts), input_ranges=tuple(span for part in parts for span in part.input_ranges),
+                   quality_state=QUALITY_RECOVERED if any(part.quality_state == QUALITY_RECOVERED for part in parts)
+                   else parts[0].quality_state)
 
 
 def _merged_chars(notes: StructuredNotes) -> int:
@@ -3910,7 +3628,7 @@ def compile_skip_reason(
 ) -> str | None:
     """Why the editorial pass will not run, or ``None`` when it will.
 
-    One predicate for two callers that must never disagree: ``_compile_pass``
+    One predicate for two callers that must never disagree: ``synthesize_booklet``
     decides whether to send the request, and the progressive-booklet callback
     decides whether a *draft* is worth delivering. When the compile is skipped
     the pass returns the merge unchanged, so a draft would be byte-identical to
@@ -3933,105 +3651,18 @@ def compile_will_run(
     mode: str,
     presentation: bool,
 ) -> bool:
-    """Whether the editorial compile will produce a different booklet."""
+    """Whether the booklet is eligible for the optional editorial pass."""
     return compile_skip_reason(notes, settings, mode=mode, presentation=presentation) is None
 
 
-async def _compile_pass(
-    merged: StructuredNotes,
-    merged_report: NoteQualityReport | None,
-    document: str,
-    context: LectureContext,
-    settings: Settings,
-    session: aiohttp.ClientSession,
-    *,
-    mode: str,
-    presentation: bool,
-    semaphore: asyncio.Semaphore | None = None,
-    source_locators: bool = False,
+async def synthesize_booklet(
+    sections: StructuredNotes | Sequence[NoteSection], plan: ContentPlan,
+    document: NormalizedDocument, router: SectionWriter,
 ) -> StructuredNotes:
-    """The editorial pass: one request when it fits, whole-section groups when not.
+    """Apply opt-in editorial edits to a deterministic booklet, not a rewrite."""
+    from .booklet_synthesis import synthesize_booklet as edit_booklet
 
-    The size-driven skip used to be silent, which made a 3-hour lecture look
-    exactly like an unedited merge. It is now logged, and the booklet is
-    compiled in groups so the pass still runs; a booklet that fits one request
-    keeps the original single-request behaviour and cost.
-    """
-    skip = compile_skip_reason(merged, settings, mode=mode, presentation=presentation)
-    if skip == "no-budget":
-        # A zero budget means the configured window cannot hold the merged
-        # booklet plus the compile prompt. Skipping silently made a
-        # misconfiguration look like a normal, unedited merge.
-        logger.warning(
-            "compile pass disabled: NOTE_CONTEXT_TOKENS leaves no room for the "
-            "merged booklet (merged_chars=%d, NOTE_MAX_OUTPUT_TOKENS=%d)",
-            _merged_chars(merged), settings.note_max_output_tokens,
-        )
-        return merged
-    if skip is not None:
-        return merged
-    merged_chars = _merged_chars(merged)
-    budget = effective_compile_max_chars(
-        settings, mode=mode, presentation=presentation
-    )
-    if budget <= 0:
-        # A zero budget means the configured window cannot hold the merged
-        # booklet plus the compile prompt. Skipping silently made a
-        # misconfiguration look like a normal, unedited merge.
-        logger.warning(
-            "compile pass disabled: NOTE_CONTEXT_TOKENS leaves no room for the "
-            "merged booklet (merged_chars=%d, NOTE_MAX_OUTPUT_TOKENS=%d)",
-            merged_chars, settings.note_max_output_tokens,
-        )
-        return merged
-    if merged_chars <= budget:
-        compiled = await _compile_once(
-            session, settings, context, merged,
-            mode=mode, presentation=presentation, budget=budget,
-            source_locators=source_locators,
-        )
-        accepted = _gate_compiled(
-            compiled, merged, merged_report, document, settings, mode=mode
-        )
-        if accepted is not None:
-            return accepted
-        logger.info("note compile outcome=RECOVERED baseline=deterministic_merge")
-        return replace(merged, quality_state=QUALITY_RECOVERED)
-
-    assembled = await _compile_in_groups(
-        merged, context, document, settings, session,
-        mode=mode, presentation=presentation, budget=budget,
-        semaphore=semaphore,
-        source_locators=source_locators,
-    )
-    accepted = _gate_compiled(
-        assembled if assembled is not merged else None,
-        merged, merged_report, document, settings, mode=mode,
-    )
-    if accepted is None:
-        logger.info("note compile outcome=RECOVERED baseline=deterministic_merge")
-        return replace(merged, quality_state=QUALITY_RECOVERED)
-    # Level 2 (the last one): a final merge of the compiled groups, only when
-    # the compile shortened the booklet enough that it now fits one request.
-    if MAX_COMPILE_LEVELS >= 2:
-        assembled_chars = len(build_compile_document(context, accepted))
-        if assembled_chars > budget:
-            logger.info(
-                "compile pass level 2 skipped: assembled_chars=%d budget=%d",
-                assembled_chars, budget,
-            )
-            return accepted
-        final = await _compile_once(
-            session, settings, context, accepted,
-            mode=mode, presentation=presentation, budget=budget,
-            source_locators=source_locators,
-        )
-        merged_final = _gate_compiled(
-            final, merged, merged_report, document, settings, mode=mode
-        )
-        if merged_final is not None:
-            return merged_final
-    return accepted
+    return await edit_booklet(sections, plan, document, router)
 
 
 #: Called with the deterministic merge before the editorial compile runs, so
@@ -4050,18 +3681,8 @@ StageCallback = Callable[[str], Awaitable[None]]
 IncompleteCallback = Callable[[str], Awaitable[None]]
 
 
-@dataclass(frozen=True, slots=True)
-class ChunkOutcome:
-    """Isolated map-stage result; one failed chunk never cancels siblings."""
-
-    index: int
-    status: str  # SUCCESS | REPAIRED | FALLBACK | FAILED
-    notes: StructuredNotes | None = None
-    error_type: str = ""
-
-
 async def _structure_booklet(
-    document: str,
+    normalized: NormalizedDocument,
     settings: Settings,
     session: aiohttp.ClientSession,
     *,
@@ -4070,23 +3691,24 @@ async def _structure_booklet(
     on_merged: MergedCallback | None = None,
     source_locators: bool = False,
     on_stage: StageCallback | None = None,
+    section_checkpoint: SectionCheckpoint | None = None,
+    on_section_checkpoint: CheckpointCallback | None = None,
 ) -> StructuredNotes:
     """Map-reduce a prepared LLM document into one structured booklet.
 
-    * one chunk → one request;
-    * several chunks → one request per chunk (concurrent, bounded) plus one
-      editorial compile request;
-    * the chunk budget comes from the model's context window
-      (:func:`effective_chunk_chars`), not from a character count alone;
-    * an oversized input is split at a safe boundary and retried (bounded), and
-      an overflowing chunk fails over to the next provider instead;
-    * a failed chunk fails the whole step (the caller delivers the raw
-      transcript, which the user already holds);
+    * the normalized plan owns topic/page/slide boundaries; only oversized
+      topics are subdivided to fit the configured route budgets;
+    * one map request per fitted unit (bounded concurrency), followed by the
+      existing deterministic merge and optional editorial pass;
+    * typed context/output exhaustion replaces only the affected range after
+      provider failover, with bounded source-preserving recovery;
+    * failed coverage recovers locally or fails the booklet instead of
+      delivering only the successful subset;
     * a failed compile falls back to the deterministic merge;
     * ``on_merged`` receives that merge before the compile starts, which is what
       lets the caller deliver a booklet while the editorial pass still runs.
     """
-    document = document.strip()
+    document = normalized.text
     if not document:
         raise StructuringError("متن ورودی خالی بود.")
     resolved_mode = resolve_note_mode(mode)
@@ -4103,327 +3725,123 @@ async def _structure_booklet(
     # locators are carried by the user message, never by this string. A prompt
     # that changed with the source kind could not be prefix-cached, and a job
     # that mixes audio and slides would pay for two different prefixes.
-    base_system = notes_system_prompt()
-    splitter = split_presentation_document if presentation else split_transcript
-    chunk_chars = effective_chunk_chars(settings, system_prompt=base_system)
-    chunks = splitter(document, chunk_chars)
-    if not chunks:
-        raise StructuringError("متن ورودی خالی بود.")
-    semaphore = _note_semaphore(settings, len(chunks))
-
-    async def finalize(result: StructuredNotes) -> StructuredNotes:
-        """Finalize the structured booklet according to the configured grounding mode.
-
-        In direct scientific mode (``note_strict_grounding=False``, the default),
-        the model's spelling/grammar polish, controlled clarifying completions,
-        English scientific terms, comparative tables, professor emphases and Q&A
-        are preserved as-is after structural validation — never scrubbed or
-        rejected by verbatim-only evidence gates.
-
-        When ``note_strict_grounding=True``, the full verbatim evidence audit,
-        completeness fill and strict final acceptance gate run unchanged.
-        """
-        if not settings.note_strict_grounding:
-            if getattr(settings, "note_completeness_fill", False):
-                result = await fill_coverage_gaps(
-                    session, settings, document, result, semaphore=semaphore,
-                )
-            preserved_quality = result.quality_state
-            result = ensure_structured_booklet(result, document)
-            if preserved_quality == QUALITY_RECOVERED:
-                result = replace(result, quality_state=QUALITY_RECOVERED)
-            if structurally_valid_booklet(result):
-                return result
-            if not getattr(settings, "note_enable_deterministic_fallback", True):
-                raise StructuringError("جزوهٔ تولیدشده ساختار لازم برای رندر نداشت.")
-            fallback = deterministic_fallback_notes(document)
-            return replace(fallback, quality_state=QUALITY_RECOVERED)
-
-        # Reject fabricated or unsupported provider prose before asking the
-        # model to fill omissions. Completeness work itself must run before the
-        # final coverage gate, even when strict early repair is enabled.
-        prefill, prefill_report = gate_notes(result, document, strict=True, mode=resolved_mode)
-        if safety_failure(prefill_report) is not None:
-            result = prefill
-        else:
-            result = prefill
-            if getattr(settings, "note_completeness_fill", False):
-                result = await fill_coverage_gaps(
-                    session, settings, document, result, semaphore=semaphore,
-                )
-        result = ensure_structured_booklet(result, document)
-        gated, report = gate_notes(result, document, strict=True, mode=resolved_mode)
-        try:
-            return enforce_final_acceptance(gated, report, mode=resolved_mode, stage="final")
-        except NoteQualityError:
-            if not getattr(settings, "note_enable_deterministic_fallback", True):
-                raise
-            fallback = deterministic_fallback_notes(document)
-            fallback, fallback_report = gate_notes(
-                fallback, document, strict=True, mode=resolved_mode
-            )
-            fallback = replace(fallback, quality_state=QUALITY_RECOVERED)
-            return enforce_final_acceptance(
-                fallback, fallback_report, mode=resolved_mode, stage="final_fallback"
-            )
-
-    # A presentation says so in the user message: its source is slides plus
-    # narration, not a transcript. The rest of the template is shared.
+    base_system = section_writer_system_prompt()
     source_header = PRESENTATION_PROMPT.rstrip("\n") if presentation else ""
+    source = SemanticSource(normalized)
+    plan = (section_checkpoint.plan if section_checkpoint is not None else None)
+    if plan is None:
+        plan = await asyncio.to_thread(plan_from_document, normalized)
+    schema = _response_schema(settings)
+    ratio = settings.llm_token_estimation_chars_per_token
 
-    def single_render(text: str) -> str:
-        """The user message of a one-part request."""
-        return build_chunk_message(text, index=1, total=1, header=source_header)
+    def fit_plan(active_plan: ContentPlan) -> list[SemanticUnit]:
+        topics = build_semantic_topics(normalized, active_plan)
+        longest = max((_section_prompt_metadata(topic, active_plan, n, strict=settings.note_strict_grounding)
+                       for n, topic in enumerate(active_plan.topics, 1)), key=len, default="")
+        metadata = build_chunk_message("", index=MAX_NOTE_CHUNKS, total=MAX_NOTE_CHUNKS,
+                                       context_block=longest, topic=" " * 120, header=source_header)
+        # The single-part form can use a slightly different label.
+        body_budget = booklet_input_budget(settings, system=base_system, user_metadata=metadata + " " * 64,
+                                           schema=schema, task="BOOKLET_GENERATION")
+        if body_budget <= 0:
+            raise StructuringError("پنجرهٔ زمینهٔ مدل پس از کسر بودجهٔ پاسخ، فضایی برای محتوای منبع ندارد.")
+        max_chars = max(1, min(settings.note_chunk_chars, int(body_budget * ratio)))
+        return source.fit(topics, lambda text: len(text) <= max_chars and
+                          estimate_tokens(text, chars_per_token=ratio) <= body_budget, max_probe_chars=max_chars)
 
-    async def finish_single(chars_used: int) -> StructuredNotes:
-        """One chunk: a single note request, then the evidence gate.
+    units = await asyncio.to_thread(fit_plan, plan)
+    if not units:
+        raise StructuringError("متن ورودی خالی بود.")
+    if 1 < len(units) <= MAX_NOTE_CHUNKS and (section_checkpoint is None or not section_checkpoint.fingerprint):
+        refined = await maybe_refine_plan(plan, normalized, settings, session)
+        if refined is not plan:
+            plan = refined
+            units = await asyncio.to_thread(fit_plan, plan)
+    input_ranges = tuple(unit.source_range for unit in units)
+    semaphore = _note_semaphore(settings, len(units))
+    writer = SectionWriter(settings, session, mode=resolved_mode, semaphore=semaphore, checkpoint=section_checkpoint,
+                           on_checkpoint=on_section_checkpoint)
+    await asyncio.to_thread(writer.bind, normalized, plan, units)
+    by_topic = {topic.id: (position, topic) for position, topic in enumerate(plan.topics, 1)}
 
-        Shared by both sizing passes so the short-lecture path cannot drift
-        between the first split and the re-split that reserves the orientation
-        context.
-        """
-        logger.info(
-            "note document sizing kind=%s chars=%d chunk_chars=%d chunks=1 context_digest=false",
-            "presentation" if presentation else "transcript",
-            len(document),
-            chars_used,
-        )
+    def sorted_failures() -> tuple[FailedSection, ...]:
+        return tuple(sorted(writer.failures, key=lambda failure: failure.source_range.start_offset))
+
+    def with_provenance(notes: StructuredNotes) -> StructuredNotes:
+        return replace(notes, input_ranges=input_ranges, failed_sections=sorted_failures(), semantic_recoveries=tuple(sorted(
+            writer.recoveries, key=lambda event: (event.original.start_offset, -event.original.end_offset, event.reason),
+        )))
+
+    async def write(index: int, unit: SemanticUnit) -> StructuredNotes:
+        position, topic = by_topic[unit.topic_id]
         try:
-            single = await _structure_piece(
-                session, settings,
-                chunks[0],
-                system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
-                presentation=presentation, render=single_render,
-            )
-        except (LLMError, StructuringError) as exc:
-            if not getattr(settings, "note_enable_deterministic_fallback", True):
-                raise
-            logger.warning(
-                "note map stage=chunk job=unknown chunk=1 outcome=FALLBACK error=%s",
-                type(exc).__name__,
-            )
-            single = deterministic_fallback_notes(document)
-        if not settings.note_strict_grounding:
-            return single
+            result = await writer.write_unit(topic, source, unit, plan, position=position, index=index,
+                                             total=len(units), header=source_header)
+            logger.info("section writer topic=%s outcome=%s", unit.topic_id, result.quality_state)
+            return result
+        except SectionGenerationError:
+            raise
+        except Exception as exc:
+            logger.warning("section writer unexpected error topic=%s type=%s", unit.topic_id, type(exc).__name__)
+            return writer.failure(source, unit, exc)
+
+    from .booklet_verification import verify_and_repair
+
+    async def finish_and_synthesize(draft: StructuredNotes, *, allow_repair: bool = True) -> StructuredNotes:
         await notify("validating")
-        try:
-            return (
-                await _audit_and_repair(
-                    single, document, settings, session,
-                    mode=resolved_mode, presentation=presentation, semaphore=semaphore,
-                    source_locators=source_locators,
-                )
-            )[0]
-        except NoteQualityError:
-            if not getattr(settings, "note_enable_deterministic_fallback", True):
-                raise
-            logger.warning("note audit outcome=RECOVERED baseline=source_preserving_fallback")
-            return deterministic_fallback_notes(document)
 
-    if len(chunks) == 1:
-        return await finalize(await finish_single(chunk_chars))
-
-    # A chunked request also carries the topic digest and the neighbour windows.
-    # Reserve their worst-case size when it fits; for a narrow model window,
-    # drop this optional orientation rather than exceed the configured context.
-    include_context = True
-    try:
-        contextual_chunk_chars = effective_chunk_chars(
-            settings, system_prompt=base_system, extra_reserve_chars=CHUNK_CONTEXT_RESERVE_CHARS
-        )
-    except StructuringError:
-        include_context = False
-        contextual_chunk_chars = chunk_chars
-    chunks = splitter(document, contextual_chunk_chars)
-    if len(chunks) > MAX_NOTE_CHUNKS:
-        raise StructuringError(
-            f"این متن به {len(chunks)} بخش تقسیم می‌شود که از سقف {MAX_NOTE_CHUNKS} "
-            "بخش بیشتر است؛ NOTE_CONTEXT_TOKENS یا NOTE_CHUNK_CHARS را افزایش دهید."
-        )
-    semaphore = _note_semaphore(settings, len(chunks))
-    if len(chunks) == 1:
-        return await finalize(await finish_single(contextual_chunk_chars))
-
-    context = build_context(chunks) if include_context else LectureContext()
-    logger.info(
-        "note document sizing kind=%s chars=%d chunk_chars=%d chunks=%d context_digest=%s",
-        "presentation" if presentation else "transcript",
-        len(document),
-        contextual_chunk_chars,
-        len(chunks),
-        include_context,
-    )
-
-    async def map_chunk(index: int, chunk: str) -> ChunkOutcome:
-        started = time.perf_counter()
-        block = context_block_for(context, chunks, index) if include_context else ""
-        topic = context.topic_for(index, len(chunks)) if include_context else ""
-
-        def render(text: str) -> str:
-            return build_chunk_message(
-                text, index=index, total=len(chunks), topic=topic,
-                context_block=block, header=source_header,
-            )
-
-        try:
-            result = await _structure_piece(
-                session, settings, chunk,
-                system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
-                presentation=presentation, render=render,
-            )
-        except (LLMError, StructuringError) as exc:
-            if getattr(settings, "note_enable_deterministic_fallback", True):
+        async def edit(baseline: StructuredNotes) -> StructuredNotes:
+            if (writer.failures or baseline.quality_state == QUALITY_RECOVERED
+                    or not any(section.section_id for section in baseline.sections)
+                    or not compile_will_run(baseline, settings, mode=resolved_mode, presentation=presentation)):
+                return baseline
+            if on_merged is not None:
                 try:
-                    fallback = deterministic_fallback_notes(chunk, section_offset=index - 1)
-                except StructuringError:
-                    fallback = None
-                if fallback is not None:
-                    logger.warning(
-                        "note map stage=chunk job=unknown chunk=%d outcome=FALLBACK error=%s latency_ms=%.0f",
-                        index, type(exc).__name__, (time.perf_counter() - started) * 1000,
-                    )
-                    return ChunkOutcome(index, "FALLBACK", fallback, type(exc).__name__)
-            logger.warning(
-                "note map stage=chunk job=unknown chunk=%d outcome=FAILED error=%s latency_ms=%.0f",
-                index, type(exc).__name__, (time.perf_counter() - started) * 1000,
-            )
-            return ChunkOutcome(index, "FAILED", None, type(exc).__name__)
-        outcome_status = "SUCCESS"
-        # Apply local, non-generative gate cleanup at the chunk boundary. This
-        # removes invalid table/tip/locator shapes before reduce without
-        # spending another provider call; prose claims remain for the one
-        # booklet-level, evidence-commanded repair pass where cross-chunk
-        # context is available. A fully safe changed chunk is observable as a
-        # REPAIRED outcome rather than being indistinguishable from a raw
-        # provider success.
-        if settings.note_strict_grounding:
-            gated_result, chunk_report = gate_notes(
-                result, chunk, strict=True, mode=resolved_mode
-            )
-            if gated_result != result:
-                result = gated_result
-                if acceptance_failure(chunk_report) is None:
-                    result = replace(result, quality_state=QUALITY_REPAIRED)
-                    outcome_status = "REPAIRED"
-        logger.info(
-            "note map stage=chunk job=unknown chunk=%d outcome=%s latency_ms=%.0f",
-            index, outcome_status, (time.perf_counter() - started) * 1000,
-        )
-        return ChunkOutcome(index, outcome_status, result)
+                    await on_merged(with_provenance(baseline))
+                except Exception:  # noqa: BLE001 - delivery is never a note failure
+                    logger.warning("progressive booklet delivery failed", exc_info=True)
+            await notify("compiling")
+            return await synthesize_booklet(with_provenance(baseline), plan, normalized, writer)
 
-    # ``return_exceptions=True`` deliberately preserves every completed map
-    # result. Cancellation is only propagated for a caller cancellation, never
-    # because one provider/chunk happened to fail.
-    tasks = [
-        asyncio.create_task(map_chunk(index, chunk))
-        for index, chunk in enumerate(chunks, start=1)
-    ]
-    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
-    chunk_outcomes: list[ChunkOutcome] = []
-    for index, outcome in enumerate(outcomes, start=1):
+        verified = await verify_and_repair(with_provenance(draft), normalized, plan, writer,
+                                           allow_repair=allow_repair and not writer.failures,
+                                           after_repair=edit if allow_repair else None)
+        return with_provenance(verified)
+
+    if len(units) == 1:
+        single = merge_structured_notes([await write(1, units[0])])
+        input_ranges = single.input_ranges
+        return await finish_and_synthesize(single)
+
+    if len(units) > MAX_NOTE_CHUNKS:
+        if not settings.note_enable_deterministic_fallback:
+            raise StructuringError(
+                f"این متن به {len(units)} بخش تقسیم می‌شود که از سقف {MAX_NOTE_CHUNKS} "
+                "درخواست جزوه بیشتر است؛ متن خام دست‌نخورده می‌ماند."
+            )
+        logger.warning("note map request cap exceeded chunks=%d outcome=source_preserving_fallback", len(units))
+        # Do not ask the model to fill or compile this budget-driven recovery.
+        # Use the same deterministic structure/evidence acceptance instead.
+        return await finish_and_synthesize(deterministic_fallback_notes(document), allow_repair=False)
+    # Gather in plan/range order. The provider semaphore limits both initial
+    # requests and recursive leaves; one failure never cancels another writer.
+    outcomes = await asyncio.gather(*(write(index, unit) for index, unit in enumerate(units, 1)),
+                                   return_exceptions=True)
+    for outcome in outcomes:
         if isinstance(outcome, asyncio.CancelledError):
             raise outcome
-        if isinstance(outcome, BaseException):
-            logger.warning(
-                "note map stage=chunk job=unknown chunk=%d outcome=FAILED error=%s",
-                index, type(outcome).__name__,
-            )
-            chunk_outcomes.append(ChunkOutcome(index, "FAILED", None, type(outcome).__name__))
-        else:
-            chunk_outcomes.append(outcome)
-    missing_chunks = [outcome.index for outcome in chunk_outcomes if outcome.notes is None]
-    chunk_notes = [outcome.notes for outcome in chunk_outcomes if outcome.notes is not None]
-    if missing_chunks:
-        # A subset of mapped chunks is not a booklet: it silently omits source
-        # material. If per-chunk recovery could not cover every input, either
-        # preserve the entire source locally or fail the booklet as a whole.
-        if getattr(settings, "note_enable_deterministic_fallback", True):
-            merged = deterministic_fallback_notes(document)
-            logger.warning(
-                "note map incomplete chunks=%d outcome=source_preserving_fallback",
-                len(missing_chunks),
-            )
-        else:
-            raise StructuringError(
-                "یک یا چند بخش از جزوه ساخته نشد؛ برای جلوگیری از تحویل جزوهٔ ناقص، "
-                "کل جزوه کنار گذاشته شد."
-            )
-    elif not chunk_notes:
-        # Defensive: the missing-chunk branch above normally catches this.
-        raise StructuringError("هیچ بخش قابل‌استفاده‌ای از جزوه ساخته نشد.")
-    else:
-        merged = merge_structured_notes(list(chunk_notes))
-        if any(outcome.status == "FALLBACK" for outcome in chunk_outcomes):
-            merged = replace(merged, quality_state=QUALITY_RECOVERED)
-        elif any(outcome.status == "REPAIRED" for outcome in chunk_outcomes):
-            merged = replace(merged, quality_state=QUALITY_REPAIRED)
-    merged_report: NoteQualityReport | None = None
-    if settings.note_strict_grounding:
-        await notify("validating")
-        try:
-            merged, merged_report = await _audit_and_repair(
-                merged, document, settings, session,
-                mode=resolved_mode, presentation=presentation, semaphore=semaphore,
-                source_locators=source_locators,
-            )
-        except NoteQualityError:
-            # Do not discard a merely incomplete draft before the bounded
-            # completeness pass gets a chance to recover its missing units.
-            # Fabrication remains a hard stop at the canonical final gate.
-            _, merged_report = gate_notes(merged, document, strict=True, mode=resolved_mode)
-            if safety_failure(merged_report) is not None:
-                if not getattr(settings, "note_enable_deterministic_fallback", True):
-                    raise
-                logger.warning("note audit outcome=RECOVERED baseline=source_preserving_fallback")
-                merged = deterministic_fallback_notes(document)
-                _, merged_report = gate_notes(merged, document, strict=True, mode=resolved_mode)
-    if on_merged is not None and compile_will_run(
-        merged, settings, mode=resolved_mode, presentation=presentation
-    ):
-        # Deliberately after the repair: the provisional booklet is the same
-        # audited content the compile starts from, never the raw merge. Skipped
-        # when the compile will not run, because the final booklet would then be
-        # this exact file.
-        try:
-            await on_merged(merged)
-        except Exception:  # noqa: BLE001 - delivery is never a note failure
-            logger.warning("progressive booklet delivery failed", exc_info=True)
-
-    if compile_will_run(
-        merged, settings, mode=resolved_mode, presentation=presentation
-    ):
-        await notify("compiling")
-    compiled = await _compile_pass(
-        merged, merged_report, document, context, settings, session,
-        mode=resolved_mode, presentation=presentation, semaphore=semaphore,
-        source_locators=source_locators,
-    )
-    compiled = await finalize(compiled)
-    if (
-        compiled is merged
-        or not settings.note_strict_grounding
-        or settings.note_quality_gate != "repair"
-    ):
-        return compiled
-    # The editorial pass replaced sections, so the complete output is audited
-    # again instead of trusting the per-group checks: acceptance is a property
-    # of the booklet that is about to be delivered.
-    _, final_report = gate_notes(
-        compiled, document, strict=True, mode=resolved_mode
-    )
-    try:
-        return enforce_final_acceptance(
-            compiled, final_report, mode=resolved_mode, stage="post_compile"
-        )
-    except NoteQualityError:
-        if not getattr(settings, "note_enable_deterministic_fallback", True):
-            raise
-        logger.warning("note post_compile outcome=RECOVERED baseline=source_preserving_fallback")
-        return deterministic_fallback_notes(document)
+        if isinstance(outcome, BaseException) and not isinstance(outcome, SectionGenerationError):
+            raise outcome
+    if any(isinstance(outcome, SectionGenerationError) for outcome in outcomes):
+        raise SectionGenerationError(sorted_failures(), writer.checkpoint)
+    pieces = [outcome for outcome in outcomes if isinstance(outcome, StructuredNotes)]
+    input_ranges = tuple(span for piece in pieces for span in piece.input_ranges)
+    merged = merge_structured_notes(pieces)
+    return await finish_and_synthesize(merged)
 
 
 async def structure_document(
-    document: str,
+    document: str | NormalizedDocument,
     settings: Settings,
     session: aiohttp.ClientSession,
     *,
@@ -4433,35 +3851,44 @@ async def structure_document(
     source_locators: bool = False,
     on_stage: StageCallback | None = None,
     on_incomplete: IncompleteCallback | None = None,
+    section_checkpoint: SectionCheckpoint | None = None,
+    on_section_checkpoint: CheckpointCallback | None = None,
 ) -> StructuredNotes:
     """Produce a booklet, then report whether it is complete.
 
-    The pipeline itself is :func:`_structure_booklet`: it maps, repairs and
-    compiles, and it rejects a booklet that asserts unsupported facts. This
-    wrapper adds the second, separate outcome: an *accepted* booklet may still
-    omit source facts that the bounded repair could not restore. That is not a
-    faithfulness failure, so it is delivered — and ``on_incomplete`` is called
-    with the reason so the job can say "incomplete" instead of "verified".
+    The retained artifact carries its verification report. A safe but
+    incomplete booklet can be delivered; strict jobs also receive a short
+    ``on_incomplete`` reason without any source text.
     """
-    notes = await _structure_booklet(
-        document, settings, session,
-        mode=mode, presentation=presentation, on_merged=on_merged,
-        source_locators=source_locators, on_stage=on_stage,
+    normalized = document if isinstance(document, NormalizedDocument) else (
+        _normalized_presentation(document) if presentation
+        else NormalizedDocument.from_source_text(document, source_type="txt")
     )
-    notes = ensure_structured_booklet(notes, document.strip())
+    notes = await _structure_booklet(
+        normalized, settings, session,
+        mode=mode, presentation=presentation, on_merged=on_merged,
+        source_locators=source_locators, on_stage=on_stage, section_checkpoint=section_checkpoint,
+        on_section_checkpoint=on_section_checkpoint,
+    )
+    notes = ensure_structured_booklet(notes, normalized.text)
     if not structurally_valid_booklet(notes):
         raise StructuringError("جزوهٔ تولیدشده ساختار لازم برای رندر نداشت.")
-    if on_incomplete is None or not settings.note_strict_grounding:
+    report = notes.verification_report
+    if on_incomplete is None or report is None or report.passed or not settings.note_strict_grounding:
         return notes
-    _, report = gate_notes(notes, document.strip(), strict=False, mode=mode)
-    reason = completeness_failure(report, mode=mode)
-    if reason is None:
-        return notes
-    if notes.quality_state == QUALITY_VERIFIED:
-        notes = replace(notes, quality_state=QUALITY_DEGRADED)
-    logger.warning(
-        "note delivered incomplete reason=%s %s", reason, report.summary()
-    )
+    codes = {issue.code for issue in report.issues}
+    recovery_codes = {"source_only_fallback", "source_node_fallback", "removed_unverified_content"}
+    if "source_only_fallback" in codes or (notes.quality_state == QUALITY_RECOVERED and codes <= recovery_codes):
+        return notes  # recovery is already reported via quality_state
+    if codes & {"missing_number", "missing_date"}:
+        reason = "missing_numbers"
+    elif "missing_term" in codes:
+        reason = "missing_terms"
+    elif "missing_topic" in codes:
+        reason = "missing_topic"
+    else:
+        reason = "verification_incomplete"
+    logger.warning("note delivered incomplete reason=%s issue_count=%d", reason, len(report.issues))
     try:
         await on_incomplete(reason)
     except Exception:  # noqa: BLE001 - reporting is never a note failure
@@ -4496,7 +3923,7 @@ def _number_from_heading(value: str) -> int:
     return int(value.translate(_SLIDE_NUMBER_TRANSLATION))
 
 
-def _slide_blocks(text: str) -> tuple[dict[int, tuple[str, str]], list[int]]:
+def _slide_blocks(text: str) -> tuple[dict[int, tuple[str, str]], list[int], str]:
     matches = list(_SLIDE_OUTLINE_RE.finditer(text))
     blocks: dict[int, tuple[str, str]] = {}
     order: list[int] = []
@@ -4507,12 +3934,13 @@ def _slide_blocks(text: str) -> tuple[dict[int, tuple[str, str]], list[int]]:
         body = text[match.end():end].strip()
         if number in blocks:
             prior_title, prior_body = blocks[number]
+            extra_title = title if prior_title and title != prior_title else ""
             title = prior_title or title
-            body = "\n\n".join(part for part in (prior_body, body) if part)
+            body = "\n\n".join(part for part in (prior_body, extra_title, body) if part)
         else:
             order.append(number)
         blocks[number] = (title, body)
-    return blocks, order
+    return blocks, order, text[:matches[0].start()].strip() if matches else text.strip()
 
 
 def _slide_narration_blocks(text: str) -> tuple[dict[int, str], str, bool]:
@@ -4523,7 +3951,8 @@ def _slide_narration_blocks(text: str) -> tuple[dict[int, str], str, bool]:
     if not matches:
         return {}, "", False
     assigned: dict[int, str] = {}
-    unassigned: list[str] = []
+    preamble = text[:matches[0].start()].strip()
+    unassigned: list[str] = [preamble] if preamble else []
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         body = text[match.end():end].strip()
@@ -4544,12 +3973,13 @@ def build_presentation_document(outline: str, transcript: str) -> str:
     unaligned provider output stays in a clearly separate section; it is never
     heuristically assigned to a slide.
     """
-    slide_blocks, slide_order = _slide_blocks(outline)
+    outline, transcript = normalize_source_text(outline), normalize_source_text(transcript)
+    slide_blocks, slide_order, outline_preamble = _slide_blocks(outline)
     narration, unassigned, has_markers = _slide_narration_blocks(transcript)
     if has_markers:
         sections: list[str] = []
-        if outline.strip() and not slide_blocks:
-            sections.append("## متن اسلایدها\n\n" + outline.strip())
+        if outline_preamble:
+            sections.append("## متن اسلایدها\n\n" + outline_preamble)
         sections.append("## متن اسلایدها و گفتار ارائه به تفکیک اسلاید")
         order = list(dict.fromkeys([*slide_order, *sorted(narration)]))
         for number in order:
@@ -4598,13 +4028,8 @@ def _continuation_prefix_for_block(block: str, max_chars: int) -> str:
     return ""
 
 
-def split_presentation_document(text: str, max_chars: int) -> list[str]:
-    """Pack complete slide blocks into chunks, splitting only an oversized slide.
-
-    This preserves slide boundaries when practical, so the note model receives
-    each slide's text beside its aligned narration instead of a generic text
-    chunk that crosses slide attribution boundaries.
-    """
+def _presentation_pieces(text: str, max_chars: int) -> list[tuple[str, str]]:
+    """Pack slide blocks as (prompt text, source body) pairs."""
     if max_chars <= 0:
         raise ValueError("max_chars must be positive")
     text = text.strip()
@@ -4612,25 +4037,25 @@ def split_presentation_document(text: str, max_chars: int) -> list[str]:
         return []
     headings = list(_PRESENTATION_BLOCK_RE.finditer(text))
     if not headings:
-        return split_transcript(text, max_chars)
+        return [(piece, piece) for piece in split_transcript(text, max_chars)]
 
     preamble = text[:headings[0].start()].strip()
     blocks = [
         text[match.start():(headings[index + 1].start() if index + 1 < len(headings) else len(text))].strip()
         for index, match in enumerate(headings)
     ]
-    chunks: list[str] = []
+    chunks: list[tuple[str, str]] = []
     if preamble:
         if blocks and len(preamble) + 2 < max_chars:
             blocks[0] = f"{preamble}\n\n{blocks[0]}"
         else:
-            chunks.extend(split_transcript(preamble, max_chars))
+            chunks.extend((part, part) for part in split_transcript(preamble, max_chars))
     current = ""
 
     def flush() -> None:
         nonlocal current
         if current.strip():
-            chunks.append(current.strip())
+            chunks.append((current.strip(), current.strip()))
         current = ""
 
     for block in blocks:
@@ -4650,18 +4075,38 @@ def split_presentation_document(text: str, max_chars: int) -> list[str]:
         for index, piece in enumerate(pieces):
             if index and prefix:
                 if len(prefix) + len(piece) <= max_chars:
-                    chunks.append(prefix + piece)
+                    chunks.append((prefix + piece, piece))
                 else:
                     for continuation in split_transcript(piece, piece_budget):
-                        chunks.append(prefix + continuation)
+                        chunks.append((prefix + continuation, continuation))
             else:
-                chunks.append(piece)
+                chunks.append((piece, piece))
     flush()
     return chunks
 
 
+def split_presentation_document(text: str, max_chars: int) -> list[str]:
+    """Pack slide blocks; continuation headings are prompt-only annotations."""
+    return [text for text, _body in _presentation_pieces(text, max_chars)]
+
+
+def _normalized_presentation(text: str) -> NormalizedDocument:
+    headings = list(_PRESENTATION_BLOCK_RE.finditer(text))
+    starts = sorted({0, *(match.start() for match in headings), len(text)})
+    blocks = []
+    for start, end in zip(starts, starts[1:], strict=False):
+        body = text[start:end]
+        marker = _SLIDE_OUTLINE_RE.match(body)
+        number = _number_from_heading(marker.group(1)) if marker is not None else None
+        blocks.append(SourceBlock(
+            "", "slide" if number is not None else "paragraph", body, start, end,
+            slide_number=number,
+        ))
+    return NormalizedDocument.from_blocks(blocks, source_type="pptx")
+
+
 async def structure_transcript(
-    text: str,
+    text: str | NormalizedDocument,
     settings: Settings,
     session: aiohttp.ClientSession,
     *,
@@ -4669,11 +4114,16 @@ async def structure_transcript(
     on_merged: MergedCallback | None = None,
     on_stage: StageCallback | None = None,
     on_incomplete: IncompleteCallback | None = None,
+    section_checkpoint: SectionCheckpoint | None = None,
+    on_section_checkpoint: CheckpointCallback | None = None,
 ) -> StructuredNotes:
     """Transcript text (the cleaned LLM document) → structured notes."""
     return await structure_document(
-        text, settings, session, mode=mode, presentation=False,
+        (text if isinstance(text, NormalizedDocument)
+         else NormalizedDocument.from_source_text(text, source_type="audio", kind="transcript")),
+        settings, session, mode=mode, presentation=False,
         on_merged=on_merged, on_stage=on_stage, on_incomplete=on_incomplete,
+        section_checkpoint=section_checkpoint, on_section_checkpoint=on_section_checkpoint,
     )
 
 
@@ -4688,6 +4138,8 @@ async def structure_presentation(
     on_merged: MergedCallback | None = None,
     on_stage: StageCallback | None = None,
     on_incomplete: IncompleteCallback | None = None,
+    section_checkpoint: SectionCheckpoint | None = None,
+    on_section_checkpoint: CheckpointCallback | None = None,
 ) -> StructuredNotes:
     """Slide outline + narration transcript → structured notes."""
     resolved_document = (
@@ -4703,5 +4155,6 @@ async def structure_presentation(
         presentation=True,
         on_merged=on_merged,
         on_stage=on_stage,
-        on_incomplete=on_incomplete,
+        on_incomplete=on_incomplete, section_checkpoint=section_checkpoint,
+        on_section_checkpoint=on_section_checkpoint,
     )

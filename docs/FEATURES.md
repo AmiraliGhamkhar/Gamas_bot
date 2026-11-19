@@ -41,9 +41,11 @@ With a note provider configured, a finished transcript also produces a Persian
 RTL booklet. Booklets, AI quizzes and AI flashcards use the same note-provider
 allowlist: AvalAI, Gemini and OpenRouter. The default chain is
 `avalai,gemini,openrouter`; task-specific priorities apply before dispatch,
-and OpenRouter is always a fallback. The optional
-editorial compile pass is off by default; bounded chunking, deterministic
-merge, split/repair and grounding gates remain enabled as configured. See
+and OpenRouter is always a fallback. The deterministic merge keeps source order,
+provenance, and distinct explanations and values. Optional edit-only synthesis
+(`NOTE_COMPILE`) is off by default. It can reorganize chapters, shorten explicit
+continuation headings, and add extractive summaries, comparisons, and study
+links without rewriting the factual body. See
 [Providers](PROVIDERS.md) for models, quotas and safe probes.
 
 - Word (`.docx`) with mixed Persian/English runs, heading styles, tables,
@@ -83,7 +85,9 @@ no page image is ever sent to a third-party recognition service.
 
 - The source card offers extracted text, full booklets, compact revision notes,
   exports, the original download and learning actions. Page/section/slide
-  locators stay attached.
+  locators stay attached. On fresh ingestion, mixed PDFs report pages with
+  no text layer. If a page raises an extraction error, the bot does not save
+  a partial extraction as a complete document.
 - Booklet generation shows the same pipeline stages as lecture notes:
   «اعتبارسنجی جزوه با متن سند» (evidence gate) and «ویرایش نهایی جزوه»
   (editorial compile) appear on the progress bar, and an accepted booklet
@@ -92,8 +96,12 @@ no page image is ever sent to a third-party recognition service.
   progress and the same final validation stage.
 - Identical uploads reuse the same user's extraction; caches are owner-scoped.
 - The code-default ceilings are `DOC_MAX_BYTES=1073741824` (1 GiB) and
-  `DOC_UNPACKED_MAX_BYTES=1073741824`, with 5 000 000 extracted characters and
-  250 000 characters per note/export source. On shared cPanel, deployment must
+  `DOC_UNPACKED_MAX_BYTES=1073741824`, with a 5 000 000-character extraction
+  safety limit and a separate 250 000-character limit for non-note exports.
+  Booklets split complete extracted text into request-sized pieces. If the
+  full booklet would need more than 200 initial map requests, it uses the
+  complete source-only fallback when enabled, rather than charging the
+  provider for a pathological request count. On shared cPanel, deployment must
   pass `python -m scripts.cpanel_preflight`: the 1 GiB default with two download
   slots needs 4.125 GiB of *free* temporary space. The documented 1 GiB cPanel
   profile uses 128 MiB document/input ceilings instead; see
