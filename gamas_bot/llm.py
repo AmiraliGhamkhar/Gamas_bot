@@ -2773,7 +2773,15 @@ async def _dispatch_across_routes(
                 2,  # reserve one bounded retry as well as the initial dispatch
             )
         except QuotaUnavailable as exc:
-            lease.release()
+            # A ledger denial is a real provider attempt: record it like any
+            # other failed dispatch so the provider's success rate and error
+            # counters reflect that the route is exhausted, instead of the
+            # provider looking idle-but-healthy.
+            METRICS.record_provider_acquire("llm", route.slug)
+            held = lease.release()
+            METRICS.record_provider_release(
+                "llm", route.slug, elapsed_seconds=held, ok=False
+            )
             quota_error = LLMTransientError(
                 "پیکربندی سهمیهٔ سرویس تکمیل است؛ مسیر پشتیبان بررسی می‌شود."
             )
@@ -2784,7 +2792,11 @@ async def _dispatch_across_routes(
             previous_failed_slug = route.slug
             continue
         except Exception as exc:
-            lease.release()
+            METRICS.record_provider_acquire("llm", route.slug)
+            held = lease.release()
+            METRICS.record_provider_release(
+                "llm", route.slug, elapsed_seconds=held, ok=False
+            )
             raise LLMTransientError("امکان رزرو امن سهمیهٔ LLM وجود نداشت.") from exc
 
         async def _reserved_call(r=route, last=is_last_route, hold=reservation):

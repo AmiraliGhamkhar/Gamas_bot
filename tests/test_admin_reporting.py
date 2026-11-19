@@ -636,6 +636,75 @@ class ProviderMetricTests(unittest.IsolatedAsyncioTestCase):
         error = stt_module.STTTransientError("x", kind="not-a-bucket")
         self.assertEqual(error.kind, "server_error")
 
+    async def test_provider_with_no_completed_attempts_has_no_success_rate(self):
+        from gamas_bot.metrics import METRICS
+
+        METRICS.record_provider_event("llm", "idle-provider", "connection_error")
+        stats = METRICS.snapshot()["providers"]["llm"]["idle-provider"]
+        self.assertEqual(stats["attempts"], 0)
+        self.assertIsNone(stats["success_rate"])
+        self.assertEqual(stats["connection_errors"], 1)
+
+    async def test_provider_error_remembers_its_timestamp(self):
+        from gamas_bot.metrics import METRICS
+
+        METRICS.record_provider_event("stt", "bench", "quota_exhausted")
+        last = METRICS.snapshot()["last_provider_error"]
+        self.assertIsNotNone(last)
+        self.assertEqual(last["layer"], "stt")
+        self.assertEqual(last["slug"], "bench")
+        self.assertEqual(last["event"], "quota_exhausted")
+        self.assertGreater(last["at"], 0)
+
+
+class RuntimeMetricsPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    """Cumulative counters survive restarts via absolute totals."""
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "metrics.db"
+        self.db = Database(self.path)
+        await self.db.connect()
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        self._tmp.cleanup()
+
+    async def test_store_and_load_round_trip(self):
+        from gamas_bot.metrics import MetricsCollector
+
+        collector = MetricsCollector()
+        collector.record_provider_event("llm", "avalai", "timeout")
+        collector.record_provider_event("llm", "avalai", "quota_exhausted")
+        collector.record_db_error()
+        totals = collector.export_totals()
+        self.assertEqual(totals["provider.llm.avalai.timeouts"], 1)
+        self.assertEqual(totals["provider.llm.avalai.quota_exhaustions"], 1)
+        self.assertEqual(totals["db_errors"], 1)
+
+        await self.db.store_runtime_metrics(totals)
+        loaded = await self.db.load_runtime_metrics()
+        self.assertEqual(loaded["provider.llm.avalai.timeouts"], 1)
+        self.assertEqual(loaded["provider.llm.avalai.quota_exhaustions"], 1)
+        self.assertEqual(loaded["db_errors"], 1)
+
+        restored = MetricsCollector()
+        restored.load_base(loaded)
+        snapshot = restored.snapshot()
+        self.assertTrue(snapshot["metrics_restored"])
+        self.assertEqual(snapshot["db_errors"], 1)
+        stats = snapshot["providers"]["llm"]["avalai"]
+        self.assertEqual(stats["timeouts"], 1)
+        self.assertEqual(stats["quota_exhaustions"], 1)
+        # A second flush stores absolute totals, not increments.
+        await self.db.store_runtime_metrics(restored.export_totals())
+        reloaded = await self.db.load_runtime_metrics()
+        self.assertEqual(reloaded["provider.llm.avalai.timeouts"], 1)
+        self.assertEqual(reloaded["db_errors"], 1)
+
+    async def test_load_is_empty_on_a_fresh_database(self):
+        self.assertEqual(await self.db.load_runtime_metrics(), {})
+
 
 class AdminScreenTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -688,6 +757,17 @@ class AdminScreenTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_callback(event)
             payloads = menu_payloads(event.edits[-1]["buttons"])
             self.assertIn(b"adm:home", payloads)
+            if section == b"ovs":
+                # The system screen is a live snapshot, not a windowed
+                # report: it carries no period selector (it used to render
+                # identical content for every period). The period only
+                # travels to the processing detail screen.
+                self.assertNotIn(b"adm:ovs:today", payloads)
+                self.assertNotIn(b"adm:ovs:all", payloads)
+                self.assertTrue(
+                    any(data.startswith(b"adm:hub:sys:proc:") for data in payloads)
+                )
+                continue
             self.assertIn(b"adm:" + section + b":today", payloads)
             self.assertIn(b"adm:" + section + b":all", payloads)
 
@@ -753,6 +833,57 @@ class AdminScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("سلامت سیستم", text)
         self.assertIn("خطاهای پایگاه‌داده", text)
         self.assertIn("آخرین پردازش موفق", text)
+
+    async def test_system_screen_shows_operator_actionable_provider_errors(self):
+        from gamas_bot.metrics import METRICS
+
+        METRICS.record_provider_event("llm", "avalai", "connection_error")
+        METRICS.record_provider_event("llm", "avalai", "quota_exhausted")
+        METRICS.record_provider_event("llm", "avalai", "auth_error")
+        event = self.press(b"adm:ovs:7d")
+        await self.bot._handle_callback(event)
+        text = event.edits[-1]["text"]
+        self.assertIn("اتصال", text)
+        self.assertIn("سهمیه", text)
+        self.assertIn("احراز هویت", text)
+        self.assertIn("آخرین خطای ارائه‌دهنده", text)
+
+    async def test_processing_screen_shows_partial_issues_in_persian(self):
+        await self.db._write(
+            "INSERT INTO submissions(user_id, kind, filename, status, error, "
+            "duration_seconds, created_at, started_at, finished_at, error_kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                USER_ID, "audio", "f.wav", "partial", "x", 600.0,
+                iso_at(timedelta(minutes=-30)), iso_at(timedelta(minutes=-29)),
+                iso_at(timedelta(minutes=-25)), "notes_quality",
+            ),
+        )
+        await self.db._write(
+            "INSERT INTO submissions(user_id, kind, filename, status, error, "
+            "duration_seconds, created_at, started_at, finished_at, error_kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                USER_ID, "audio", "f.wav", "failed", "y", 600.0,
+                iso_at(timedelta(minutes=-30)), iso_at(timedelta(minutes=-29)),
+                iso_at(timedelta(minutes=-25)), None,
+            ),
+        )
+        event = self.press(b"adm:ovp:7d")
+        await self.bot._handle_callback(event)
+        text = event.edits[-1]["text"]
+        self.assertIn("تحویل ناقص", text)
+        self.assertIn("کیفیت جزوه", text)
+        self.assertIn("طبقه‌بندی‌نشده", text)
+        self.assertNotIn("unclassified", text)
+        self.assertNotIn("اعتبار", text.split("⏱ زمان")[1].split("🚨")[0])
+
+    async def test_duration_text_is_a_duration_not_credits(self):
+        from gamas_bot.bot_admin import AdminWorkflowMixin
+
+        self.assertEqual(AdminWorkflowMixin._duration_text(300), "۵ دقیقه")
+        self.assertEqual(AdminWorkflowMixin._duration_text(90), "۱ دقیقه و ۳۰ ثانیه")
+        self.assertEqual(AdminWorkflowMixin._duration_text(None), "—")
 
 
 class QueueHealthTests(unittest.IsolatedAsyncioTestCase):

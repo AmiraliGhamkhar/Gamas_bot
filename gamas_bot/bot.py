@@ -139,6 +139,7 @@ from .intake import (
 from .jobs import JobQueue
 from .llm import complete_json
 from .media import extract_audio_track, needs_transcode, probe_media
+from .metrics import METRICS
 from .notes import structure_transcript
 from .office import OfficeError, OfficeSession
 from .presentations import load_presentation, prepare_audio
@@ -289,6 +290,20 @@ class GamasBot(
     async def run(self) -> None:
         await run_file_io(self._prepare_private_dirs)
         await self.db.connect()
+        # Restore cumulative runtime/provider counters from earlier runs so
+        # the admin health screen keeps its incident history across the
+        # frequent restarts of shared hosting. Best-effort: a missing table
+        # (fresh install) simply starts from zero.
+        try:
+            restored_totals = await self.db.load_runtime_metrics()
+        except Exception:
+            logger.warning("runtime metric restore failed", exc_info=True)
+            restored_totals = {}
+        if restored_totals:
+            try:
+                METRICS.load_base(restored_totals)
+            except Exception:
+                logger.warning("runtime metric totals could not be loaded", exc_info=True)
         await self.db.sync_plans(
             [
                 {
@@ -463,6 +478,13 @@ class GamasBot(
             self._http = None
         await self.subscription.close()
         await self.client.disconnect()
+        # Flush cumulative counters before closing the DB so the next run
+        # restores them. Absolute totals (not increments) are stored, so a
+        # crash between flushes loses at most this run's delta.
+        try:
+            await self.db.store_runtime_metrics(METRICS.export_totals())
+        except Exception:
+            logger.warning("runtime metric flush failed", exc_info=True)
         await self.db.close()
 
     def _http_session(self) -> aiohttp.ClientSession:

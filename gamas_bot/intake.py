@@ -82,6 +82,22 @@ FAILURE_KIND_LABELS_FA: dict[str, str] = {
     "capacity": "تکمیل ظرفیت صف",
     "banned": "حساب مسدود",
     "internal": "خطای داخلی",
+    # Reported when the row carries no recorded category (reserved for NULL).
+    "unclassified": "طبقه‌بندی‌نشده",
+    # Partial-delivery notices recorded against status='partial' submissions;
+    # surfaced in the processing report's partial-issue block.
+    "notes": "ساخت جزوهٔ ساختارمند",
+    "notes_quality": "کیفیت جزوه (پشتوانهٔ ناکافی)",
+    "notes_structure": "ساختار نامعتبر جزوه",
+    "notes_incomplete": "جزوهٔ ناقص تأییدشده",
+    "notes_recovered": "جزوهٔ بازیابی‌شده",
+    "notes_degraded": "جزوهٔ تنزل‌یافته",
+    "booklet_partial": "جزوهٔ ناقص",
+    "booklet_unavailable": "ذخیره نشدن فایل جزوه",
+    "booklet_render": "رندر ناقص جزوه",
+    "review_html": "ساخت جزوهٔ مرور تعاملی",
+    "review_html_storage": "ذخیرهٔ جزوهٔ تعاملی",
+    "notification": "ارسال پیام نتیجه",
 }
 
 _FAILURE_KIND_BY_STATE: dict[str, str] = {
