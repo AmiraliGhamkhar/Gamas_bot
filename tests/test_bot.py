@@ -1498,7 +1498,7 @@ class FakeCallbackEvent:
     async def answer(self, text=None, *, alert=False):
         self.answers.append((text, alert))
 
-    async def edit(self, text, buttons=None):
+    async def edit(self, text, buttons=None, **kwargs):
         self.edits.append((text, buttons))
 
     async def respond(self, text="", buttons=None, **_kwargs):
@@ -1615,7 +1615,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             text,
             "فایل درس بعدی را همین‌جا بفرستید.\n\n"
-            f"اعتبار: {await self.bot._balance_text(self.user_id)}",
+            f"اعتبار: {await self.bot._display_balance_text(self.user_id)}",
         )
 
     async def test_help_copy_is_the_one_tap_guide_followed_by_billing_contract(self):
@@ -2812,9 +2812,9 @@ class ReviewSheetDeliveryTests(BotPipelineTestCase):
         self.assertEqual(inspect_review_html(html_text.encode("utf-8")).errors, ())
         self.assertTrue(str(review["filename"]).endswith(".html"))
         self.assertEqual(review["content_type"], "text/html")
-        results = [text for text in event.replies if "پردازش تمام شد" in text]
+        results = [text for text in event.replies if texts.BOOKLET_READY in text]
         self.assertTrue(results)
-        self.assertIn(texts.DELIVERY_ROW_REVIEW_HTML, results[-1])
+        self.assertIn(texts.BOOKLET_REFERRAL_CTA, results[-1])
 
     async def test_a_failing_review_renderer_keeps_pdf_and_docx_and_says_so(self):
         event, submission, _planner = await self._completed_job_with_review(
@@ -2823,7 +2823,7 @@ class ReviewSheetDeliveryTests(BotPipelineTestCase):
         self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
         self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "docx"))
         self.assertIsNone(await self.db.binary_artifact(submission, USER_ID, "review_html"))
-        results = [text for text in event.replies if "پردازش تمام شد" in text]
+        results = [text for text in event.replies if texts.BOOKLET_READY in text]
         self.assertIn(texts.NOTICE_REVIEW_HTML.strip(), results[-1])
 
     async def test_the_stored_sheet_is_sent_as_a_text_html_document_without_regeneration(self):

@@ -19,11 +19,11 @@ import shutil
 import tempfile
 from typing import TYPE_CHECKING, Any
 
+from telethon import Button
 from telethon.tl.custom import Message
 
 from . import texts
 from .artifact_validation import validate_docx_artifact, validate_pdf_artifact
-from .billing import format_credit_duration, format_seconds_as_credits
 from .bot_deps import deps_for
 from .bot_ui import ACTIVE_LIMIT_MESSAGE
 from .db import InsufficientBalanceError, TooManyActiveJobsError
@@ -285,18 +285,9 @@ class JobPipelineMixin:
         needed = self._reserve_estimate(duration)
         unlimited = await self.db.is_unlimited(user_id)
         if not unlimited and available < needed:
-            has_duration = duration is not None and duration > 0
-            measured = (
-                "مدت فایل: " + format_credit_duration(duration)
-                if has_duration
-                else "مدت فایل نامشخص است"
-            )
             await event.reply(
-                f"💳 اعتبار شما کافی نیست.\n"
-                f"{measured} | اعتبار لازم (برآورد): {format_seconds_as_credits(needed)} "
-                f"| موجود: {format_seconds_as_credits(available)}\n"
-                f"{texts.CREDIT_ESTIMATE_NOTE}\n"
-                "برای افزایش موجودی، منوی «اعتبار» را باز کنید."
+                texts.INSUFFICIENT_CREDIT,
+                buttons=[[Button.inline(texts.BTN_WALLET, b"wallet")]],
             )
             return
         try:
@@ -362,11 +353,8 @@ class JobPipelineMixin:
             needed = self._reserve_estimate(None)
             if available < needed:
                 await event.reply(
-                    f"💳 اعتبار شما کافی نیست.\n"
-                    f"اعتبار لازم (برآورد): {format_seconds_as_credits(needed)} "
-                    f"| موجود: {format_seconds_as_credits(available)}\n"
-                    f"{texts.CREDIT_ESTIMATE_NOTE}\n"
-                    "برای افزایش موجودی، منوی «اعتبار» را باز کنید."
+                    texts.INSUFFICIENT_CREDIT,
+                    buttons=[[Button.inline(texts.BTN_WALLET, b"wallet")]],
                 )
                 return
         try:
@@ -611,13 +599,8 @@ class JobPipelineMixin:
             if progress:
                 await progress.fail(str(job.submission_id))
             await self._reply(
-                job,
-                (
-                    f"💳 اعتبار شما کافی نیست.\n"
-                    f"اعتبار لازم: {format_seconds_as_credits(exc.required_seconds)} "
-                    f"| موجود: {format_seconds_as_credits(exc.available_seconds)}\n"
-                    "برای افزایش موجودی، منوی «اعتبار» را باز کنید."
-                ),
+                job, texts.INSUFFICIENT_CREDIT,
+                buttons=[[Button.inline(texts.BTN_WALLET, b"wallet")]],
             )
         except USER_VISIBLE_ERRORS as exc:
             kind = classify_failure(job.state, exc)
@@ -1734,7 +1717,9 @@ class JobPipelineMixin:
             has_learning_item=item_id is not None,
         )
         render_incomplete = bool(job.meta.get("booklet_render_incomplete"))
-        if render_incomplete:
+        if has_booklet or has_docx:
+            body = texts.BOOKLET_SUCCESS
+        elif render_incomplete:
             header = texts.DELIVERY_READY_HEADER.format(reference=reference)
             body = body.replace(header, f"خروجی‌های در دسترس — {reference}", 1)
         # Quality notices are a suffix to the single results message: do not
@@ -1773,7 +1758,8 @@ class JobPipelineMixin:
         if progress is not None:
             if notified and not render_incomplete:
                 await progress.complete(
-                    texts.DELIVERY_READY_HEADER.format(reference=reference)
+                    texts.BOOKLET_READY if has_booklet or has_docx
+                    else texts.DELIVERY_READY_HEADER.format(reference=reference)
                 )
             else:
                 fail = getattr(progress, "fail", None)

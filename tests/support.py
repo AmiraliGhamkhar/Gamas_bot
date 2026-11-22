@@ -368,8 +368,8 @@ class FakeCallbackEvent:
     async def reply(self, *args, **kwargs):
         return await self.message.reply(*args, **kwargs)
 
-    async def edit(self, text: str = "", buttons=None):
-        self.edits.append({"text": text, "buttons": buttons})
+    async def edit(self, text: str = "", buttons=None, **kwargs):
+        self.edits.append({"text": text, "buttons": buttons, **kwargs})
         return FakeSentMessage(self.client, {"text": text})
 
 

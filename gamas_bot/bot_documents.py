@@ -283,8 +283,6 @@ class DocumentOfficeWorkflowMixin:
                 f"⚠️ {to_persian_digits(len(pages_without_text))} صفحه لایهٔ متن نداشت؛ "
                 "این صفحه‌ها از روی تصویر خوانده نشدند."
             )
-        if self.settings.office_enabled:
-            lines.append(texts.DOCUMENT_FREE_NOTICE)
         if not self.settings.note_configured:
             lines.append(texts.LEARNING_GENERATION_UNAVAILABLE)
         source_type = str(document.get("source_type") or "")
@@ -457,7 +455,7 @@ class DocumentOfficeWorkflowMixin:
             "متن را اینجا بچسبانید یا چند پیام بفرستید؛ فایل‌های .txt، .md، .markdown، .csv و .tsv هم پذیرفته می‌شوند.\n"
             f"سقف هر سند {to_persian_digits(self.settings.office_max_chars)} نویسه است.\n"
             "پس از پایان، قالب Word، Excel، PowerPoint یا PDF را انتخاب کنید. "
-            "هر خروجی جداگانه قابل ساخت است؛ از اعتبار حساب شما کم نمی‌شود، اما سقف ورودی و ظرفیت پردازش اعمال می‌شود.",
+            "هر خروجی جداگانه قابل ساخت است؛ سقف ورودی و ظرفیت پردازش اعمال می‌شود.",
             self._office_session_keyboard(),
         )
 
@@ -986,11 +984,15 @@ class DocumentOfficeWorkflowMixin:
             resolved_success = (
                 success_text(outputs) if callable(success_text) else success_text
             )
-            await self._edit(  # type: ignore[attr-defined]
-                event,
-                completed_progress_text(resolved_success, headline="✅ فایل آماده شد"),
-                buttons,
-            )
+            if library_kind == "booklet":
+                completion_buttons = [*buttons, [Button.inline(texts.BTN_REFERRALS, b"ref:result")]]
+                await self._edit(event, resolved_success, completion_buttons)  # type: ignore[attr-defined]
+            else:
+                await self._edit(  # type: ignore[attr-defined]
+                    event,
+                    completed_progress_text(resolved_success, headline="✅ فایل آماده شد"),
+                    buttons,
+                )
         except (OfficeError, StructuringError) as exc:
             await self._edit(  # type: ignore[attr-defined]
                 event,
@@ -1097,7 +1099,7 @@ class DocumentOfficeWorkflowMixin:
             event,
             "قالب خروجی را از متن استخراج‌شده انتخاب کنید. فایل اصلی دست‌نخورده می‌ماند.\n"
             "PowerPoint تازه‌ای از متن ساخته می‌شود و تبدیل پیکسلی/ظاهری ارائهٔ اصلی نیست.\n"
-            "همهٔ عملیات رایگان‌اند و از اعتبار کم نمی‌کنند.",
+            "خروجی مورد نظر را انتخاب کنید.",
             self._document_export_keyboard(document_id),
         )
 
@@ -1422,18 +1424,9 @@ class DocumentOfficeWorkflowMixin:
             return outputs
 
         def _success_text(_outputs: list[Any]) -> str:
-            text = (
-                f"✅ {mode_label} ساخته شد و فایل‌های آن در کتابخانه ذخیره شدند.\n"
-                "برچسب‌های صفحه/اسلاید از سند استخراج‌شده حفظ شده‌اند؛ فایل اصلی هم همچنان قابل دریافت است."
-            )
+            text = texts.BOOKLET_SUCCESS
             if note_incomplete.get("reason"):
-                # Same honesty contract as the lecture pipeline: an accepted
-                # booklet whose coverage is imperfect is delivered, but the
-                # completion screen says so instead of claiming «verified».
-                text += (
-                    "\nℹ️ اعتبارسنجی نهایی: پوشش برخی جزئیات منبع در جزوه کامل تأیید نشد؛ "
-                    "متن کامل سند از «📥 دریافت فایل اصلی» در دسترس است."
-                )
+                text += "\n\nℹ️ پوشش برخی جزئیات منبع تأیید نشد؛ متن اصلی را نیز بررسی کنید."
             return text
 
         await self._office_run_operation(
@@ -2040,7 +2033,7 @@ class DocumentOfficeWorkflowMixin:
             return outputs
 
         def success_text(_outputs: list[Any]) -> str:
-            message = "✅ فایل‌های جزوه ساخته شدند و در کتابخانه ذخیره شدند."
+            message = texts.BOOKLET_SUCCESS
             if verification_incomplete:
                 message += "\nℹ️ پوشش همهٔ جزئیات منبع در اعتبارسنجی نهایی تأیید نشد."
             return message

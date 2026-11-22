@@ -325,6 +325,15 @@ def format_credit_duration(seconds: int | float | None) -> str:
     return f"{format_duration(seconds)} ≈ {format_seconds_as_credits(seconds)}"
 
 
+def round_display_credits(credits: int) -> int:
+    """Round down to one significant digit for non-authoritative plan labels."""
+    value = max(0, int(credits))
+    if value < 10:
+        return value
+    step = 10 ** (len(str(value)) - 1)
+    return value // step * step
+
+
 def format_credits_number(credits: int | float | None) -> str:
     """The bare grouped credit number, in Persian digits, without the unit.
 

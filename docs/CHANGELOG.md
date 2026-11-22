@@ -4,6 +4,13 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Booklet completion and wallet display.** Successful booklets show a short
+completion message and an invite button without replacing the result. Partial
+results retain important warnings. Wallet summaries round credit down for display;
+exact plan credits and balances remain available in wallet details. Hours, prices
+and payment processing are unchanged. Stored list prices are struck through only
+when a real discount exists.
+
 **Admin system health and provider accounting.** Elapsed times use duration units,
 unknown/partial-delivery errors have Persian labels, and partial issues are
 reported separately from failed jobs. The live system screen no longer offers a

@@ -109,9 +109,9 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         buy = await self.press(USER, "wallet")
         screen = buy.edits[-1][0]
         self.assertIn("۱۰۰٬۰۰۰ اعتبار (۳ ساعت)", screen)
-        self.assertIn("قیمت اصلی: ۱۶۰٬۰۰۰ تومان | قیمت نهایی: ۷۹٬۰۰۰ تومان", screen)
-        self.assertIn("۸۶۶٬۶۶۷ اعتبار (۲۶ ساعت)", screen)
-        self.assertIn("قیمت اصلی: ۴۶۰٬۰۰۰ تومان | قیمت نهایی: ۲۲۹٬۰۰۰ تومان", screen)
+        self.assertIn("قیمت قبلی: <s>۱۶۰٬۰۰۰ تومان</s>\nبا تخفیف\n<b>قیمت نهایی: ۷۹٬۰۰۰ تومان</b>", screen)
+        self.assertIn("۸۰۰٬۰۰۰ اعتبار (۲۶ ساعت)", screen)
+        self.assertIn("قیمت قبلی: <s>۴۶۰٬۰۰۰ تومان</s>\nبا تخفیف\n<b>قیمت نهایی: ۲۲۹٬۰۰۰ تومان</b>", screen)
         self.assertIn("هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت", screen)
 
         plan_tap = await self.press(USER, f"plan:{PLAN_30_CODE}")
@@ -420,7 +420,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.library_list(USER, limit=6), [])
         source = await self.db.library_submission_source_item(USER, job.submission_id)
         self.assertIsNotNone(source)
-        results = [reply for reply in event.replies if "پردازش تمام شد" in reply]
+        results = [reply for reply in event.replies if "جزوه شما آماده است" in reply]
         self.assertEqual(len(results), 1)
         self.assertEqual((await self.db.submission(job.submission_id)).status, "done")
 

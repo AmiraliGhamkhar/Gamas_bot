@@ -94,8 +94,8 @@ class MainAndHelpCopyTests(unittest.TestCase):
         lines = [line for line in text.splitlines() if line.strip()]
         self.assertTrue(text.startswith("ℹ️ راهنمای گاماس\n\n"))
         self.assertLessEqual(len(lines), 15)
-        self.assertIn("اعتباری کم نمی‌شود", text)
-        self.assertIn("خطای ساخت جزوه", text)
+        self.assertNotIn("اعتباری کم نمی‌شود", text)
+        self.assertNotIn("خطای ساخت جزوه", text)
         self.assertIn(texts.OFFICE_CREDIT_NOTICE, text)
         self.assertIn("سقف ورودی و محدودیت ظرفیت", text)
         self.assertIn("صدای PowerPoint خودکار پردازش نمی‌شود", text)
@@ -108,7 +108,7 @@ class MainAndHelpCopyTests(unittest.TestCase):
         self.assertIn("فعلاً فعال نیست", text)
         self.assertNotIn("نخستین آزمون", text)
         self.assertNotIn("ساخت آزمون و فلش‌کارت هوش مصنوعی اعتبار کم می‌کند", text)
-        self.assertIn("اعتباری کم نمی‌شود", text)
+        self.assertNotIn("اعتباری کم نمی‌شود", text)
 
     def test_results_empty_copy_reflects_raw_only_deployment(self):
         text = texts.results_hub_empty(notes_configured=False)

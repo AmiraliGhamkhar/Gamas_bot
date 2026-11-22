@@ -54,7 +54,7 @@ class ReferralWorkflowMixin:
         elif status == "duplicate":
             await event.reply(texts.REFERRALS_DUPLICATE)
 
-    async def _show_referrals(self, event: Any, user_id: int) -> None:
+    async def _show_referrals(self, event: Any, user_id: int, *, new_message: bool = False) -> None:
         await self.db.ensure_user(user_id)
         code = await self.db.ensure_referral_code(user_id)
         summary = await self.db.referral_summary(user_id)
@@ -90,9 +90,16 @@ class ReferralWorkflowMixin:
         if link:
             buttons.append([Button.url(texts.BTN_SHARE_INVITE, _share_url(link))])
         buttons.append([Button.inline(texts.BTN_BACK_MAIN, b"menu:main")])
-        await self._edit_or_reply(  # type: ignore[attr-defined]
-            event, "\n".join(lines), buttons
-        )
+        if new_message:
+            try:
+                await event.respond("\n".join(lines), buttons=buttons)
+            except Exception:
+                logger.warning("referral screen with buttons could not be sent", exc_info=True)
+                await event.respond("\n".join(lines))
+        else:
+            await self._edit_or_reply(  # type: ignore[attr-defined]
+                event, "\n".join(lines), buttons
+            )
 
     async def _show_admin_referrals(self, event: Any) -> None:
         totals = await self.db.referral_totals()
