@@ -37,7 +37,12 @@ def test_approved_default_models_and_operational_budgets():
     assert settings.llm_primary_max_in_flight == 3
     assert settings.llm_fallback_max_in_flight == 1
     assert settings.note_hedge_after == 0
-    assert (settings.note_context_tokens, settings.note_chunk_chars, settings.note_max_output_tokens) == (131072, 64000, 16384)
+    assert (
+        settings.note_context_tokens,
+        settings.note_chunk_chars,
+        settings.note_pack_target_chars,
+        settings.note_max_output_tokens,
+    ) == (262144, 64000, 20000, 65536)
     assert not settings.note_compile
 
 

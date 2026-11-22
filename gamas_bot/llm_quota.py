@@ -32,6 +32,7 @@ class Reservation:
     provider: str
     db_path: str
     reserved_tokens: int
+    attempts: int = 1
 
 
 def estimate_tokens(text: str, *, chars_per_token: float = 1.5) -> int:
@@ -127,10 +128,14 @@ def reserve(
             "SELECT COALESCE(SUM(reserved_tokens),0) FROM llm_quota_reservations WHERE provider=? AND expires >= ?",
             (provider, now),
         ).fetchone()[0]
-        if budget.rpm and requests_minute + attempts > budget.rpm:
+        if budget.rpm and requests_minute + 1 > budget.rpm:
             raise QuotaUnavailable(f"{provider} RPM budget exhausted")
-        if budget.rpd and requests_day + attempts > budget.rpd:
+        if budget.rpd and requests_day + 1 > budget.rpd:
             raise QuotaUnavailable(f"{provider} daily request budget exhausted")
+        if budget.rpm:
+            attempts = min(attempts, budget.rpm - requests_minute)
+        if budget.rpd:
+            attempts = min(attempts, budget.rpd - requests_day)
         if budget.tpm and used_tokens + held_tokens + tokens > budget.tpm:
             raise QuotaUnavailable(f"{provider} TPM budget exhausted")
         if budget.max_in_flight and inflight >= budget.max_in_flight:
@@ -153,10 +158,76 @@ def reserve(
                 (token if attempt_index == 0 else f"{token}:{attempt_index}", provider, now, 0, 0),
             )
         conn.commit()
-        return Reservation(token, provider, db_path, tokens)
+        return Reservation(token, provider, db_path, tokens, attempts)
     except BaseException:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+def retry_after_seconds(
+    db_path: str,
+    provider: str,
+    budget: ProviderBudget,
+    *,
+    tokens: int = 1,
+    attempts: int = 1,
+) -> float | None:
+    """Seconds until an RPM/TPM minute-window denial can clear, or ``None``.
+
+    Returns ``None`` for daily-cap (RPD) or open-circuit denials where waiting
+    a few seconds cannot help.
+    """
+    now = time.time()
+    tokens = max(1, int(tokens))
+    attempts = max(1, min(4, int(attempts)))
+    conn = _connect(db_path)
+    try:
+        circuit = conn.execute(
+            "SELECT open_until FROM llm_quota_circuit WHERE provider=?",
+            (provider,),
+        ).fetchone()
+        if circuit and circuit[0] > now:
+            return None
+        if budget.rpd:
+            requests_day = conn.execute(
+                "SELECT COUNT(*) FROM llm_quota_requests WHERE provider=? AND started >= ?",
+                (provider, now - 86400),
+            ).fetchone()[0]
+            if requests_day + 1 > budget.rpd:
+                return None
+        waits: list[float] = []
+        if budget.rpm:
+            rows = conn.execute(
+                "SELECT started FROM llm_quota_requests WHERE provider=? AND started >= ? "
+                "ORDER BY started ASC",
+                (provider, now - 60),
+            ).fetchall()
+            excess = len(rows) + 1 - budget.rpm
+            if excess > 0 and len(rows) >= excess:
+                waits.append(max(0.05, (rows[excess - 1][0] + 60.0) - now))
+        if budget.tpm:
+            rows = conn.execute(
+                "SELECT started, tokens FROM llm_quota_requests WHERE provider=? AND started >= ? "
+                "ORDER BY started ASC",
+                (provider, now - 60),
+            ).fetchall()
+            held_tokens = conn.execute(
+                "SELECT COALESCE(SUM(reserved_tokens),0) FROM llm_quota_reservations "
+                "WHERE provider=? AND expires >= ?",
+                (provider, now),
+            ).fetchone()[0]
+            used_tokens = sum(row[1] for row in rows)
+            deficit = used_tokens + held_tokens + tokens - budget.tpm
+            if deficit > 0 and rows:
+                freed = 0
+                for started, row_tokens in rows:
+                    freed += row_tokens
+                    if freed >= deficit:
+                        waits.append(max(0.05, (started + 60.0) - now))
+                        break
+        return max(waits) if waits else None
     finally:
         conn.close()
 
@@ -167,6 +238,7 @@ def finish(
     actual_tokens: int | None,
     succeeded: bool,
     circuit_failure: bool | None = None,
+    attempts_used: int | None = None,
 ) -> None:
     conn = _connect(reservation.db_path)
     try:
@@ -182,6 +254,13 @@ def finish(
             "UPDATE llm_quota_requests SET tokens=?, succeeded=? WHERE token=?",
             (charged, int(succeeded), reservation.token),
         )
+        if attempts_used is not None and reservation.attempts > 1:
+            used = max(1, min(reservation.attempts, int(attempts_used)))
+            for unused_index in range(used, reservation.attempts):
+                conn.execute(
+                    "DELETE FROM llm_quota_requests WHERE token=?",
+                    (f"{reservation.token}:{unused_index}",),
+                )
         now = time.time()
         failed_health_check = (not succeeded) if circuit_failure is None else circuit_failure
         health_success = not failed_health_check

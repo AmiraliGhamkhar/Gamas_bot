@@ -18,6 +18,78 @@ class SemanticUnit:
     source_range: SourceRange
     # Optional orientation, never part of this unit's evidence or coverage.
     preceding_context: SourceRange | None = None
+    # Ordered topic IDs/titles when consecutive small topics are packed into
+    # one provider request. Empty tuple means a single topic (topic_id/title).
+    packed_topic_ids: tuple[str, ...] = ()
+    packed_titles: tuple[str, ...] = ()
+
+    @property
+    def covered_topic_ids(self) -> tuple[str, ...]:
+        return self.packed_topic_ids or (self.topic_id,)
+
+    @property
+    def covered_titles(self) -> tuple[str, ...]:
+        return self.packed_titles or (self.title,)
+
+
+def pack_semantic_units(
+    source: SemanticSource,
+    units: Sequence[SemanticUnit],
+    *,
+    target_chars: int,
+    fits: Callable[[str], bool] | None = None,
+) -> list[SemanticUnit]:
+    """Pack consecutive small units in source order up to ``target_chars``.
+
+    Preserves exact contiguous source offsets and every ``source_block_id``
+    while keeping the request count bounded (typically 1–3 calls for sources up
+    to ~50k chars instead of one request per page, slide, or short topic).
+    """
+    if target_chars <= 0 or len(units) <= 1:
+        return list(units)
+
+    def flush(group: list[SemanticUnit]) -> SemanticUnit:
+        if len(group) == 1:
+            return group[0]
+        first, last = group[0], group[-1]
+        block_ids = tuple(
+            dict.fromkeys(bid for unit in group for bid in unit.source_range.block_ids)
+        )
+        topic_ids = tuple(
+            dict.fromkeys(tid for unit in group for tid in unit.covered_topic_ids)
+        )
+        titles = tuple(
+            dict.fromkeys(title for unit in group for title in unit.covered_titles)
+        )
+        return SemanticUnit(
+            topic_id=first.topic_id,
+            title=first.title,
+            parent_id=first.parent_id,
+            source_range=SourceRange(
+                first.source_range.start_offset,
+                last.source_range.end_offset,
+                block_ids,
+            ),
+            preceding_context=first.preceding_context,
+            packed_topic_ids=topic_ids if len(topic_ids) > 1 else (),
+            packed_titles=titles if len(topic_ids) > 1 else (),
+        )
+
+    packed: list[SemanticUnit] = []
+    group: list[SemanticUnit] = [units[0]]
+    for unit in units[1:]:
+        start = group[0].source_range.start_offset
+        prev_end = group[-1].source_range.end_offset
+        end = unit.source_range.end_offset
+        contiguous = unit.source_range.start_offset == prev_end
+        within_target = end - start <= target_chars
+        if contiguous and within_target and (fits is None or fits(source.text[start:end])):
+            group.append(unit)
+        else:
+            packed.append(flush(group))
+            group = [unit]
+    packed.append(flush(group))
+    return packed
 
 
 @dataclass(frozen=True, slots=True)

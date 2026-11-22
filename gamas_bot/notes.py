@@ -75,7 +75,7 @@ from ._prompt_block import (  # noqa: F401  (re-exported public prompt surface)
     synthesis_system_prompt,
 )
 
-from .config import Settings, resolve_note_mode
+from .config import Settings, note_routes, resolve_note_mode
 from .llm import (
     LLMContextOverflowError,
     LLMError,
@@ -83,6 +83,7 @@ from .llm import (
     booklet_input_budget,
     complete_json,
 )
+from .llm_profiles import get_provider_profile, task_output_tokens
 from .llm_quota import estimate_tokens
 from .note_planning import maybe_refine_plan
 from .notes_evidence import (
@@ -107,7 +108,13 @@ from .notes_evidence import (
     validate_tip,
 )
 from .progress import to_persian_digits
-from .semantic_segments import SemanticRecovery, SemanticSource, SemanticUnit, build_semantic_topics
+from .semantic_segments import (
+    SemanticRecovery,
+    SemanticSource,
+    SemanticUnit,
+    build_semantic_topics,
+    pack_semantic_units,
+)
 from .textnorm import normalize_for_compare
 from .transcript import split_transcript
 
@@ -182,8 +189,8 @@ COMPILE_HARD_MAX_CHARS = 160000
 #: NEIGHBOUR_CONTEXT_CHARS)
 
 #: How many times one oversized request may be halved before the step gives up
-#: (1 → 2 → 4 requests, each cut at a paragraph/sentence boundary).
-MAX_CONTEXT_SPLITS = 2
+#: (1 → 2 → 4 → 8 → 16 requests, each cut at a paragraph/sentence boundary).
+MAX_CONTEXT_SPLITS = 4
 #: Bound paid map work per booklet. Above this, recover from the complete
 #: source locally (or fail explicitly if deterministic fallback is disabled).
 MAX_NOTE_CHUNKS = 200
@@ -1349,10 +1356,25 @@ def _merge_table_group(
     return (combined[0], tuple(combined[1:])) if combined else (None, ())
 
 
+_SPLIT_SECTION_ID = re.compile(r"^([^:]+):(\d{1,12}):(\d{1,12}):(\d+)$")
+
+
 def _combine_sections(first: NoteSection, second: NoteSection) -> NoteSection:
     table, tables = _merge_table_group(first.all_tables + second.all_tables)
+    section_id = first.section_id
+    m1 = _SPLIT_SECTION_ID.fullmatch(first.section_id)
+    m2 = _SPLIT_SECTION_ID.fullmatch(second.section_id)
+    if (
+        m1 is not None
+        and m2 is not None
+        and m1[1] == m2[1]
+        and m1[1] == first.topic_id
+        and int(m1[3]) == int(m2[2])
+    ):
+        section_id = f"{first.topic_id}:{m1[2]}:{m2[3]}:{m1[4]}"
     return replace(
         first,
+        section_id=section_id,
         paragraphs=_dedupe_by_key(first.paragraphs + second.paragraphs, _literal_key),
         bullets=_dedupe_by_key(first.bullets + second.bullets, _literal_key),
         definitions=_dedupe_definitions(first.definitions + second.definitions),
@@ -1379,9 +1401,19 @@ def _literal_continuation_title(text: str) -> str:
 
 
 def _same_logical_section(first: NoteSection, second: NoteSection) -> bool:
-    if (first.section_id != second.section_id or first.topic_id != second.topic_id
-            or first.parent_topic_id != second.parent_topic_id):
+    if first.topic_id != second.topic_id or first.parent_topic_id != second.parent_topic_id:
         return False
+    if first.section_id != second.section_id:
+        m1 = _SPLIT_SECTION_ID.fullmatch(first.section_id)
+        m2 = _SPLIT_SECTION_ID.fullmatch(second.section_id)
+        if not (
+            first.topic_id
+            and m1 is not None
+            and m2 is not None
+            and m1[1] == m2[1] == first.topic_id
+            and int(m1[3]) <= int(m2[2])
+        ):
+            return False
     if first.steps and second.steps and first.steps != second.steps:
         return False  # do not turn separate procedures into one sequence
     if len(set(first.source_locators + second.source_locators)) > MAX_SOURCE_LOCATORS_PER_SECTION:
@@ -3149,10 +3181,16 @@ def deterministic_fallback_notes(
     pending: list[str] = []
     pending_chars = 0
     current_heading = ""
+    deferred_heading = ""
 
     def flush() -> None:
-        nonlocal pending, pending_chars, current_heading
+        nonlocal pending, pending_chars, current_heading, deferred_heading
+        if not pending and deferred_heading:
+            pending.append(deferred_heading)
+            deferred_heading = ""
         if not pending:
+            current_heading = ""
+            deferred_heading = ""
             return
         number = section_offset + len(sections) + 1
         heading = current_heading or f"بخش {to_persian_digits(number)}"
@@ -3169,16 +3207,23 @@ def deterministic_fallback_notes(
         pending = []
         pending_chars = 0
         current_heading = ""
+        deferred_heading = ""
 
     for paragraph in paragraphs:
         match = _FALLBACK_HEADING.match(paragraph)
         paragraph_heading = match.group(1).strip() if match else ""
-        # Keep a real Markdown heading as both a deterministic heading and in
-        # the source text when it has no following content.
-        if paragraph_heading and pending:
+        # Use a real Markdown heading as the section title without duplicating
+        # raw ``##`` markup inside body paragraphs when body content follows.
+        if paragraph_heading and (pending or deferred_heading):
             flush()
         if paragraph_heading:
             current_heading = paragraph_heading
+            remainder = paragraph[match.end():].strip() if match else ""
+            if not remainder:
+                deferred_heading = paragraph_heading
+                continue
+            paragraph = remainder
+        deferred_heading = ""
         if pending and pending_chars + len(paragraph) + 2 > MAX_TEXT_CHARS:
             flush()
         pending.append(paragraph)
@@ -3420,17 +3465,39 @@ def _section_provenance(notes: StructuredNotes, source: SemanticSource, unit: Se
     ) for index, section in enumerate(notes.sections, 1)))
 
 
-def _section_prompt_metadata(topic: PlannedTopic, plan: ContentPlan, position: int, *, strict: bool) -> str:
+def _section_prompt_metadata(
+    topic: PlannedTopic,
+    plan: ContentPlan,
+    position: int,
+    *,
+    strict: bool,
+    packed_topics: Sequence[PlannedTopic] = (),
+) -> str:
     # The plan projection is deliberately structural. No other topic's prose,
     # examples, numbers, or source text is included in this writer's request.
-    return "موضوع و طرح (فقط ساختار): " + json.dumps({
+    payload: dict[str, object] = {
         "topic": {"id": topic.id, "title": topic.title, "parent_id": topic.parent_id,
                   "dimensions_if_evidenced": topic.required_dimensions},
         "plan": {"position": position, "topic_count": len(plan.topics),
                  "previous_id": plan.topics[position - 2].id if position > 1 else None,
                  "next_id": plan.topics[position].id if position < len(plan.topics) else None},
         "strict_grounding": strict,
-    }, ensure_ascii=False, separators=(",", ":"))
+    }
+    if len(packed_topics) > 1:
+        compact_packed: list[dict[str, object]] = []
+        budget_chars = 3200
+        used_chars = 0
+        for item in packed_topics:
+            entry: dict[str, object] = {"id": item.id, "title": item.title[:100]}
+            if item.parent_id:
+                entry["parent_id"] = item.parent_id
+            entry_len = len(item.id) + len(item.title[:100]) + 32
+            if used_chars + entry_len > budget_chars and compact_packed:
+                break
+            compact_packed.append(entry)
+            used_chars += entry_len
+        payload["packed_topics"] = compact_packed
+    return "موضوع و طرح (فقط ساختار): " + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 class SectionWriter:
@@ -3480,7 +3547,7 @@ class SectionWriter:
         recovered: StructuredNotes | None = None
         if self.settings.note_enable_deterministic_fallback:
             try:
-                recovered = deterministic_fallback_notes(source.body(unit))
+                recovered = deterministic_fallback_notes(source.body(unit), title=unit.title)
             except StructuringError:
                 pass
         failure = FailedSection(unit.topic_id, unit.source_range, type(exc).__name__, recovered is not None)
@@ -3490,19 +3557,39 @@ class SectionWriter:
                        "FALLBACK" if recovered is not None else "FAILED", failure.error_type)
         if recovered is None:
             raise SectionGenerationError((failure,), self.checkpoint) from exc
+        if unit.title and recovered.sections and recovered.sections[0].heading.startswith("بخش "):
+            recovered = replace(
+                recovered,
+                sections=(replace(recovered.sections[0], heading=unit.title), *recovered.sections[1:]),
+            )
         return _section_provenance(recovered, source, unit)
 
     async def write_unit(
         self, topic: PlannedTopic, source: SemanticSource, unit: SemanticUnit, plan: ContentPlan,
         *, position: int, index: int, total: int, header: str = "", standalone: bool = False,
     ) -> StructuredNotes:
-        metadata = _section_prompt_metadata(topic, plan, position, strict=self.settings.note_strict_grounding)
+        by_id = {item.id: item for item in plan.topics}
 
         def render(part: SemanticUnit) -> str:
             body = source.body(part)
+            part_blocks = set(part.source_range.block_ids)
+            packed_topics = tuple(
+                by_id[tid]
+                for tid in part.covered_topic_ids
+                if tid in by_id and (not part_blocks or (set(by_id[tid].source_block_ids) & part_blocks))
+            )
+            part_topic = packed_topics[0] if packed_topics else topic
+            part_position = plan.topics.index(part_topic) + 1 if part_topic in plan.topics else position
+            metadata = _section_prompt_metadata(
+                part_topic,
+                plan,
+                part_position,
+                strict=self.settings.note_strict_grounding,
+                packed_topics=packed_topics if len(packed_topics) > 1 else (),
+            )
             if total == 1:
                 return build_chunk_message(body, index=1, total=1, header=(header or SINGLE_CHUNK_HEADER) + "\n" + metadata)
-            return build_chunk_message(body, index=index, total=total, topic=topic.title,
+            return build_chunk_message(body, index=index, total=total, topic=part_topic.title,
                                        context_block=metadata, header=header)
 
         try:
@@ -3586,12 +3673,19 @@ async def _structure_piece(
     reason = checkpoint.split_reasons.get(key) if checkpoint is not None else None
     if reason is None:
         try:
+            validated_notes: StructuredNotes | None = None
+
+            def validate_booklet_payload(candidate: dict) -> None:
+                nonlocal validated_notes
+                validated_notes = _load_json_payload(candidate, mode=mode)
+
             async with semaphore:
                 payload = await complete_json(
                     session, settings, system=system_prompt, user=render(unit),
                     schema=_response_schema(settings), task="BOOKLET_GENERATION", adaptive_capacity=True,
+                    validate_payload=validate_booklet_payload,
                 )
-            notes = _load_json_payload(payload, mode=mode)
+            notes = validated_notes if validated_notes is not None else _load_json_payload(payload, mode=mode)
             if standalone and settings.note_strict_grounding:
                 notes, report = gate_notes(notes, source.body(unit), strict=True, mode=mode)
                 if (issue := safety_failure(report)) or not notes.sections:
@@ -3612,7 +3706,12 @@ async def _structure_piece(
                 await writer.save_checkpoint()
             return _section_provenance(notes, source, unit)
         except (LLMContextOverflowError, LLMOutputBudgetError) as exc:
-            if depth >= MAX_CONTEXT_SPLITS or unit.source_range.end_offset - unit.source_range.start_offset < 2:
+            tentative = source.bisect(unit, overlap_chars=overlap_chars) if depth < MAX_CONTEXT_SPLITS else ()
+            can_split = bool(tentative) and all(
+                is_usable_transcript(instructional_source_text(source.body(child)))
+                for child in tentative
+            )
+            if not can_split:
                 if writer is not None:
                     return writer.failure(source, unit, exc)
                 raise
@@ -3765,20 +3864,45 @@ async def _structure_booklet(
     schema = _response_schema(settings)
     ratio = settings.llm_token_estimation_chars_per_token
 
+    def _effective_pack_target(max_chars: int) -> int:
+        configured = int(getattr(settings, "note_pack_target_chars", 0) or 0)
+        if configured <= 0:
+            return 0
+        requested_output = task_output_tokens(settings, "BOOKLET_GENERATION")
+        routes = note_routes(settings)
+        if routes:
+            min_output = min(
+                get_provider_profile(route.slug).clamp_output_tokens(route, requested_output, settings)
+                for route in routes
+            )
+        else:
+            min_output = requested_output
+        output_safe_chars = max(1, int(min_output * ratio * 0.65))
+        return max(1, min(configured, output_safe_chars, max_chars))
+
     def fit_plan(active_plan: ContentPlan) -> list[SemanticUnit]:
         topics = build_semantic_topics(normalized, active_plan)
         longest = max((_section_prompt_metadata(topic, active_plan, n, strict=settings.note_strict_grounding)
                        for n, topic in enumerate(active_plan.topics, 1)), key=len, default="")
+        pack_reserve = " " * 3200 if int(getattr(settings, "note_pack_target_chars", 0) or 0) > 0 and len(topics) > 1 else ""
         metadata = build_chunk_message("", index=MAX_NOTE_CHUNKS, total=MAX_NOTE_CHUNKS,
-                                       context_block=longest, topic=" " * 120, header=source_header)
+                                       context_block=longest + pack_reserve, topic=" " * 120, header=source_header)
         # The single-part form can use a slightly different label.
         body_budget = booklet_input_budget(settings, system=base_system, user_metadata=metadata + " " * 64,
                                            schema=schema, task="BOOKLET_GENERATION")
         if body_budget <= 0:
             raise StructuringError("پنجرهٔ زمینهٔ مدل پس از کسر بودجهٔ پاسخ، فضایی برای محتوای منبع ندارد.")
         max_chars = max(1, min(settings.note_chunk_chars, int(body_budget * ratio)))
-        return source.fit(topics, lambda text: len(text) <= max_chars and
-                          estimate_tokens(text, chars_per_token=ratio) <= body_budget, max_probe_chars=max_chars)
+        pack_target = _effective_pack_target(max_chars)
+        unit_char_limit = min(max_chars, pack_target) if pack_target > 0 else max_chars
+
+        def fits_body(text: str) -> bool:
+            return len(text) <= unit_char_limit and estimate_tokens(text, chars_per_token=ratio) <= body_budget
+
+        fitted = source.fit(topics, fits_body, max_probe_chars=unit_char_limit)
+        if pack_target > 0 and len(fitted) > 1:
+            return pack_semantic_units(source, fitted, target_chars=pack_target, fits=fits_body)
+        return fitted
 
     units = await asyncio.to_thread(fit_plan, plan)
     if not units:
@@ -3830,11 +3954,12 @@ async def _structure_booklet(
             await notify("compiling")
             return await synthesize_booklet(with_provenance(baseline), plan, normalized, writer)
 
+        has_healthy = len(writer.failures) < len(units)
         can_edit = (allow_repair and not writer.failures and draft.quality_state != QUALITY_RECOVERED
                     and any(section.section_id for section in draft.sections)
                     and compile_will_run(draft, settings, mode=resolved_mode, presentation=presentation))
         verified = await verify_and_repair(with_provenance(draft), normalized, plan, writer,
-                                           allow_repair=allow_repair and not writer.failures,
+                                           allow_repair=allow_repair and has_healthy,
                                            before_verify=edit if can_edit else None)
         return with_provenance(verified)
 

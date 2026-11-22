@@ -124,28 +124,28 @@ DEFAULT_NOTE_MODELS = {
 #: Context window assumed for one note request when the operator does not say.
 #: It is the *smallest* window among the configured models that matters, because
 #: the chain must fit the tightest provider that may answer. The operational
-#: budget is deliberately below the reference model windows, leaving headroom
-#: for gateway caps and the conservative Persian character-to-token estimate
-#: in ``notes.py``. A large model window does not raise this operating budget.
-DEFAULT_NOTE_CONTEXT_TOKENS = 131072
+#: budget stays below the 1M reference model windows while giving ample room
+#: for packed multi-topic requests and the conservative Persian character-to-
+#: token estimate in ``notes.py``.
+DEFAULT_NOTE_CONTEXT_TOKENS = 262144
 #: Per-chunk character ceiling of one note request (an upper bound that the
 #: token budget in ``notes.effective_chunk_chars`` may still shrink).
 DEFAULT_NOTE_CHUNK_CHARS = 64000
+#: Target character budget for packing consecutive small topics/pages/slides
+#: into a single booklet-generation request so typical sources (~<=50k chars)
+#: complete in 1–3 parallel requests instead of fragmenting per page/slide.
+#: Set ``NOTE_PACK_TARGET_CHARS=0`` to disable cross-topic packing.
+DEFAULT_NOTE_PACK_TARGET_CHARS = 20000
 #: Output-token budget sent as ``max_tokens`` / ``maxOutputTokens`` on every
-#: note request. It stays at half (or less) of the default models' documented
-#: completion caps, so the budget itself never exceeds what a default model may
-#: emit. Overrides must fit every eligible model's context/output caps and
-#: the request deadline; 16,384 remains the operating default, not a model cap.
-DEFAULT_NOTE_MAX_OUTPUT_TOKENS = 16384
+#: note request. Matches Gemini 3.5 Flash-Lite's native 65,536 completion cap
+#: and stays within OpenRouter (131,072) and AvalAI (393,216) caps so packed
+#: multi-topic responses do not hit ``finish_reason=length``.
+DEFAULT_NOTE_MAX_OUTPUT_TOKENS = 65536
 #: Wall-clock deadline of one note request, in seconds. A hung provider must
 #: not inherit the STT job's multi-hour read timeout — but the deadline must
-#: still be long enough for the configured *output* budget to be produced by
-#: a slow (free-tier, shared-pool) gateway. The output budget, not the input
-#: size, is what fills this window: the default 16,384 output tokens need
-#: several minutes on such a gateway, which is why this is configurable
-#: instead of hard-wired. The default is paired with the default output
-#: budget so the shipped configuration is coherent (see ``check``).
-DEFAULT_NOTE_REQUEST_TIMEOUT_SECONDS = 900.0
+#: still be long enough for a packed request's output to be produced by a slow
+#: (free-tier, shared-pool) gateway.
+DEFAULT_NOTE_REQUEST_TIMEOUT_SECONDS = 1200.0
 #: Conservative output speed (tokens per second) a free or shared note
 #: gateway is assumed to sustain. Used only to warn that a configured output
 #: budget cannot be produced inside the request deadline — the warning is
@@ -249,12 +249,12 @@ DEFAULT_OFFICE_JOB_CONCURRENCY = 2
 #: * ``NOTE_CONCURRENCY`` — the map phase never starts more requests than there
 #:   are chunks (capped at 8); 3 keeps per-job request bursts modest on shared hosts.
 #: * ``NOTE_TTFB_TIMEOUT_SECONDS`` — a route that has not produced a first byte
-#:   within 25 s is treated as hung and the chain fails over, instead of waiting
+#:   within 60 s is treated as hung and the chain fails over, instead of waiting
 #:   out the whole request timeout.
 #: * ``NOTE_HEDGE_AFTER_SECONDS`` — compatibility knob only. Dispatch never
 #:   hedges, even when a stale deployment sets it nonzero, to avoid duplicates.
 DEFAULT_NOTE_CONCURRENCY = 3
-DEFAULT_NOTE_TTFB_TIMEOUT_SECONDS = 25.0
+DEFAULT_NOTE_TTFB_TIMEOUT_SECONDS = 60.0
 DEFAULT_NOTE_HEDGE_AFTER_SECONDS = 0.0
 
 #: Per-provider direct-upload ceilings (bytes). A file larger than a
@@ -708,6 +708,7 @@ class Settings:
     llm_prewarm: bool = True
     note_ttfb_timeout: float = DEFAULT_NOTE_TTFB_TIMEOUT_SECONDS
     note_hedge_after: float = DEFAULT_NOTE_HEDGE_AFTER_SECONDS
+    note_pack_target_chars: int = DEFAULT_NOTE_PACK_TARGET_CHARS
     office_ai_concurrency: int = 3
     # Deployment ceilings, not claims about undocumented model capabilities.
     note_unknown_model_context_tokens: int = 32_768
@@ -1383,6 +1384,12 @@ def from_env(env_file: str | None = None) -> Settings:
         note_chunk_chars=_env_int(
             "NOTE_CHUNK_CHARS", DEFAULT_NOTE_CHUNK_CHARS, minimum=2000, maximum=200_000
         ),
+        note_pack_target_chars=_env_int(
+            "NOTE_PACK_TARGET_CHARS",
+            DEFAULT_NOTE_PACK_TARGET_CHARS,
+            minimum=0,
+            maximum=200_000,
+        ),
         note_concurrency=_env_int(
             "NOTE_CONCURRENCY", DEFAULT_NOTE_CONCURRENCY, minimum=1, maximum=8
         ),
@@ -1841,8 +1848,16 @@ def _check_note_settings(settings: Settings) -> list[ConfigDiagnostic]:
                 advisory=True,
             )
         )
+    if settings.note_pack_target_chars > 0:
+        chars_per_token = max(0.5, float(settings.llm_token_estimation_chars_per_token))
+        expected_output_tokens = min(
+            settings.note_max_output_tokens,
+            max(1, int((settings.note_pack_target_chars / chars_per_token) * 1.6)),
+        )
+    else:
+        expected_output_tokens = settings.note_max_output_tokens
     seconds_needed = (
-        settings.note_max_output_tokens / MIN_NOTE_OUTPUT_TOKENS_PER_SECOND
+        expected_output_tokens / MIN_NOTE_OUTPUT_TOKENS_PER_SECOND
     )
     if seconds_needed > settings.note_request_timeout:
         items.append(

@@ -540,10 +540,11 @@ def make_settings(**overrides) -> Settings:
         # fill pass is exercised explicitly by tests that opt in.
         note_completeness_fill=False,
         # Pinned to the pre-change behaviour on purpose: the shipped defaults
-        # (25 s first-byte guard, 60 s hedge) are covered by tests that build
-        # settings from the environment instead of this fixture.
+        # (60 s first-byte guard, 20k packing target) are covered by tests that
+        # build settings from the environment instead of this fixture.
         note_ttfb_timeout=0.0,
         note_hedge_after=0.0,
+        note_pack_target_chars=0,
         note_compile_provider="",
         raw_text_profile="plain",
         raw_fallback_file_chars=100_000,

@@ -15,7 +15,14 @@ from .document_model import PLAN_SCHEMA_VERSION, ContentPlan, NormalizedDocument
 from .llm import LLMError, booklet_input_budget
 from .note_planning import _signals as planning_signals
 from .notes_evidence import (
-    NoteQualityReport, Signal, SignalOccurrence, classify_claim_risk, content_words, extract_number_occurrences,
+    NoteQualityReport,
+    Signal,
+    SignalOccurrence,
+    classify_claim_risk,
+    content_words,
+    extract_number_occurrences,
+    extract_number_word_values,
+    units_compatible,
     validate_table,
 )
 from .semantic_segments import build_semantic_topics
@@ -173,7 +180,13 @@ def _is_measurement(signal: Signal) -> bool:
 
 
 def _matches(signal: Signal, candidate: Signal) -> bool:
-    return signal.value == candidate.value and signal.unit == candidate.unit
+    if signal.value != candidate.value:
+        return False
+    if signal.unit == candidate.unit:
+        return True
+    if signal.unit and candidate.unit:
+        return units_compatible(signal.unit, candidate.unit)
+    return False
 
 
 def _literal(text: str) -> str:
@@ -262,12 +275,13 @@ def _verbatim_table_fields(tables: Sequence[n.NoteTable], text: str) -> set[str]
     }
 
 
-def _section_evidence(section: n.NoteSection, index: int, scope: _Evidence, *, semantic: bool, deep_tables: bool
-                      ) -> tuple[list[_Finding], int, int]:
+def _section_evidence(section: n.NoteSection, index: int, scope: _Evidence, *, semantic: bool, deep_tables: bool,
+                      strict: bool = True) -> tuple[list[_Finding], int, int]:
     """Hard signal checks are local; only ambiguous claims need reasoning."""
     result: list[_Finding] = []
     text = n.instructional_source_text(scope.text)
     source_signals = _signals(text)
+    source_word_values = extract_number_word_values(text)
     sentences = tuple(_sentences(text))
     literal_sentences = {_literal(sentence) for sentence in sentences}
     exact_table_fields = _verbatim_table_fields(section.all_tables, text)
@@ -283,6 +297,7 @@ def _section_evidence(section: n.NoteSection, index: int, scope: _Evidence, *, s
             direct = field in exact_table_fields or _literal(claim) in literal_sentences
             contextual_support = False
             if numbers and not direct:
+                claim_high_risk = classify_claim_risk(claim) == "high"
                 template, in_order = _number_template(claim)
                 matches = templates.get(template, [])
                 contextual_support = any(len(seq) == len(in_order) and all(_matches(left, right)
@@ -295,6 +310,15 @@ def _section_evidence(section: n.NoteSection, index: int, scope: _Evidence, *, s
                     if any(_matches(signal, source_signal) for source_signal in relevant):
                         passed += 1
                         continue
+                    if (
+                        not strict
+                        and not signal.unit
+                        and not _DATE.fullmatch(signal.value)
+                        and not claim_high_risk
+                        and signal.value in source_word_values
+                    ):
+                        passed += 1
+                        continue
                     same_value = [sig for sig in relevant if sig.value == signal.value]
                     if same_value and any(sig.unit != signal.unit for sig in same_value):
                         code = "unit_mismatch"
@@ -302,7 +326,9 @@ def _section_evidence(section: n.NoteSection, index: int, scope: _Evidence, *, s
                         code = "date_mismatch"
                     else:
                         code = "number_mismatch"
-                    result.append(_issue(code, "critical", "A stated measurement or date does not match the local source evidence.",
+                    is_hard = strict or code == "unit_mismatch" or _is_measurement(signal) or claim_high_risk
+                    severity = "critical" if is_hard else "medium"
+                    result.append(_issue(code, severity, "A stated measurement or date does not match the local source evidence.",
                                          section=section, index=index, evidence=scope, field=field, assertion=claim,
                                          excerpt=_closest(claim, sentences)))
             elif direct:
@@ -386,8 +412,14 @@ def _inspect(notes: n.StructuredNotes, source: _Source, *, strict: bool = True,
         structural(all(all(len(row) == len(table.headers) for row in table.rows) and table.headers and table.rows
                        for table in section.all_tables), here("invalid_table_shape", "medium", "Table rows do not match their columns."))
         topic = source.topics.get(section.topic_id)
-        if topic and has_content:
-            topics[topic.id].append((index, section))
+        if has_content:
+            if topic:
+                topics[topic.id].append((index, section))
+            if section.source_block_ids:
+                sec_blocks = set(section.source_block_ids)
+                for candidate_topic in source.topics.values():
+                    if candidate_topic.id != section.topic_id and (sec_blocks & set(candidate_topic.unit_ids)):
+                        topics[candidate_topic.id].append((index, section))
         bad_refs = (any(ref not in source.blocks for ref in section.source_block_ids)
                     or bool(section.topic_id and (topic is None or not section.source_block_ids))
                     or bool(topic and section.parent_topic_id != topic.parent_id)
@@ -411,7 +443,7 @@ def _inspect(notes: n.StructuredNotes, source: _Source, *, strict: bool = True,
                 other = aliases.setdefault(key_term, spelling)
                 if other != spelling:
                     findings.append(here("terminology_inconsistency", "medium", "The same term has different English equivalents in the same topic."))
-        local, total, good = _section_evidence(section, index, scope, semantic=semantic, deep_tables=strict)
+        local, total, good = _section_evidence(section, index, scope, semantic=semantic, deep_tables=strict, strict=strict)
         findings.extend(local)
         evidence_total += total
         evidence_good += good
@@ -419,8 +451,15 @@ def _inspect(notes: n.StructuredNotes, source: _Source, *, strict: bool = True,
     for topic_id, entries in topics.items():
         topic = source.topics[topic_id]
         index, section = entries[0]
+        entry_indices = {idx for idx, _ in entries}
         dependencies = (*topic.depends_on, topic.parent_id)
-        if any(dep and dep in topics and topics[dep][-1][0] > index for dep in dependencies):
+        if any(
+            dep
+            and dep in topics
+            and topics[dep][-1][0] > index
+            and {idx for idx, _ in topics[dep]} != entry_indices
+            for dep in dependencies
+        ):
             structural(False, _issue("topic_order", "medium", "A topic precedes its planned prerequisite.",
                                      section=section, index=index, evidence=source.scope(section)))
 

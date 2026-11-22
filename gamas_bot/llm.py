@@ -59,7 +59,14 @@ from .llm_profiles import (
     to_gemini_response_format_schema,
 )
 from .metrics import METRICS
-from .llm_quota import ProviderBudget, QuotaUnavailable, finish as finish_quota, reserve as reserve_quota, estimate_tokens
+from .llm_quota import (
+    ProviderBudget,
+    QuotaUnavailable,
+    estimate_tokens,
+    finish as finish_quota,
+    reserve as reserve_quota,
+    retry_after_seconds as quota_retry_after,
+)
 from .protocols import LLMProviderDialect
 
 try:
@@ -171,6 +178,22 @@ _REQUEST_USAGE: contextvars.ContextVar[tuple[str, int | None, int | None] | None
 _ACTUAL_USAGE_TOKENS: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "gamas_llm_actual_usage_tokens", default=None
 )
+_WIRE_ATTEMPTS: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "gamas_llm_wire_attempts", default=0
+)
+
+
+def _estimated_output_reserve(estimated_input: int, max_route_output: int) -> int:
+    """Realistic TPM output reserve for local quota accounting.
+
+    The API request still carries the full ``max_output_tokens`` ceiling (e.g.
+    65,536) so completions never truncate, while local TPM holds avoid locking
+    65K tokens per 20K-char packed unit before actual usage is reconciled.
+    """
+    cap = max(1, int(max_route_output))
+    if cap <= 16_384:
+        return cap
+    return min(cap, max(16_384, int(max(1, int(estimated_input)) * 1.5)))
 #: Per-call sampling control. Context-local storage keeps concurrent map calls
 #: independent while allowing command-driven repair to be more deterministic
 #: than generation without creating a second provider client.
@@ -2428,6 +2451,7 @@ async def _complete_on_route(
     compatibility_adjustments = 0
     while True:
         request_number += 1
+        _WIRE_ATTEMPTS.set(_WIRE_ATTEMPTS.get() + 1)
         # Read the budget from the payload: this is the value that really goes
         # on the wire after provider-specific clamping and per-call overrides.
         requested_output_tokens = request_payload_output_tokens(payload)
@@ -2845,6 +2869,7 @@ async def _dispatch_across_routes(
 
     previous_failed_slug: str | None = routes[0].slug if failures else None
     wait_timeout = float(getattr(settings, "llm_slot_wait_timeout", 30.0)) if wait_for_capacity else 0.0
+    rpm_waited_slugs: set[str] = set()
 
     while indexed_routes:
         # Uncooled routes lead; cooled routes stay as last-resort fallbacks so
@@ -2910,6 +2935,36 @@ async def _dispatch_across_routes(
                 2,  # reserve one bounded retry as well as the initial dispatch
             )
         except QuotaUnavailable as exc:
+            # When this is the last eligible route and the denial is a short
+            # minute-window RPM/TPM burst, wait boundedly once instead of
+            # immediately dropping to deterministic fallback.
+            if (
+                is_last_route
+                and wait_for_capacity
+                and wait_timeout > 0
+                and route.slug not in rpm_waited_slugs
+                and ("RPM" in str(exc) or "TPM" in str(exc))
+            ):
+                delay = await asyncio.to_thread(
+                    quota_retry_after,
+                    str(settings.db_path),
+                    route.slug,
+                    budgets[orig_idx],
+                    tokens=max(1, int(reservation_tokens)),
+                    attempts=2,
+                )
+                max_rpm_wait = min(wait_timeout, 15.0)
+                if delay is not None and 0 < delay <= max_rpm_wait:
+                    rpm_waited_slugs.add(route.slug)
+                    lease.release()
+                    logger.info(
+                        "LLM quota minute window full on last route provider=%s; waiting %.2fs",
+                        route.slug,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    indexed_routes.append((orig_idx, route))
+                    continue
             # A ledger denial is a real provider attempt: record it like any
             # other failed dispatch so the provider's success rate and error
             # counters reflect that the route is exhausted, instead of the
@@ -2942,6 +2997,7 @@ async def _dispatch_across_routes(
             circuit_failure: bool | None = None
             started = time.perf_counter()
             usage_token = _ACTUAL_USAGE_TOKENS.set(None)
+            wire_token = _WIRE_ATTEMPTS.set(0)
             stage_scope = _REQUEST_STAGE.set(_sanitize_error_text(task or "UNSPECIFIED", limit=48).upper())
             try:
                 result = await call_route(r, last)
@@ -2953,11 +3009,13 @@ async def _dispatch_across_routes(
                 raise
             finally:
                 actual_tokens = _ACTUAL_USAGE_TOKENS.get()
+                wire_attempts = max(1, _WIRE_ATTEMPTS.get())
                 _ACTUAL_USAGE_TOKENS.reset(usage_token)
+                _WIRE_ATTEMPTS.reset(wire_token)
                 _REQUEST_STAGE.reset(stage_scope)
                 await asyncio.to_thread(
                     finish_quota, hold, actual_tokens=actual_tokens, succeeded=succeeded,
-                    circuit_failure=circuit_failure,
+                    circuit_failure=circuit_failure, attempts_used=wire_attempts,
                 )
                 METRICS.record_llm_operation(
                     task=task,
@@ -3029,15 +3087,18 @@ async def complete(
         )
 
     estimated_input = estimate_tokens(
-        system + "\\n" + user,
+        system + "\n" + user,
         chars_per_token=getattr(settings, "llm_token_estimation_chars_per_token", 2.0),
+    )
+    output_reserve = _estimated_output_reserve(
+        estimated_input, max(1, int(settings.note_max_output_tokens))
     )
     return await _dispatch_across_routes(
         routes, session, settings, _call, hedge_route=_call,
-        reservation_tokens=estimated_input + max(1, int(settings.note_max_output_tokens)),
+        reservation_tokens=estimated_input + output_reserve,
         task=task,
         estimated_input_tokens=estimated_input,
-        reserved_output_tokens=max(1, int(settings.note_max_output_tokens)),
+        reserved_output_tokens=output_reserve,
     )
 
 
@@ -3266,20 +3327,39 @@ async def _complete_json_on_route(
     schema: dict | None = None,
     strict_json: bool = False,
     adaptive_capacity: bool = False,
+    validate_payload: Callable[[dict], Any] | None = None,
 ) -> dict:
-    """Validate JSON inside the recorded attempt; fail over without resending it."""
+    """Validate JSON (and optional domain payload) inside the recorded attempt."""
     parsed = None
 
     def parse(text: str) -> None:
         nonlocal parsed
-        parsed = _parse_json_object(text, strict=strict_json)
+        candidate = _parse_json_object(text, strict=strict_json)
+        if validate_payload is not None:
+            try:
+                validate_payload(candidate)
+            except LLMError:
+                raise
+            except Exception as exc:
+                raise LLMResponseError(str(exc)) from exc
+        parsed = candidate
 
     raw = await _complete_on_route(
         route, session, settings, system=system, user=user,
         retry_on_timeout=retry_on_timeout, schema=schema, adaptive_capacity=adaptive_capacity,
         validate_response=parse,
     )
-    return parsed if parsed is not None else _parse_json_object(raw, strict=strict_json)
+    if parsed is not None:
+        return parsed
+    candidate = _parse_json_object(raw, strict=strict_json)
+    if validate_payload is not None:
+        try:
+            validate_payload(candidate)
+        except LLMError:
+            raise
+        except Exception as exc:
+            raise LLMResponseError(str(exc)) from exc
+    return candidate
 
 
 TASK_PROVIDER_ORDER = {
@@ -3341,6 +3421,7 @@ async def complete_json(
     sampling_temperature: float | None = None,
     strict_json: bool = False,
     adaptive_capacity: bool = False,
+    validate_payload: Callable[[dict], Any] | None = None,
 ) -> dict:
     """A completion parsed as strict JSON, with bounded per-provider recovery.
 
@@ -3374,17 +3455,21 @@ async def complete_json(
             system=system,
             user=user,
             retry_on_timeout=is_last,
-            schema=schema, strict_json=strict_json, adaptive_capacity=adaptive_capacity,
+            schema=schema,
+            strict_json=strict_json,
+            adaptive_capacity=adaptive_capacity,
+            validate_payload=validate_payload,
         )
 
     estimated_input = estimate_tokens(
-        system + "\\n" + user,
+        system + "\n" + user,
         chars_per_token=getattr(settings, "llm_token_estimation_chars_per_token", 2.0),
     )
-    output_reserve = min(
+    max_route_output = min(
         max(get_provider_profile(route.slug).clamp_output_tokens(route, requested_output, settings) for route in routes),
         max(1, int(getattr(settings, "note_context_tokens", settings.note_max_output_tokens))),
     )
+    output_reserve = _estimated_output_reserve(estimated_input, max_route_output)
     token = None
     if sampling_temperature is not None:
         token = _SAMPLING_TEMPERATURE.set(min(2.0, max(0.0, float(sampling_temperature))))

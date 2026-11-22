@@ -145,9 +145,11 @@ _LATIN_STOPWORDS = frozenset(
     }
 )
 
-#: Structural numbering: a slide/page/figure/step number is not a content number.
+#: Structural numbering: a slide/page/figure/step/example number is not a content number.
 _STRUCTURAL_NUMBER = re.compile(
-    r"(?:[Ss]lide|[Pp]age|اسلاید|صفحه(?:ٔ|\s+ی)?|برگ|بخش|گام|مرحله|جدول|شکل|نمودار|فصل|درس|جلسه|تمرین|پرسش|سوال|سؤال)"
+    r"(?:[Ss]lide|[Pp]age|[Ff]igure|[Tt]able|[Ee]xample|[Ss]tep|[Pp]art|[Cc]hapter|[Ss]ection|"
+    r"اسلاید|صفحه(?:ٔ|\s+ی)?|برگ|بخش|گام|مرحله|جدول|شکل|تصویر|نمودار|فصل|درس|جلسه|تمرین|"
+    r"پرسش|سوال|سؤال|پاسخ|مثال|بند|ماده(?:ٔ|\s+ی)?|قضیه(?:ٔ|\s+ی)?|ردیف|قسمت|مبحث|معادله(?:ٔ|\s+ی)?)"
     r"\s*[‌ ]?\s*[0-9۰-۹٠-٩]+"
     r"(?:\s*(?:از|از کل)\s*[0-9۰-۹٠-٩]+)?"
     r"(?:\s*\(\s*[0-9۰-۹٠-٩]+\s*/\s*[0-9۰-۹٠-٩]+\s*\))?"
@@ -263,6 +265,11 @@ _NUMBER_WORD_UNIT = re.compile(
     re.UNICODE | re.IGNORECASE,
 )
 _NUMBER_WORD_TOKEN = re.compile(rf"(?<![\w])(?:{_NUMBER_WORD_ATOM})(?![\w])", re.UNICODE)
+_NUMBER_WORD_PHRASE = re.compile(
+    rf"(?<![\w])(?:{_NUMBER_WORD_ATOM})"
+    rf"(?:(?:[\s\u200c]*و[\s\u200c]*|[\s\u200c]+)(?:{_NUMBER_WORD_ATOM})){{0,5}}(?![\w])",
+    re.UNICODE,
+)
 _NORMALIZED_NUMBER_WORD_VALUES = {
     normalize_for_compare(word): value for word, value in _NUMBER_WORD_VALUES.items()
 }
@@ -479,6 +486,18 @@ def _parse_number_words(raw: str) -> int | None:
             total += (current or 1) * value
             current = 0
     return total + current
+
+
+def extract_number_word_values(text: str) -> frozenset[str]:
+    """Return canonical numeric strings for Persian number words in *text*."""
+    if not text:
+        return frozenset()
+    values: set[str] = set()
+    for match in _NUMBER_WORD_PHRASE.finditer(text):
+        parsed = _parse_number_words(match.group(0))
+        if parsed is not None:
+            values.add(str(parsed))
+    return frozenset(values)
 
 
 def mask_structural(text: str) -> str:
