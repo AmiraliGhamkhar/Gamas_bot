@@ -249,5 +249,7 @@ def delivery_markup(
         )
     if learning:
         rows.append(learning)
+    if has_booklet or KIND_DOCX in kinds:
+        rows.append([Button.inline(texts.BTN_REFERRALS, b"ref:result")])
     rows.append([Button.inline(texts.BTN_BACK_MAIN, b"menu:main")])
     return rows

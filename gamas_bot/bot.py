@@ -55,7 +55,7 @@ from .artifacts import (
     delivery_markup,
     key_points_of,
 )
-from .billing import format_seconds_as_credits, plan_catalog
+from .billing import format_credits, format_seconds_as_credits, plan_catalog, round_display_credits, seconds_to_credits
 from .bot_admin import AdminWorkflowMixin
 from .bot_deps import DEFAULT_BOT_DEPS, BotDependencies, deps_for
 from .bot_documents import DocumentOfficeWorkflowMixin
@@ -585,16 +585,17 @@ class GamasBot(
         except Exception:
             logger.debug("callback answer failed", exc_info=True)
 
-    async def _edit(self, event, text: str, buttons=None) -> None:
+    async def _edit(self, event, text: str, buttons=None, *, parse_mode=None) -> None:
         """Edit a callback message; fall back to sending a new one."""
         try:
-            await event.edit(text, buttons=buttons)
+            kwargs = {"parse_mode": parse_mode} if parse_mode else {}
+            await event.edit(text, buttons=buttons, **kwargs)
         except MessageNotModifiedError:
             pass
         except Exception:
             logger.debug("callback edit failed; responding instead", exc_info=True)
             try:
-                await event.respond(text, buttons=buttons)
+                await event.respond(text, buttons=buttons, **kwargs)
             except Exception:
                 # An invalid button (e.g. a malformed URL) rejects the edit and
                 # the buttoned respond with the same error; deliver the screen
@@ -604,7 +605,7 @@ class GamasBot(
                     exc_info=True,
                 )
                 try:
-                    await event.respond(text)
+                    await event.respond(text, **kwargs)
                 except Exception:
                     logger.warning(
                         "callback screen could not be delivered", exc_info=True
@@ -711,7 +712,7 @@ class GamasBot(
             logger.info("free plan granted")
         text = texts.main_screen(
             first_start=first_start,
-            balance=await self._balance_text(user_id),
+            balance=await self._display_balance_text(user_id),
             office_enabled=self.settings.office_enabled,
             notes_configured=self.settings.note_configured,
         )
@@ -861,7 +862,7 @@ class GamasBot(
         return checked
 
     async def _edit_or_reply(
-        self, event, text: str, buttons=None, *, reply_markup: Any = None
+        self, event, text: str, buttons=None, *, reply_markup: Any = None, parse_mode=None
     ) -> None:
         """Render a screen: edit when triggered by a button, reply when by a message.
 
@@ -875,9 +876,13 @@ class GamasBot(
             await event.reply(text, buttons=reply_markup)
             return
         if hasattr(event, "data"):
-            await self._edit(event, text, buttons)
+            if parse_mode:
+                await self._edit(event, text, buttons, parse_mode=parse_mode)
+            else:
+                await self._edit(event, text, buttons)
             return
-        await event.reply(text, buttons=buttons)
+        kwargs = {"parse_mode": parse_mode} if parse_mode else {}
+        await event.reply(text, buttons=buttons, **kwargs)
 
     def _is_admin(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.settings.admin_ids
@@ -910,6 +915,13 @@ class GamasBot(
         if await self.db.is_unlimited(user_id):
             return texts.UNLIMITED_BALANCE
         return format_seconds_as_credits(await self.db.available_seconds(user_id))
+
+    async def _display_balance_text(self, user_id: int) -> str:
+        """A conservative rounded balance for summary screens, never billing."""
+        if await self.db.is_unlimited(user_id):
+            return texts.UNLIMITED_BALANCE
+        credits = seconds_to_credits(await self.db.available_seconds(user_id))
+        return format_credits(round_display_credits(credits))
 
     def _free_plan_seconds(self) -> int:
         for plan in plan_catalog(self.settings.tariff_values()):
@@ -1272,6 +1284,7 @@ class GamasBot(
         r.register_prefix("res:", self._cb_result_set)
         r.register_exact("library:fc", lambda e, _u, _d: self._show_flashcard_hub(e))
         r.register_exact("wallet", lambda e, _u, _d: self._show_wallet(e))
+        r.register_exact("wallet:exact", lambda e, u, _d: self._show_wallet_exact(e, u))
         r.register_exact("support", self._handle_support_callback)
         r.register_exact("adm:home", lambda e, _u, _d: self._show_admin_overview(e))
         r.register_exact("adm:users", lambda e, _u, _d: self._show_admin_users(e))
@@ -1282,6 +1295,7 @@ class GamasBot(
         r.register_exact("adm:bccancel", self._cb_broadcast_cancel)
         r.register_prefix("adm:bcresume:", self._cb_broadcast_resume)
         r.register_exact("adm:audit", lambda e, _u, _d: self._show_admin_audit(e, 0))
+        r.register_exact("ref:result", lambda e, u, _d: self._show_referrals(e, u, new_message=True))
         r.register_exact("ref:home", lambda e, u, _d: self._show_referrals(e, u))
         r.register_exact("adm:ref", lambda e, _u, _d: self._show_admin_referrals(e))
         r.register_exact("adm:sup", self._handle_admin_support_callback)

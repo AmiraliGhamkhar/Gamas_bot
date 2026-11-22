@@ -21,6 +21,11 @@ arithmetic uses exact fractions — no float crosses a billing boundary.
 | `paid_26h_30d` | 26 h | 866 667 | 460 000 | 229 000 |
 | `paid_30h_30d` | 30 h | 1 000 000 | 600 000 | 299 000 |
 
+The wallet rounds plan and balance summaries down to one significant digit for
+display; the exact integer plan credits and balance are available through its
+exact-credit details button. Rounding never changes the ledger or purchased
+seconds. Stored list prices are struck through only when above the sale price.
+
 All six paid plans have 30-day validity. Original/list and final/sale prices
 are explicit per plan; they are not derived from hours or the credit conversion.
 The wallet shows both prices, and new payment snapshots and charges use only the

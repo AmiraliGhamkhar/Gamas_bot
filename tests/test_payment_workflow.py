@@ -179,7 +179,7 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_complete_photo_receipt_confirmation_and_duplicate_protection(self):
         plans = await self.press(USER, "wallet")
         self.assertIn("۱٬۰۰۰٬۰۰۰ اعتبار (۳۰ ساعت)", plans.edits[-1][0])
-        self.assertIn("قیمت اصلی: ۶۰۰٬۰۰۰ تومان | قیمت نهایی: ۲۹۹٬۰۰۰ تومان", plans.edits[-1][0])
+        self.assertIn("قیمت قبلی: <s>۶۰۰٬۰۰۰ تومان</s>\nبا تخفیف\n<b>قیمت نهایی: ۲۹۹٬۰۰۰ تومان</b>", plans.edits[-1][0])
         await self.press(USER, f"plan:{PLAN}")
         payment_id = (await self.db.pending_payments())[0]["payment_id"]
         order = await self.db.payment(payment_id)

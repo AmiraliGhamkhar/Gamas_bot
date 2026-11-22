@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from html import escape
 import logging
 from pathlib import Path
 import secrets
@@ -22,12 +23,14 @@ from .doc_extract import sha256_file
 from .metrics import METRICS
 from .billing import (
     format_credits_number,
-    format_credits_with_hours,
+    format_credits,
     format_plan_price,
     format_seconds_as_credits,
     format_toman,
+    format_duration,
     format_validity,
     seconds_to_credits,
+    round_display_credits,
 )
 from .bot_ui import TELEGRAM_CAPTION_LIMIT
 from .config import format_payment_card
@@ -80,6 +83,7 @@ class WalletWorkflowMixin:
             "",
         ]
         buttons: list[list] = []
+        plan_price_markup: dict[int, tuple[int | None, int]] = {}
 
         payment = await self.db.open_payment_for_user(user_id)
         if payment is not None:
@@ -110,7 +114,7 @@ class WalletWorkflowMixin:
                 lines.append(
                     "\n"
                     + texts.WALLET_PLAN_ROW_TEMPLATE.format(
-                        credits=format_credits_with_hours(credits, hours),
+                        credits=f"{format_credits(round_display_credits(credits))} ({format_duration(int(hours * 3600))})",
                         validity=validity,
                         price=format_plan_price(
                             int(plan["price"]),
@@ -118,11 +122,15 @@ class WalletWorkflowMixin:
                         ),
                     )
                 )
+                original = plan.get("original_price")
+                plan_price_markup[len(lines) - 1] = (
+                    int(original) if original is not None else None, int(plan["price"])
+                )
                 if self.settings.payment_card_number:
                     label = button_label(
                         texts.WALLET_PLAN_BUTTON_TEMPLATE.format(
                             credits=texts.WALLET_PLAN_BUTTON_CREDITS.format(
-                                credits=format_credits_number(credits)
+                                credits=format_credits_number(round_display_credits(credits))
                             ),
                             price=format_toman(plan["price"]),
                         )
@@ -136,8 +144,8 @@ class WalletWorkflowMixin:
         lines.extend(
             [
                 "",
-                texts.WALLET_BALANCE_TEMPLATE.format(
-                    balance=await self._balance_text(user_id)  # type: ignore[attr-defined]
+                texts.WALLET_DISPLAY_BALANCE_TEMPLATE.format(
+                    balance=await self._display_balance_text(user_id)  # type: ignore[attr-defined]
                 ),
                 texts.WALLET_UNIT_HINT,
                 "",
@@ -188,11 +196,43 @@ class WalletWorkflowMixin:
             buttons.append(nav)
         buttons.extend(
             [
+                [Button.inline(texts.WALLET_EXACT_BUTTON, b"wallet:exact")],
                 [Button.inline(texts.BTN_SUPPORT, b"support")],
                 [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
             ]
         )
-        await self._edit_or_reply(event, "\n".join(lines), buttons)
+        # Escape all data, including payment history, before adding controlled HTML.
+        rendered = []
+        for index, line in enumerate(lines):
+            safe = escape(line)
+            if index in plan_price_markup:
+                original, sale = plan_price_markup[index]
+                old = escape(format_plan_price(sale, original))
+                sale_text = escape(format_toman(sale))
+                if original is not None and original > sale > 0:
+                    new = texts.WALLET_DISCOUNT_HTML_TEMPLATE.format(
+                        original=escape(format_toman(original)), sale=sale_text
+                    )
+                else:
+                    new = texts.WALLET_FINAL_HTML_TEMPLATE.format(sale=sale_text)
+                safe = safe.replace(old, new, 1)
+            rendered.append(safe)
+        await self._edit_or_reply(event, "\n".join(rendered), buttons, parse_mode="html")
+
+    async def _show_wallet_exact(self, event: Any, user_id: int) -> None:
+        lines = [texts.WALLET_EXACT_TITLE, ""]
+        for plan in await self.db.plans():
+            if int(plan["price"]) <= 0:
+                continue
+            seconds = int(round(float(plan["hours"]) * 3600))
+            lines.append(texts.WALLET_EXACT_PLAN.format(
+                credits=format_credits_number(seconds_to_credits(seconds)),
+                duration=format_duration(seconds),
+            ))
+        lines.extend(["", texts.WALLET_BALANCE_TEMPLATE.format(
+            balance=await self._balance_text(user_id)  # type: ignore[attr-defined]
+        )])
+        await self._edit_or_reply(event, "\n".join(lines), [[Button.inline(texts.BTN_WALLET, b"wallet")]])
 
     async def _start_payment(self, event: Any, plan_code: str) -> None:
         if not self.settings.payment_card_number:

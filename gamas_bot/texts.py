@@ -80,8 +80,8 @@ BTN_UPGRADE: Final = "🛒 افزایش اعتبار"
 BTN_QUIZ_FROM_BOOKLET: Final = "آزمون از این جزوه"
 BTN_CARDS_FROM_BOOKLET: Final = "فلش‌کارت از این جزوه"
 OFFICE_CREDIT_NOTICE: Final = (
-    "🗂 آفیس رایگان: تبدیل متن به Word، Excel، PowerPoint یا PDF؛ "
-    "بدون کسر اعتبار، با سقف ورودی و محدودیت ظرفیت."
+    "🗂 تبدیل متن به Word، Excel، PowerPoint یا PDF؛ "
+    "سقف ورودی و محدودیت ظرفیت اعمال می‌شود."
 )
 CREDIT_ESTIMATE_NOTE: Final = (
     "اعتبار لازم برآورد اولیه است؛ کسر نهایی پس از پردازش بر اساس مدت واقعی انجام می‌شود. "
@@ -90,8 +90,7 @@ CREDIT_ESTIMATE_NOTE: Final = (
 LEARNING_FREE_CHOICE_LABEL: Final = "رایگان در اولین استفاده"
 PRESENTATION_PROCESSING_NOTICE: Final = (
     "متن اسلایدها استخراج می‌شود؛ صدای ارائه خودکار پردازش نمی‌شود و فقط با دکمهٔ "
-    "«🎧 پردازش صدای ارائه» آغاز می‌شود. فقط صدای ضبط‌شده اعتبار مصرف می‌کند؛ "
-    "ارائهٔ بی‌صدا رایگان است."
+    "«🎧 پردازش صدای ارائه» آغاز می‌شود."
 )
 DOCUMENT_SCANNED_NOTICE: Final = (
     "PDF اسکن‌شده یا عکس سند قابل‌خواندن نیست؛ "
@@ -195,6 +194,11 @@ def reply_menu_rows(*, is_admin: bool, office_enabled: bool = True) -> list[list
 # ---------------------------------------------------------------------------
 # Delivery — the results screen and the three fetch buttons
 # ---------------------------------------------------------------------------
+
+BOOKLET_READY: Final = "✅ جزوه شما آماده است."
+BOOKLET_REFERRAL_CTA: Final = "🎁 اعتبار رایگان بیشتری می‌خواهی؟ دوستانت را دعوت کن و اعتبار رایگان بگیر."
+BOOKLET_SUCCESS: Final = BOOKLET_READY + "\n\n" + BOOKLET_REFERRAL_CTA
+INSUFFICIENT_CREDIT: Final = "💳 اعتبار شما کافی نیست. برای ادامه، بخش اعتبار را باز کنید."
 
 DELIVERY_READY_HEADER: Final = "پردازش تمام شد — {reference}"
 DELIVERY_READY_BODY: Final = "دکمه‌های خروجی‌های آماده در همین پیام هستند."
@@ -345,13 +349,12 @@ def help_screen(
     lines.extend(
         [
             "",
-            "📚 خروجی‌ها در «کتابخانه» می‌مانند (تا ۵۰ فایل)؛ دریافت مجدد رایگان است.",
+            "📚 خروجی‌ها در «کتابخانه» می‌مانند (تا ۵۰ فایل).",
         ]
     )
     if notes_configured:
         lines.append(
-            "🧪 از جزوه آزمون و 🃏 فلش‌کارت بسازید؛ "
-            "اولین آزمون و اولین مجموعهٔ فلش‌کارت رایگان‌اند."
+            "🧪 از جزوه آزمون و 🃏 فلش‌کارت بسازید."
         )
     else:
         lines.append(
@@ -364,22 +367,8 @@ def help_screen(
             DOCUMENT_SCANNED_NOTICE,
             DOCUMENT_EMBEDDED_IMAGES_NOTICE,
             "",
-            "💳 اعتبار: هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت صوت کلاس.",
-            "فقط پس از آماده‌شدن متن خام اعتبار کم می‌شود؛ "
-            "اگر متن خام نرسد، اعتباری کم نمی‌شود.",
+            "💳 اطلاعات اعتبار و قیمت‌ها را در بخش خرید اعتبار ببینید.",
         ]
-    )
-    if notes_configured:
-        lines.extend(
-            [
-                "ساخت آزمون و فلش‌کارت هوش مصنوعی اعتبار کم می‌کند؛ "
-                "اگر ناموفق باشد، کامل برمی‌گردد.",
-                "خطای ساخت جزوه پس از دریافت متن خام، اعتبار را برنمی‌گرداند.",
-            ]
-        )
-    lines.append(
-        "اعتبار خرید پس از تأیید رسید توسط مدیر اضافه می‌شود؛ "
-        "پشتیبانی در منوی اصلی است."
     )
     return "\n".join(lines)
 
@@ -652,7 +641,12 @@ TRACKING_CODE_TEMPLATE: Final = "کد پیگیری: {reference}"
 WALLET_TITLE: Final = "💳 اعتبار و خرید بسته"
 WALLET_NO_PLANS: Final = "فعلاً بسته‌ای برای خرید موجود نیست."
 WALLET_CHOOSE_PLAN: Final = "بسته را انتخاب کنید؛ اعتبار خرید به موجودی شما اضافه می‌شود."
-WALLET_PLAN_ROW_TEMPLATE: Final = "• {credits}\n  اعتبار: {validity} | {price}"
+WALLET_FINAL_HTML_TEMPLATE: Final = "<b>قیمت نهایی: {sale}</b>"
+WALLET_DISCOUNT_HTML_TEMPLATE: Final = "قیمت قبلی: <s>{original}</s>\nبا تخفیف\n<b>قیمت نهایی: {sale}</b>"
+WALLET_EXACT_BUTTON: Final = "جزئیات اعتبار دقیق"
+WALLET_EXACT_TITLE: Final = "مقدار دقیق اعتبار بسته‌ها و موجودی"
+WALLET_EXACT_PLAN: Final = "{credits} اعتبار — {duration}"
+WALLET_PLAN_ROW_TEMPLATE: Final = "• اعتبار نمایشی: {credits}\n  اعتبار بسته: {validity} | {price}"
 WALLET_PLAN_BUTTON_TEMPLATE: Final = "{credits} — {price}"
 #: The credit amount as it appears inside a plan button.
 WALLET_PLAN_BUTTON_CREDITS: Final = "{credits} اعتبار"
@@ -664,6 +658,7 @@ WALLET_PLAN_BUTTON_CREDITS: Final = "{credits} اعتبار"
 #: Intake: the file's own length, in both currencies.
 WALLET_CARD_DISABLED: Final = "🛒 پرداخت کارت‌به‌کارت فعلاً غیرفعال است."
 WALLET_BALANCE_TEMPLATE: Final = "💳 اعتبار باقی‌مانده: {balance}"
+WALLET_DISPLAY_BALANCE_TEMPLATE: Final = "💳 اعتبار باقی‌مانده (نمایشی): {balance}"
 WALLET_UNIT_HINT: Final = "📐 هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت صوت کلاس"
 WALLET_RECENT_PAYMENTS: Final = "🧾 پرداخت‌های اخیر"
 WALLET_NO_PAYMENTS: Final = "پرداختی ثبت نشده است."

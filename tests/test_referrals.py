@@ -280,6 +280,12 @@ class ReferralScreenTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("اعتبار اعتبار", reward)
 
+    async def test_booklet_referral_opens_new_message_without_editing_result(self):
+        event = FakeCallbackEvent(self.client, data=b"ref:result")
+        await self.bot._handle_callback(event)
+        self.assertFalse(event.edits)
+        self.assertTrue(any("دعوت دوستان" in m.get("text", "") for m in self.client.texts))
+
     async def test_invalid_buttons_never_blank_the_screen(self):
         class RejectingEvent(FakeCallbackEvent):
             async def edit(self, text: str = "", buttons=None):

@@ -130,7 +130,7 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(callback)
 
         text = callback.edits[-1]["text"]
-        self.assertIn("از اعتبار حساب شما کم نمی‌شود", text)
+        self.assertNotIn("از اعتبار حساب شما کم نمی‌شود", text)
         self.assertIn("سقف ورودی و ظرفیت پردازش", text)
 
     async def test_pasted_messages_make_real_word_excel_powerpoint_and_selectable_pdf_without_billing(self):
@@ -409,6 +409,11 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(full)
         compact = self.callback(f"doc:note:{doc_id}:compact")
         await self.bot._handle_callback(compact)
+        for callback in (full, compact):
+            result = callback.edits[-1]
+            self.assertIn("جزوه شما آماده است", result["text"])
+            self.assertIn("اعتبار رایگان بیشتری", result["text"])
+            self.assertIn(b"ref:result", [button.type.data for row in result["buttons"] for button in row])
 
         delivered = self.capture.file_payloads
         full_word = next(payload for path, payload in delivered if "FULL" in path and path.endswith(".docx"))
