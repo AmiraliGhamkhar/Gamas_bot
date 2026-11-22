@@ -115,8 +115,11 @@ no page image is ever sent to a third-party recognition service.
 
 ## Free Office / آفیس رایگان
 
-Paste text/messages or upload `.txt`, `.md`, `.markdown`, `.csv`, `.tsv`, then
-pick Word, Excel, PowerPoint or PDF.
+The separate Office button is hidden from the menu. Upload `.txt`, `.md`,
+`.markdown`, `.csv`, or `.tsv` to open a draft and pick Word, Excel, PowerPoint
+or PDF; supported document cards also offer exports. Existing Office callbacks
+remain available for older messages. Pasted study text outside an Office draft
+enters the main booklet workflow instead of the multi-message Office draft.
 
 - `OFFICE_ENABLED=true` by default. No note key is required; deterministic
   fallbacks keep the workflow usable without any AI provider.

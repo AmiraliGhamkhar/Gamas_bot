@@ -1538,7 +1538,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         more_menu = menu_payloads(self.bot._more_menu())
         self.assertIn(b"results", more_menu)
         self.assertNotIn(b"board", more_menu)
-        self.assertIn(b"office:start", more_menu)
+        self.assertNotIn(b"office:start", more_menu)
         self.assertIn(b"ref:home", more_menu)
         self.bot.settings = replace(self.settings, office_enabled=False)
         self.assertNotIn(b"office:start", menu_payloads(self.bot._more_menu()))

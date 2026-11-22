@@ -4,6 +4,10 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Office navigation.** The standalone Office button is no longer shown in the
+more menu. Existing callbacks, text-file drafts and document exports remain
+available; this navigation change does not merge or reprice Office workflows.
+
 **Booklet completion and wallet display.** Successful booklets show a short
 completion message and an invite button without replacing the result. Partial
 results retain important warnings. Wallet summaries round credit down for display;

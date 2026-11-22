@@ -502,6 +502,15 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("این سند پیدا نشد.", True), callback.answers)
         self.assertEqual(self.capture.file_payloads, [])
 
+    async def test_office_button_hidden_but_existing_callbacks_still_work(self):
+        for menu in (self.bot._user_menu(), self.bot._more_menu()):
+            payloads = {button.type.data for row in menu for button in row}
+            self.assertNotIn(b"office:start", payloads)
+        callback = self.callback("office:start")
+        await self.bot._handle_callback(callback)
+        self.assertIn(self.user_id, self.bot._office_sessions)
+        self.assertTrue(callback.edits)
+
     async def test_disabled_office_hides_menu_and_rejects_stale_callback(self):
         self.bot.settings = replace(self.settings, office_enabled=False)
         payloads = {
