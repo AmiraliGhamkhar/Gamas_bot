@@ -118,6 +118,9 @@ logger = logging.getLogger(__name__)
 
 MAX_TITLE_CHARS = 200
 MAX_TEXT_CHARS = 20000
+#: A table cell is a value, not a paragraph; the model never legitimately needs
+#: more than this in one cell and the renderer collapses wider cells anyway.
+TABLE_CELL_MAX_CHARS = 4000
 MAX_SOURCE_LOCATORS_PER_SECTION = 100
 VALID_CALLOUT_KINDS = ("نکته", "هشدار", "یادآوری", "تأکید استاد")
 PRACTICE_QUESTION_KINDS = ("مفهومی", "آزمونی", "تشریحی", "محاسباتی")
@@ -288,10 +291,10 @@ class NoteCallout:
     def from_payload(cls, payload: object) -> "NoteCallout | None":
         if not isinstance(payload, dict):
             return None
-        text = _bounded_text(payload.get("text"))
+        text = _bounded_text(payload.get("text"), field="callout.text")
         if not text:
             return None
-        kind = _bounded_text(payload.get("kind"), 20)
+        kind = _bounded_text(payload.get("kind"), 20, field="callout.kind")
         if kind not in VALID_CALLOUT_KINDS:
             kind = "نکته"
         return cls(kind, text)
@@ -307,22 +310,32 @@ class NoteTable:
     def from_payload(cls, payload: object) -> "NoteTable | None":
         if not isinstance(payload, dict):
             return None
-        headers = _string_list(payload.get("headers"))
+        headers = _string_list(payload.get("headers"), field="table.headers")
         raw_rows = payload.get("rows")
         if not headers or not isinstance(raw_rows, (list, tuple)):
             return None
         rows: list[list[str]] = []
         for raw_row in raw_rows:
             if isinstance(raw_row, (list, tuple)):
-                cells = [_bounded_text(cell, 4000) for cell in raw_row]
+                cells = [_bounded_text(cell, TABLE_CELL_MAX_CHARS, field="table.cell") for cell in raw_row]
             else:
-                cells = [_bounded_text(raw_row, 4000)]
+                cells = [_bounded_text(raw_row, TABLE_CELL_MAX_CHARS, field="table.cell")]
             if any(cell for cell in cells):
+                if len(cells) > len(headers):
+                    # A row wider than the header is content, not noise. Keep
+                    # the surplus under the last column (and say so in the log)
+                    # instead of slicing a value away.
+                    logger.warning(
+                        "note table row wider than its header cells=%d headers=%d",
+                        len(cells),
+                        len(headers),
+                    )
+                    cells = [*cells[: len(headers) - 1], " ".join(cells[len(headers) - 1:])]
                 cells = (cells + [""] * len(headers))[: len(headers)]
                 rows.append(cells)
         if not rows:
             return None
-        caption = _bounded_text(payload.get("caption"), MAX_TITLE_CHARS)
+        caption = _bounded_text(payload.get("caption"), MAX_TITLE_CHARS, field="table.caption")
         return cls(headers, rows, caption)
 
     def signature(self) -> tuple[str, ...]:
@@ -352,13 +365,13 @@ class PracticalTip:
     def from_payload(cls, payload: object) -> "PracticalTip | None":
         if not isinstance(payload, dict):
             return None
-        text = _bounded_text(payload.get("text"))
+        text = _bounded_text(payload.get("text"), field="tip.text")
         if not text:
             return None
-        kind = _bounded_text(payload.get("kind"), 20)
+        kind = _bounded_text(payload.get("kind"), 20, field="tip.kind")
         if kind not in TIP_KINDS:
             kind = "کاربردی"
-        return cls(text, _bounded_text(payload.get("basis")), kind)
+        return cls(text, _bounded_text(payload.get("basis"), field="tip.basis"), kind)
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,11 +385,12 @@ class NoteDefinition:
     def from_payload(cls, payload: object) -> "NoteDefinition | None":
         if not isinstance(payload, dict):
             return None
-        term = _bounded_text(payload.get("term"), MAX_TITLE_CHARS)
-        definition = _bounded_text(payload.get("definition"))
+        term = _bounded_text(payload.get("term"), MAX_TITLE_CHARS, field="glossary.term")
+        definition = _bounded_text(payload.get("definition"), field="glossary.definition")
         if not term or not definition:
             return None
-        return cls(term, definition, _bounded_text(payload.get("term_en"), MAX_TITLE_CHARS))
+        return cls(term, definition,
+                   _bounded_text(payload.get("term_en"), MAX_TITLE_CHARS, field="glossary.term_en"))
 
 
 def _table_identity(table: NoteTable) -> tuple[str, tuple[str, ...], tuple[tuple[str, ...], ...]]:
@@ -398,7 +412,7 @@ def _normalise_tables(payload: dict) -> tuple[NoteTable | None, tuple[NoteTable,
     if isinstance(raw_tables, dict):
         # A model that returns one table under ``tables`` means a list of one.
         raw_tables = [raw_tables]
-    for item in raw_tables if isinstance(raw_tables, (list, tuple)) else ():
+    for item in _as_list(raw_tables, field="section.tables"):
         table = NoteTable.from_payload(item)
         if table is None or _table_identity(table) in seen:
             continue
@@ -459,32 +473,38 @@ class NoteSection:
     def from_payload(cls, payload: object, fallback_index: int) -> "NoteSection | None":
         if not isinstance(payload, dict):
             return None
-        heading = _bounded_text(payload.get("heading"), MAX_TITLE_CHARS)
+        heading = _bounded_text(payload.get("heading"), MAX_TITLE_CHARS, field="section.heading")
         if not heading:
             heading = f"بخش {fallback_index}"
         callouts = tuple(
-            filter(None, (NoteCallout.from_payload(item) for item in payload.get("callouts") or []))
+            filter(None, (
+                NoteCallout.from_payload(item)
+                for item in _as_list(payload.get("callouts"), field="section.callouts")
+            ))
         )
         definitions = tuple(
-            filter(None, (NoteDefinition.from_payload(item) for item in payload.get("definitions") or []))
+            filter(None, (
+                NoteDefinition.from_payload(item)
+                for item in _as_list(payload.get("definitions"), field="section.definitions")
+            ))
         )
         primary, extra = _normalise_tables(payload)
         section = cls(
             heading=heading,
-            paragraphs=tuple(_string_list(payload.get("paragraphs"))),
-            bullets=tuple(_string_list(payload.get("bullets"))),
+            paragraphs=tuple(_string_list(payload.get("paragraphs"), field="section.paragraphs")),
+            bullets=tuple(_string_list(payload.get("bullets"), field="section.bullets")),
             definitions=definitions,
-            examples=tuple(_string_list(payload.get("examples"))),
-            steps=tuple(_string_list(payload.get("steps"))),
-            formulas=tuple(_string_list(payload.get("formulas"))),
-            key_points=tuple(_string_list(payload.get("key_points"))),
+            examples=tuple(_string_list(payload.get("examples"), field="section.examples")),
+            steps=tuple(_string_list(payload.get("steps"), field="section.steps")),
+            formulas=tuple(_string_list(payload.get("formulas"), field="section.formulas")),
+            key_points=tuple(_string_list(payload.get("key_points"), field="section.key_points")),
             table=primary,
             callouts=callouts,
             tables=extra,
             source_locators=tuple(
                 dict.fromkeys(
                     " ".join(value.split())[:120]
-                    for value in _string_list(payload.get("source_locators"))
+                    for value in _string_list(payload.get("source_locators"), field="section.source_locators")
                     if value.strip()
                 )
             )[:MAX_SOURCE_LOCATORS_PER_SECTION],
@@ -502,11 +522,12 @@ class GlossaryEntry:
     def from_payload(cls, payload: object) -> "GlossaryEntry | None":
         if not isinstance(payload, dict):
             return None
-        term = _bounded_text(payload.get("term"), MAX_TITLE_CHARS)
-        definition = _bounded_text(payload.get("definition"))
+        term = _bounded_text(payload.get("term"), MAX_TITLE_CHARS, field="definition.term")
+        definition = _bounded_text(payload.get("definition"), field="definition.definition")
         if not term or not definition:
             return None
-        return cls(term, definition, _bounded_text(payload.get("term_en"), MAX_TITLE_CHARS))
+        return cls(term, definition,
+                   _bounded_text(payload.get("term_en"), MAX_TITLE_CHARS, field="definition.term_en"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -520,15 +541,15 @@ class PracticeQuestion:
     @classmethod
     def from_payload(cls, payload: object) -> "PracticeQuestion | None":
         if isinstance(payload, str):
-            text = _bounded_text(payload)
+            text = _bounded_text(payload, field="practice_question")
             return cls(text) if text else None
         if not isinstance(payload, dict):
             return None
-        question = _bounded_text(payload.get("question") or payload.get("q"))
+        question = _bounded_text(payload.get("question") or payload.get("q"), field="practice_question.question")
         if not question:
             return None
-        answer = _bounded_text(payload.get("answer") or payload.get("a"))
-        kind = _bounded_text(payload.get("kind"), 24)
+        answer = _bounded_text(payload.get("answer") or payload.get("a"), field="practice_question.answer")
+        kind = _bounded_text(payload.get("kind"), 24, field="practice_question.kind")
         if kind and kind not in PRACTICE_QUESTION_KINDS:
             kind = ""
         return cls(question=question, answer=answer, kind=kind)
@@ -756,71 +777,67 @@ class StructuredNotes:
             raise StructuringError("پاسخ سرویس تولید جزوه یک شیء JSON نبود.")
         if _contains_forbidden_booklet_metadata(payload):
             raise StructuringError("پاسخ جزوه شامل فرادادهٔ ممنوعِ گفتار یا زمان بود.")
-        raw_sections = payload.get("sections")
         sections = tuple(
             filter(
                 None,
                 (
                     NoteSection.from_payload(item, index)
                     for index, item in enumerate(
-                        raw_sections if isinstance(raw_sections, (list, tuple)) else [],
+                        _as_list(payload.get("sections"), field="sections"),
                         start=1,
                     )
                 ),
             )
         )
-        raw_glossary = payload.get("glossary")
-        glossary_items = raw_glossary if isinstance(raw_glossary, (list, tuple)) else []
         glossary = tuple(
-            filter(None, (GlossaryEntry.from_payload(item) for item in glossary_items))
+            filter(None, (
+                GlossaryEntry.from_payload(item)
+                for item in _as_list(payload.get("glossary"), field="glossary")
+            ))
         )
         # CR-3: FULL is the only mode. Any legacy compression-mode value or
         # junk in an archived payload is normalised to "full" and never crashes
         # parsing. ``default_mode`` is kept for a compatible signature.
         note_mode = "full"
-        raw_tips = payload.get("practical_tips")
         practical_tips = tuple(
             filter(
                 None,
                 (
                     PracticalTip.from_payload(item)
-                    for item in (raw_tips if isinstance(raw_tips, (list, tuple)) else [])
+                    for item in _as_list(payload.get("practical_tips"), field="practical_tips")
                 ),
             )
         )
-        raw_practice = payload.get("practice_questions")
         practice_list: list[PracticeQuestion] = [
             parsed
-            for item in (raw_practice if isinstance(raw_practice, (list, tuple)) else [])
+            for item in _as_list(payload.get("practice_questions"), field="practice_questions")
             if (parsed := PracticeQuestion.from_payload(item)) is not None
         ]
-        raw_review = payload.get("review_questions")
         review_list: list[str] = []
-        if isinstance(raw_review, (list, tuple)):
-            for item in raw_review:
-                if isinstance(item, dict):
-                    parsed_q = PracticeQuestion.from_payload(item)
-                    if parsed_q is not None:
-                        practice_list.append(parsed_q)
-                else:
-                    cleaned = _bounded_text(item)
-                    if cleaned:
-                        review_list.append(cleaned)
+        for item in _as_list(payload.get("review_questions"), field="review_questions"):
+            if isinstance(item, dict):
+                parsed_q = PracticeQuestion.from_payload(item)
+                if parsed_q is not None:
+                    practice_list.append(parsed_q)
+            else:
+                cleaned = _bounded_text(item, field="review_questions")
+                if cleaned:
+                    review_list.append(cleaned)
         notes = cls(
-            title=_bounded_text(payload.get("title"), MAX_TITLE_CHARS),
-            subtitle=_bounded_text(payload.get("subtitle"), MAX_TITLE_CHARS),
-            summary=(_bounded_text(payload.get("summary")) if provider_reply else
+            title=_bounded_text(payload.get("title"), MAX_TITLE_CHARS, field="title"),
+            subtitle=_bounded_text(payload.get("subtitle"), MAX_TITLE_CHARS, field="subtitle"),
+            summary=(_bounded_text(payload.get("summary"), field="summary") if provider_reply else
                      scrub_backend_artifacts(str(payload.get("summary") or ""))),
             sections=sections,
-            key_points=tuple(_string_list(payload.get("key_points"))),
+            key_points=tuple(_string_list(payload.get("key_points"), field="key_points")),
             glossary=glossary,
             note_mode=note_mode,
-            learning_objectives=tuple(_string_list(payload.get("learning_objectives"))),
+            learning_objectives=tuple(_string_list(payload.get("learning_objectives"), field="learning_objectives")),
             review_questions=tuple(review_list),
             practice_questions=tuple(practice_list),
             practical_tips=practical_tips,
-            common_mistakes=tuple(_string_list(payload.get("common_mistakes"))),
-            final_review=tuple(_string_list(payload.get("final_review"))),
+            common_mistakes=tuple(_string_list(payload.get("common_mistakes"), field="common_mistakes")),
+            final_review=tuple(_string_list(payload.get("final_review"), field="final_review")),
         )
         if not notes.has_content:
             raise StructuringError("ساختار جزوهٔ دریافتی خالی بود.")
@@ -895,16 +912,52 @@ _STATUS_PHRASE = re.compile(
 )
 
 
+#: A line this short, with no sentence terminator, is a raw backend report
+#: (``HTTP 429 rate limit``) rather than a sentence someone wrote about the
+#: subject. Only such lines are treated as diagnostic plumbing.
+_REPORT_LINE_MAX_WORDS = 8
+_SENTENCE_END = re.compile(r"[.!؟?…](?:\s|$)")
+
+
+def _looks_like_backend_report(line: str) -> bool:
+    """True for a raw status/token line, false for a teaching sentence.
+
+    A report is short and dense in plumbing (``HTTP 429 rate limit, retry
+    after 30s``); a sentence that *explains* the same codes runs longer and
+    usually ends with a terminator, so it keeps its numbers.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    words = len(stripped.split())
+    markers = len(_DIAGNOSTIC_TOKEN.findall(stripped)) + len(_META_PHRASE.findall(stripped))
+    if markers < 2:
+        return False
+    if words <= _REPORT_LINE_MAX_WORDS:
+        return True
+    return not _SENTENCE_END.search(stripped) and words <= _REPORT_LINE_MAX_WORDS * 2
+
+
 def _scrub_line(line: str) -> tuple[str, int]:
+    """Mask backend plumbing on one line; never delete the line itself.
+
+    A line is content the model wrote. Even when it looks like a diagnostic
+    cluster (``429``/``rate limit``/``quota`` in a networking lecture) the words
+    are masked in place and the rest of the sentence survives — dropping the
+    whole line would remove teaching material from a finished booklet. Status
+    codes and token counters are only masked when the line actually looks like a
+    raw backend report; a full sentence about HTTP 429 is lesson content.
+    """
     hits = 0
-    for pattern in (_KEY_PREFIX, _REQUEST_ID, _KEY_ASSIGNMENT, _SELF_REFERENCE, _AI_DISCLAIMER, _META_PHRASE):
+    for pattern in (_KEY_PREFIX, _REQUEST_ID, _KEY_ASSIGNMENT, _SELF_REFERENCE,
+                    _AI_DISCLAIMER):
         line, count = pattern.subn(_REDACTION, line)
         hits += count
-    markers = len(_DIAGNOSTIC_TOKEN.findall(line))
-    if markers >= 2:
-        return "", hits + markers
-    scrubbed, count = _STATUS_PHRASE.subn(_REDACTION, line)
-    return scrubbed, hits + count
+    if _looks_like_backend_report(line):
+        for pattern in (_META_PHRASE, _DIAGNOSTIC_TOKEN, _STATUS_PHRASE):
+            line, count = pattern.subn(_REDACTION, line)
+            hits += count
+    return line, hits
 
 
 def scrub_backend_artifacts(text: str) -> str:
@@ -912,28 +965,90 @@ def scrub_backend_artifacts(text: str) -> str:
 
     Conservative by design: bare provider names survive (a networking lecture
     may legitimately mention Cloudflare or NVIDIA); only self-references,
-    key/id-shaped tokens, diagnostic clusters and meta phrases are removed.
+    key/id-shaped tokens, diagnostic clusters and meta phrases are masked. Text
+    is masked, never dropped: a line whose content is entirely plumbing becomes
+    the redaction marker and is then removed only if nothing else is left.
     """
     if not text:
         return text
     cleaned_lines = []
     for line in str(text).splitlines():
         cleaned, _ = _scrub_line(line)
-        cleaned_lines.append(cleaned)
+        if cleaned.strip() and cleaned.strip() != _REDACTION:
+            cleaned_lines.append(cleaned)
     cleaned = "\n".join(cleaned_lines)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned.strip()
 
 
-def _bounded_text(value: object, limit: int = MAX_TEXT_CHARS) -> str:
-    return scrub_backend_artifacts(str(value if value is not None else ""))[:limit]
+#: Marker appended when a single field is longer than the booklet contract has
+#: room for. The cut is a real content loss, so it is visible in the artifact
+#: and logged by :func:`_bounded_text` instead of happening silently.
+TRUNCATION_MARKER = " …"
 
 
-def _string_list(value: object) -> list[str]:
-    if not isinstance(value, (list, tuple)):
-        return []
-    return [_bounded_text(item) for item in value if _bounded_text(item)]
+#: Keys a model uses when it wraps a single text value in an object although the
+#: contract asks for a plain string (``{"text": …}``, ``{"content": …}``).
+_TEXT_WRAPPER_KEYS = ("text", "content", "value", "body", "description")
+
+
+def _as_text(value: object) -> str:
+    """One text value from whatever shape the model chose for it.
+
+    ``str(dict)`` would ship a Python repr (``{'text': …}``) into the booklet,
+    which is corruption rather than content, so a wrapped string is unwrapped
+    and any other non-scalar becomes empty text (and is then dropped).
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        for key in _TEXT_WRAPPER_KEYS:
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+        return ""
+    if isinstance(value, (list, tuple)):
+        return " ".join(_as_text(item) for item in value).strip()
+    return ""
+
+
+def _as_list(value: object, *, field: str = "") -> list:
+    """A documented list field that the model sent as a single value."""
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, str):
+        if not value.strip():
+            return []
+        logger.warning("note field sent as a string where a list was expected field=%s", field or "list")
+        return [value]
+    if isinstance(value, dict):
+        logger.warning("note field sent as an object where a list was expected field=%s", field or "list")
+        return [value]
+    return []
+
+
+def _bounded_text(value: object, limit: int = MAX_TEXT_CHARS, *, field: str = "") -> str:
+    """Scrubbed text of at most ``limit`` characters, with a visible cut mark."""
+    cleaned = scrub_backend_artifacts(_as_text(value))
+    if len(cleaned) <= limit:
+        return cleaned
+    logger.warning(
+        "note field truncated field=%s original_chars=%d limit=%d",
+        field or "text",
+        len(cleaned),
+        limit,
+    )
+    return cleaned[: max(0, limit - len(TRUNCATION_MARKER))].rstrip() + TRUNCATION_MARKER
+
+
+def _string_list(value: object, *, field: str = "") -> list[str]:
+    items = [_bounded_text(item, field=field) for item in _as_list(value, field=field)]
+    return [item for item in items if item]
 
 
 # ===========================================================================

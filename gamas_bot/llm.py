@@ -374,12 +374,54 @@ _PROMPT_SECRET_TOKEN_RE = re.compile(
 )
 
 
+#: A value is only treated as a credential when it looks like one. Without this
+#: guard an ordinary word sitting in a secret-named environment variable
+#: (``LOGIN_PASS=test``) would be replaced everywhere it occurs in the lecture
+#: text, which is a silent content edit rather than a secret removal.
+_CREDENTIAL_VALUE_MIN_CHARS = 12
+
+
+_CONNECTION_STRING_RE = re.compile(r"^[a-z][a-z0-9+.-]*://\S+$", re.IGNORECASE)
+
+
+def _looks_like_credential_value(value: str) -> bool:
+    """True for token/password-shaped values, false for plain words and labels.
+
+    A credential carries a digit, a connection-string scheme, ZWNJ or non-ASCII
+    text, or is long enough that no ordinary dictionary word matches it.
+    ``"str"``, ``"test"``, ``"student_id"``-style identifiers and a bare ``key``
+    label therefore survive, while ``hunter2``, ``generic-api-secret-123`` and
+    ``postgres://service:db-secret@host/db`` are still removed.
+    """
+    candidate = value.strip().strip("\"'")
+    if not candidate:
+        return False
+    if any(char.isdigit() for char in candidate):
+        return True
+    if any(char in candidate for char in "\u200c\u200d") or any(
+        not char.isascii() for char in candidate
+    ):
+        return True
+    if _CONNECTION_STRING_RE.match(candidate):
+        return True
+    return len(candidate) >= _CREDENTIAL_VALUE_MIN_CHARS
+
+
 def _prompt_secret_values(settings: Settings) -> tuple[str, ...]:
-    """Configured credentials plus secret-named environment values, longest first."""
+    """Configured credentials plus secret-named environment values, longest first.
+
+    Configured provider/Telegram secrets are always removed: they are known
+    credentials whatever their shape. Environment values are removed only when
+    their *name* says secret **and** their value looks like one.
+    """
     values = set(collect_configured_secrets(settings))
     for name, raw_value in os.environ.items():
         value = raw_value.strip()
-        if _PROMPT_SECRET_ENV_NAME_RE.search(name) and len(value) >= 4:
+        if (
+            _PROMPT_SECRET_ENV_NAME_RE.search(name)
+            and len(value) >= 4
+            and _looks_like_credential_value(value)
+        ):
             values.add(value)
     return tuple(sorted(values, key=len, reverse=True))
 
@@ -391,7 +433,12 @@ def _sanitize_prompt_text(text: str, settings: Settings) -> str:
         sanitized = sanitized.replace(secret, "[REDACTED]")
     sanitized = _PROMPT_SECRET_TOKEN_RE.sub("[REDACTED]", sanitized)
     return _PROMPT_CREDENTIAL_ASSIGNMENT_RE.sub(
-        lambda match: match.group("prefix") + "[REDACTED]", sanitized
+        lambda match: (
+            match.group("prefix") + "[REDACTED]"
+            if _looks_like_credential_value(match.group("value"))
+            else match.group(0)
+        ),
+        sanitized,
     )
 
 
@@ -861,6 +908,14 @@ OPENAI_BLOCKED_FINISH_REASONS = frozenset(
 )
 
 
+#: Finish reasons that mean "the model stopped because the answer was done".
+#: Every *other* reason (a documented block, a documented truncation, a stream
+#: that never reported one, or a value a future provider adds) is handled
+#: explicitly: an unrecognised reason is not evidence of a complete answer.
+GEMINI_COMPLETE_FINISH_REASONS = frozenset({"STOP", "FINISH_REASON_UNSPECIFIED"})
+OPENAI_COMPLETE_FINISH_REASONS = frozenset({"stop", "end_turn", "eos", "eos_token"})
+
+
 def _usage_count(value: object) -> int | None:
     """One token count from a provider usage block, or ``None`` if unusable."""
     if isinstance(value, bool):
@@ -1033,6 +1088,20 @@ class OpenAIDialect:
                     "پاسخ سرویس تولید جزوه پیش از پایان به سقف توکن خروجی رسید "
                     "(NOTE_MAX_OUTPUT_TOKENS را افزایش دهید)."
                 )
+        unknown_reason = (
+            finish_reason_lower
+            if finish_reason_lower and finish_reason_lower not in OPENAI_COMPLETE_FINISH_REASONS
+            and finish_reason_lower not in OPENAI_BLOCKED_FINISH_REASONS
+            and native_reason_lower not in OPENAI_COMPLETE_FINISH_REASONS
+            else ""
+        )
+        if unknown_reason:
+            # "error"/"incomplete"/a future value: the provider did not report a
+            # normal end of the answer, so it must not be treated as complete.
+            raise LLMResponseError(
+                "پاسخ سرویس تولید جزوه با وضعیت پایان ناشناخته برگشت "
+                f"({_sanitize_error_text(unknown_reason)})."
+            )
         return text
 
     def extract_usage(
@@ -1198,6 +1267,16 @@ class GeminiDialect:
             raise LLMOutputBudgetError(
                 "پاسخ سرویس تولید جزوه پیش از پایان به سقف توکن خروجی رسید "
                 "(NOTE_MAX_OUTPUT_TOKENS را افزایش دهید)."
+            )
+        if (finish_reason and finish_reason not in GEMINI_COMPLETE_FINISH_REASONS
+                and finish_reason not in GEMINI_BLOCKED_FINISH_REASONS
+                and finish_reason not in GEMINI_MALFORMED_FINISH_REASONS
+                and finish_reason not in ("MAX_TOKENS", "CONTINUATION", "LENGTH")):
+            # A reason this code does not know cannot prove a complete answer
+            # ("OTHER", a new enum value, a gateway-specific string).
+            raise LLMResponseError(
+                "پاسخ سرویس تولید جزوه با وضعیت پایان ناشناخته برگشت "
+                f"({_sanitize_error_text(finish_reason)})."
             )
         return text
 
@@ -1897,7 +1976,42 @@ async def _hedge_two(first_factory, second_factory, hedge_after: float):
             await asyncio.gather(*unfinished, return_exceptions=True)
 
 
+def _stream_text(value: object) -> str:
+    """The text of a streamed ``content`` value, in either gateway shape.
+
+    Some gateways stream ``content`` as a list of text parts (the same shape the
+    non-streaming body uses). ``str(value)`` on that would ship a Python repr to
+    the note parser, so the parts are joined exactly like ``parse_response``.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "".join(
+            str(part.get("text", ""))
+            for part in value
+            if isinstance(part, dict)
+            and part.get("type") not in ("thinking", "reasoning")
+            and part.get("thought") is not True
+        )
+    if isinstance(value, dict):
+        return str(value.get("text", "")) if "text" in value else ""
+    return str(value)
+
+
+#: Sentinel returned by :func:`_parse_sse_line` for a ``data:`` line whose
+#: payload is not a JSON object, so the stream reader can count it (a distinct
+#: value from ``None``, which means "nothing to parse here").
+_UNPARSED_SSE: dict = {"__gamas_unparsed_sse__": True}
+
+
 def _parse_sse_line(line: bytes | str) -> dict | None:
+    """One SSE data line as an object; ``None`` for comments, ``[DONE]`` and junk.
+
+    A line that carries a ``data:`` payload but does not parse as a JSON object
+    is *counted* by the caller (:func:`_complete_streaming_on_route`) rather than
+    silently discarded: a corrupt middle line means a piece of the answer was
+    lost, which is exactly the case that must not look like a complete answer.
+    """
     if isinstance(line, (bytes, bytearray)):
         raw = bytes(line).strip()
         if not raw or raw.startswith(b":"):
@@ -1909,8 +2023,8 @@ def _parse_sse_line(line: bytes | str) -> dict | None:
         try:
             parsed = _loads(raw)
         except (ValueError, TypeError):
-            return None
-        return parsed if isinstance(parsed, dict) else None
+            return _UNPARSED_SSE
+        return parsed if isinstance(parsed, dict) else _UNPARSED_SSE
     text = str(line).strip()
     if not text or text.startswith(":"):
         return None
@@ -1921,8 +2035,8 @@ def _parse_sse_line(line: bytes | str) -> dict | None:
     try:
         parsed = _loads(text.encode("utf-8"))
     except (ValueError, TypeError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
+        return _UNPARSED_SSE
+    return parsed if isinstance(parsed, dict) else _UNPARSED_SSE
 
 
 def _gemini_sse_url(url: str) -> str:
@@ -1988,6 +2102,7 @@ async def _complete_streaming_on_route(
     non_sse_buffer = bytearray()
     saw_sse_prefix = False
     parsed_chunks = 0
+    unparsed_lines = 0
     response_bytes = 0
 
     async with session.post(
@@ -2005,7 +2120,7 @@ async def _complete_streaming_on_route(
         resp_headers = getattr(response, "headers", None)
 
         def consume_line(line: bytes | str, *, count_bytes: bool = True) -> None:
-            nonlocal parsed_chunks, response_bytes, finish_reason, native_finish_reason
+            nonlocal parsed_chunks, unparsed_lines, response_bytes, finish_reason, native_finish_reason
             nonlocal usage, saw_thought, saw_reasoning, saw_candidate, prompt_feedback
             nonlocal model_version, served_model, saw_sse_prefix
             line_bytes_obj = (
@@ -2028,6 +2143,12 @@ async def _complete_streaming_on_route(
 
             chunk = _parse_sse_line(line)
             if chunk is None:
+                return
+            if chunk is _UNPARSED_SSE:
+                # A `data:` line that is not a JSON object: a piece of the
+                # answer was lost mid-stream. Count it; the assembly below
+                # refuses to call such a stream complete.
+                unparsed_lines += 1
                 return
             parsed_chunks += 1
             error_obj = chunk.get("error")
@@ -2083,7 +2204,7 @@ async def _complete_streaming_on_route(
                 delta = choice.get("delta")
                 if isinstance(delta, dict):
                     if delta.get("content"):
-                        text_parts.append(str(delta["content"]))
+                        text_parts.append(_stream_text(delta["content"]))
                     for r_key in ("reasoning", "reasoning_content"):
                         r_val = delta.get(r_key)
                         if isinstance(r_val, str) and r_val.strip():
@@ -2097,7 +2218,7 @@ async def _complete_streaming_on_route(
                 elif isinstance(choice.get("message"), dict):
                     msg_dict = choice["message"]
                     if msg_dict.get("content"):
-                        text_parts.append(str(msg_dict["content"]))
+                        text_parts.append(_stream_text(msg_dict["content"]))
                     for r_key in ("reasoning", "reasoning_content"):
                         r_val = msg_dict.get(r_key)
                         if isinstance(r_val, str) and r_val.strip():
@@ -2196,6 +2317,11 @@ async def _complete_streaming_on_route(
         except (ValueError, TypeError):
             pass
 
+    # A stream that ends without a terminal reason did not *say* it finished:
+    # it merely stopped. Reporting it as STOP/stop would let a dropped
+    # connection pass the truncation guard, so the missing/unparsed evidence is
+    # kept explicit and the regular response guard rejects it below.
+    lost_stream_evidence = bool(unparsed_lines) or (parsed_chunks > 0 and not finish_reason)
     if is_gemini:
         assembled_parts: list[dict[str, object]] = []
         if saw_thought:
@@ -2206,7 +2332,7 @@ async def _complete_streaming_on_route(
         if saw_candidate or not prompt_feedback:
             assembled["candidates"] = [{
                 "content": {"parts": assembled_parts},
-                "finishReason": finish_reason or "STOP",
+                "finishReason": finish_reason or ("INCOMPLETE_STREAM" if lost_stream_evidence else "STOP"),
             }]
         if prompt_feedback:
             assembled["promptFeedback"] = prompt_feedback
@@ -2222,7 +2348,7 @@ async def _complete_streaming_on_route(
             assembled_msg["refusal"] = "".join(refusal_parts)
         assembled_choice: dict[str, Any] = {
             "message": assembled_msg,
-            "finish_reason": finish_reason or "stop",
+            "finish_reason": finish_reason or ("incomplete_stream" if lost_stream_evidence else "stop"),
         }
         if native_finish_reason:
             assembled_choice["native_finish_reason"] = native_finish_reason
@@ -2238,6 +2364,17 @@ async def _complete_streaming_on_route(
         requested_output_tokens=requested_output_tokens,
     )
     _raise_if_in_body_error(route.label, assembled, resp_headers, route.api_key or None)
+    if lost_stream_evidence:
+        logger.warning(
+            "LLM stream ended without a terminal reason provider=%s unparsed_lines=%d chunks=%d",
+            route.slug,
+            unparsed_lines,
+            parsed_chunks,
+        )
+        raise LLMResponseError(
+            "جریان پاسخ سرویس تولید جزوه پیش از پایان قطع شد "
+            f"({unparsed_lines} خط ناخوانا از {parsed_chunks} بسته)."
+        )
     return _parse_response(assembled, route.style)
 
 
@@ -2944,12 +3081,69 @@ def _balanced_object_end(text: str, start: int) -> int | None:
     return None
 
 
+#: Top-level keys every model task actually asks for (notes/plan/quiz/cards/
+#: office/review/verify). A model answer can legitimately contain more than one
+#: balanced JSON object — a reasoning draft, a set-notation fragment, or the
+#: documented contract example echoed before the real payload. Preferring the
+#: first balanced object would then hand a *placeholder* to the caller, so the
+#: payload-shaped object is chosen explicitly and ambiguity is an error.
+#: ``items`` is deliberately excluded: it is too generic to be a tie-breaker
+#: and appears inside unrelated prose objects.
+_PAYLOAD_KEYS = frozenset(
+    {
+        "sections", "title", "summary", "glossary", "topics", "questions",
+        "cards", "verdicts", "headers", "rows", "lines", "issues", "plan",
+        "paragraphs", "key_points", "answer", "explanation",
+    }
+)
+
+
+def _is_payload_object(parsed: object) -> bool:
+    """True when a parsed object carries at least one task-level payload key."""
+    return isinstance(parsed, dict) and bool(_PAYLOAD_KEYS.intersection(parsed))
+
+
+def _first_duplicate_key(text: str) -> str:
+    """The first key a JSON document repeats, or ``""`` when keys are unique.
+
+    ``json.loads`` (and ``orjson``) silently keep the last value of a repeated
+    key. For a note payload that means a whole duplicated ``sections`` array can
+    disappear without a trace, so the answer is checked for it explicitly.
+    """
+    seen: set[str] = set()
+    try:
+        pairs = json.loads(
+            text,
+            object_pairs_hook=lambda items: items,
+            parse_constant=lambda value: value,
+        )
+    except (ValueError, TypeError, RecursionError):
+        return ""
+    stack = [pairs]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, list):
+            if node and isinstance(node[0], tuple) and len(node[0]) == 2:
+                for key, value in node:
+                    if key in seen:
+                        return str(key)
+                    seen.add(key)
+                    stack.append(value)
+            else:
+                stack.extend(node)
+    return ""
+
+
 def extract_json_object(text: str) -> str:
-    """Extract the outermost valid JSON object from a model answer.
+    """Extract the outermost payload-shaped JSON object from a model answer.
 
     Strips inline ``<think>...</think>`` reasoning blocks, prioritizes fenced
     JSON blocks, and skips non-JSON ``{...}`` prose fragments (e.g. set notation
-    before the real payload) in favor of the first balanced JSON ``dict``.
+    before the real payload). Among several balanced objects, the one carrying
+    a task-level key (see :data:`_PAYLOAD_KEYS`) wins; two *different* such
+    objects make the answer ambiguous and are rejected instead of silently
+    picking one — a placeholder contract example next to the real answer must
+    never be delivered as the answer.
     """
     cleaned = _THINK_TAG_RE.sub("", text or "").strip()
     if "</think" in cleaned.lower():
@@ -2964,7 +3158,7 @@ def extract_json_object(text: str) -> str:
         regions.append(unfenced)
     regions.append(cleaned)
 
-    first_balanced: str | None = None
+    payload_candidates: list[str] = []
     saw_opening_brace = False
     for region in regions:
         search_from = 0
@@ -2978,34 +3172,64 @@ def extract_json_object(text: str) -> str:
                 search_from = brace_idx + 1
                 continue
             candidate = region[brace_idx:end_idx]
-            if first_balanced is None:
-                first_balanced = candidate
             try:
                 parsed = json.loads(candidate)
-                if isinstance(parsed, dict):
-                    return candidate
             except ValueError:
-                pass
-            search_from = brace_idx + 1
+                search_from = brace_idx + 1
+                continue
+            # Only *top-level* objects compete: a nested section object carries
+            # payload keys too, but it is part of the document, not a second
+            # answer. Past a balanced object, scanning resumes after it.
+            if _is_payload_object(parsed) and candidate not in payload_candidates:
+                payload_candidates.append(candidate)
+            search_from = end_idx
 
-    if first_balanced is not None:
-        return first_balanced
+    distinct_payloads = list(dict.fromkeys(payload_candidates))
+    if len(distinct_payloads) > 1:
+        # Two complete answers in one response: choosing one would silently drop
+        # the other, so the caller must retry/fail over instead.
+        raise LLMResponseError("پاسخ مدل چند شیء JSON متفاوت داشت و قابل انتخاب نبود.")
+
+    if distinct_payloads:
+        return distinct_payloads[0]
+
+    # No payload-shaped object: keep the historical behaviour of returning the
+    # first balanced object (a shape the domain validator then rejects).
+    for region in regions:
+        brace_idx = region.find("{")
+        while brace_idx >= 0:
+            end_idx = _balanced_object_end(region, brace_idx)
+            if end_idx is not None:
+                candidate = region[brace_idx:end_idx]
+                try:
+                    if isinstance(json.loads(candidate), dict):
+                        return candidate
+                except ValueError:
+                    pass
+            brace_idx = region.find("{", brace_idx + 1)
+
     if saw_opening_brace:
         raise LLMResponseError("شیء JSON در پاسخ مدل کامل نبود.")
     raise LLMResponseError("پاسخ مدل شامل هیچ شیء JSON نبود.")
 
 
 def _parse_json_object(text: str, *, strict: bool = False) -> dict:
-    """Parse strict JSON and enforce the object shape used by note prompts."""
+    """Parse JSON and enforce the object shape used by note prompts.
+
+    Duplicate object keys are rejected in both modes: ``json`` (and ``orjson``)
+    keep the last value, so a repeated ``sections`` array would drop a whole
+    half of the answer without any error.
+    """
     if not strict and _orjson is not None and isinstance(text, str):
         stripped = text.strip()
         if stripped.startswith("{") and stripped.endswith("}"):
             try:
                 fast_payload = _orjson.loads(stripped)
-                if isinstance(fast_payload, dict):
-                    return fast_payload
             except ValueError:
                 pass
+            else:
+                if isinstance(fast_payload, dict) and not _first_duplicate_key(stripped):
+                    return fast_payload
 
     def reject_constant(value: str) -> None:
         raise ValueError(f"non-standard JSON constant: {value}")
@@ -3022,7 +3246,7 @@ def _parse_json_object(text: str, *, strict: bool = False) -> dict:
         payload = json.loads(
             text if strict else extract_json_object(text),
             parse_constant=reject_constant,
-            object_pairs_hook=unique_keys if strict else None,
+            object_pairs_hook=unique_keys,
         )
     except (LLMResponseError, ValueError, TypeError, RecursionError) as exc:
         raise LLMResponseError("پاسخ مدل شامل JSON معتبر نبود.") from exc

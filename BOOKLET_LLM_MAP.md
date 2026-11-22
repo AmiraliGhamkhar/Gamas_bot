@@ -186,6 +186,16 @@ StructuredNotes  (notes.py)
 
 ---
 
+### د) حفظ متن در مرز درخواست/پاسخ — ✅ اصلاح شد
+
+بررسی «جا انداختن متن» (تفصیل در `AUDIT/TEXT_LOSS_AUDIT_FA.md`) هشت نقطهٔ افت/خرابی خاموش را نشان داد که
+همه اصلاح شدند: انتخاب اولین شیء JSON به‌جای شیء payload، نسبت `STOP` ساختگی برای جریان بدون نشانهٔ پایان،
+دور ریختن خط خراب SSE، حذف کل خط درس توسط پاک‌سازی بک‌اند، حذف بخش در صورت رشته‌بودن آرایه،
+بریدن بی‌صدا در `_bounded_text`، ماسک واژه‌های عادی به‌دست فیلتر رازداری، و `str()` روی محتوای فهرستی
+جریان. پوشش تست: `tests/test_prompt_and_parse_fidelity.py` + چهار تست جریان در `tests/test_llm_perf.py`.
+
+---
+
 ## ۱۱) آنچه در این بررسی اجرا شد
 
 گیت کامل پروژه روی همین شاخه، پس از پاک‌سازی:
@@ -194,8 +204,8 @@ StructuredNotes  (notes.py)
 python -m compileall -q gamas_bot scripts tests   → موفق
 ruff check .                                      → All checks passed  (روی main شکست می‌خورد)
 python -m mypy (۸۰ ماژول)                          → فقط ۲ خطای از پیش موجود metrics.py (windll ویندوز)
-python -m pytest -q                               → 2016 passed, 521 subtests
-python -m unittest discover -s tests -q           → 1898 tests OK
+python -m pytest -q                               → 2039 passed, 502 subtests  (پس از پاس حفظ متن)
+python -m unittest discover -s tests -q           → 1929 tests OK
 pip check / sync_requirements --check / media_worker check → همه سالم
 ```
 
