@@ -201,6 +201,30 @@ Truncated (`finish_reason=length`), empty and malformed answers raise
 `LLMResponseError` and fall through to the next eligible route instead of
 producing a partial booklet.
 
+Completeness is judged on positive evidence, not on the absence of an error:
+
+- a streamed answer that ends without any terminal `finish_reason`/
+  `finishReason` is **not** labelled `stop`/`STOP`; the stream is reported as
+  cut off and the next route is tried (a dropped connection looks exactly like
+  that, so "it just stopped" can never pass as "it finished");
+- one unparsable `data:` line inside a stream also marks the answer incomplete,
+  because that line carried a piece of the text;
+- a `finish_reason`/`finishReason` this build does not recognise (`incomplete`,
+  `error`, `OTHER`, a new enum value) is a hard error rather than an assumed
+  success;
+- when a response contains two *different* complete JSON payloads (for example
+  the documented contract example echoed before the real answer) the answer is
+  rejected as ambiguous instead of silently picking the first one, and a
+  duplicated top-level key is an error in both strict and permissive parsing.
+
+On the prompt side, credential redaction removes only credential-shaped values:
+a configured provider secret is always removed, but an environment value is
+removed only when its name says secret *and* its value looks like one (a digit,
+a symbol, or at least twelve characters). Ordinary lesson words such as
+`test`/`demo` therefore survive even when they sit in a `*_PASS` variable, and
+schema-flavoured text (`password: str`, `PRIMARY KEY: student_id`) is not
+mistaken for a credential.
+
 ### Safe probes
 
 ```bash

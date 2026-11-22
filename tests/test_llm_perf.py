@@ -174,7 +174,9 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         settings = routed_settings(note_ttfb_timeout=0.0, note_hedge_after=0.0)
         route = note_routes(settings)[0]
         session = DispatchSession([
-            ("api.avalai.ir", StreamingResponse([sse(delta("fast")), b"data: [DONE]"]))
+            ("api.avalai.ir", StreamingResponse([
+                sse(delta("fast")), sse(delta("", finish="stop")), b"data: [DONE]",
+            ]))
         ])
         result = await llm._complete_streaming_on_route(
             route,
@@ -205,7 +207,11 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         deltas parse as the JSON object the schema describes.
         """
         expected = {"sections": [{"heading": "مقدمه"}]}
-        lines = [sse(delta(json.dumps(expected, ensure_ascii=False))), b"data: [DONE]"]
+        lines = [
+            sse(delta(json.dumps(expected, ensure_ascii=False))),
+            sse(delta("", finish="stop")),
+            b"data: [DONE]",
+        ]
         session = DispatchSession([("api.avalai.ir", lambda: StreamingResponse(lines))])
         schema = {
             "type": "object",
@@ -226,6 +232,69 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent["stream"])
         self.assertEqual(sent["response_format"]["type"], "json_schema")
         self.assertEqual(sent["response_format"]["json_schema"]["name"], "gamas_notes")
+
+    async def test_stream_without_a_terminal_reason_is_not_reported_complete(self):
+        """A stream that just stops must not be labelled STOP/stop.
+
+        A dropped connection ends the body without the provider ever saying the
+        answer finished. Reporting that as a complete answer is the one silent
+        truncation the truncation guard cannot see, so it is rejected.
+        """
+        lines = [sse(delta("نیمهٔ پاسخ")), b"data: [DONE]"]
+        session = DispatchSession([("api.avalai.ir", lambda: StreamingResponse(lines))])
+        with self.assertRaises(LLMResponseError):
+            await complete(session, self.settings(), system="S", user="U")
+        # The chain's public error aggregates provider labels; the specific
+        # reason is what the single-route call reports, asserted next.
+        with self.assertRaises(LLMResponseError) as route_ctx:
+            await llm._complete_on_route(
+                note_routes(self.settings())[0], session, self.settings(),
+                system="S", user="U",
+            )
+        self.assertIn("قطع", str(route_ctx.exception))
+
+    async def test_gemini_stream_without_finish_reason_is_rejected(self):
+        gemini_lines = [
+            sse({"candidates": [{"content": {"parts": [{"text": "نیمه"}]}}]}),
+            b"data: [DONE]",
+        ]
+        session = DispatchSession([
+            ("generativelanguage.googleapis.com", lambda: StreamingResponse(gemini_lines))
+        ])
+        settings = make_settings(
+            gemini_api_key="g-test", note_providers=("gemini",), note_ttfb_timeout=0.5
+        )
+        with self.assertRaises(LLMResponseError):
+            await complete(session, settings, system="S", user="U")
+
+    async def test_an_unparsable_stream_line_marks_the_answer_incomplete(self):
+        """One corrupt `data:` line lost a piece of the answer; that is not success."""
+        good = sse(delta("جملهٔ اول. "))
+        corrupt = b'data: {"choices":[{"delta":{"content":"\xd8\xa7\xd8\xb2"\n'
+        tail = sse(delta(" جملهٔ سوم.", finish="stop"))
+        session = DispatchSession([
+            ("api.avalai.ir", lambda: StreamingResponse([good, corrupt, tail]))
+        ])
+        with self.assertRaises(LLMResponseError):
+            await complete(session, self.settings(), system="S", user="U")
+        with self.assertRaises(LLMResponseError) as route_ctx:
+            await llm._complete_on_route(
+                note_routes(self.settings())[0], session, self.settings(),
+                system="S", user="U",
+            )
+        self.assertIn("ناخوانا", str(route_ctx.exception))
+
+    async def test_streamed_list_shaped_content_is_joined_not_stringified(self):
+        """A gateway that streams `content` as parts must not ship a Python repr."""
+        part_lines = [
+            sse({"choices": [{"delta": {"content": [
+                {"type": "text", "text": "سلام "}, {"type": "text", "text": "دنیا"},
+            ]}}]}),
+            sse(delta("", finish="stop")),
+        ]
+        session = DispatchSession([("api.avalai.ir", lambda: StreamingResponse(part_lines))])
+        result = await complete(session, self.settings(), system="S", user="U")
+        self.assertEqual(result, "سلام دنیا")
 
     async def test_length_finish_reason_is_output_budget_error(self):
         lines = [sse(delta("partial", finish="length")), b"data: [DONE]"]
@@ -283,7 +352,11 @@ class ShippedDefaultWiringTests(unittest.IsolatedAsyncioTestCase):
         settings = self.settings()
         self.assertEqual(settings.note_ttfb_timeout, 25.0)
         expected = {"sections": [{"heading": "مقدمه"}]}
-        lines = [sse(delta(json.dumps(expected, ensure_ascii=False))), b"data: [DONE]"]
+        lines = [
+            sse(delta(json.dumps(expected, ensure_ascii=False))),
+            sse(delta("", finish="stop")),
+            b"data: [DONE]",
+        ]
         session = DispatchSession([("api.avalai.ir", lambda: StreamingResponse(lines))])
         result = await complete_json(
             session,
