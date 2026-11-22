@@ -218,8 +218,12 @@ def peak_rss_bytes() -> int:
 
             counters = _PROCESS_MEMORY_COUNTERS()
             counters.cb = ctypes.sizeof(_PROCESS_MEMORY_COUNTERS)
-            handle = ctypes.windll.kernel32.GetCurrentProcess()
-            ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+            # ``ctypes.windll`` only exists on Windows; mypy resolves the type
+            # stub on every platform, so the attribute is suppressed here while
+            # the enclosing ``os.name == "nt"`` branch and ``try`` keep it safe.
+            windll = ctypes.windll  # type: ignore[attr-defined]
+            handle = windll.kernel32.GetCurrentProcess()
+            ok = windll.psapi.GetProcessMemoryInfo(
                 handle, ctypes.byref(counters), counters.cb
             )
             if ok:
