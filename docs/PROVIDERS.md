@@ -91,10 +91,11 @@ use configurable deployment ceilings rather than inheriting these limits. The
 native Google route can use [`models.countTokens`](https://ai.google.dev/api/tokens)
 with the sanitized generation request; failure or an unsupported endpoint falls
 back to estimation. The counter is not sent to custom proxies.
-Operating defaults remain **131072 context / 64000 chunk characters / 16384
-output**, with `NOTE_COMPILE=false`; never substitute a reference context window
-for the output budget. Verify current model documentation and entitlement
-before changing a deployment. Offline tests do not verify live compatibility.
+Operating defaults remain **262144 context / 64000 chunk characters / 20000
+pack target / 65536 output**, with `NOTE_COMPILE=false`; never substitute a
+reference context window for the output budget. Verify current model
+documentation and entitlement before changing a deployment. Offline tests do
+not verify live compatibility.
 
 ### Quota budgets and reliability
 

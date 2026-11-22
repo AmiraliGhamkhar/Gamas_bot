@@ -213,7 +213,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotIn("openai_compatible", [r.slug for r in routes])
         # The shipped, project-wide default is the three-provider chain.
         self.assertEqual(DEFAULT_NOTE_PROVIDERS, "avalai,gemini,openrouter")
-        self.assertEqual(DEFAULT_NOTE_MAX_OUTPUT_TOKENS, 16384)
+        self.assertEqual(DEFAULT_NOTE_MAX_OUTPUT_TOKENS, 65536)
 
     def test_no_legacy_openai_compatible_route_without_legacy_credentials(self):
         settings = settings_from_env(NOTE_PROVIDER="openai_compatible")

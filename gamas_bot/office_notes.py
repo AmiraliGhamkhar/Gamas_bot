@@ -22,6 +22,7 @@ from .llm import LLMError, complete_json
 from .document_model import NormalizedDocument, SourceBlock
 from .notes import (
     MAX_SOURCE_LOCATORS_PER_SECTION,
+    QUALITY_RECOVERED,
     NoteQualityError,
     NoteSection,
     StructuredNotes,
@@ -456,6 +457,16 @@ def _normalize_office_source(
         if not text:
             continue
         markers = _attached_locator_matches(OfficeSourceChunk(text, chunk.locators))
+        if not markers:
+            parsed = NormalizedDocument.from_source_text(text, source_type=source_type)
+            for idx, subblock in enumerate(parsed.source_blocks):
+                prefix = "\n\n" if blocks and idx == 0 else ""
+                blocks.append(SourceBlock(
+                    "", subblock.kind, prefix + subblock.text, 0, 0,
+                    page_number=subblock.page_number,
+                    slide_number=subblock.slide_number,
+                ))
+            continue
         starts = sorted({0, *(match.start() for match in markers), len(text)})
         labels = {match.start(): match.group(1) for match in markers}
         for start, end in zip(starts, starts[1:], strict=False):
@@ -533,7 +544,7 @@ async def generate_full_booklet(
         except StructuringError:
             return fallback, True
         if structurally_valid_booklet(normalized) and normalized.has_content:
-            return normalized, False
+            return normalized, (normalized.quality_state == QUALITY_RECOVERED)
         return fallback, True
     if not _full_result_is_grounded(generated, source, allowed, locator_sources):
         return fallback, True

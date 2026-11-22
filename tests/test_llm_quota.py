@@ -86,7 +86,7 @@ def test_central_dispatch_reserves_budget_and_skips_exhausted_route(tmp_path):
             _ACTUAL_USAGE_TOKENS.set(75)
             return {"ok": True}
 
-        for expected in (True, False):
+        for expected in (True, True, False):
             try:
                 result = await _dispatch_across_routes(
                     (route,), object(), settings, handler, reservation_tokens=500,
@@ -98,7 +98,7 @@ def test_central_dispatch_reserves_budget_and_skips_exhausted_route(tmp_path):
             except Exception as exc:
                 assert not expected
                 assert "quota" in str(exc).lower() or "سهمیه" in str(exc)
-        assert calls == ["called"]
+        assert calls == ["called", "called"]
         with sqlite3.connect(db_path) as conn:
             requests = conn.execute(
                 "SELECT COUNT(*) FROM llm_quota_requests WHERE provider='avalai'"
@@ -106,8 +106,10 @@ def test_central_dispatch_reserves_budget_and_skips_exhausted_route(tmp_path):
             tokens = conn.execute(
                 "SELECT SUM(tokens) FROM llm_quota_requests WHERE provider='avalai'"
             ).fetchone()[0]
-        assert requests == 2  # initial request + one reserved bounded retry
-        assert tokens == 75  # actual usage reconciles below the 500-token reservation
+        # Unused retry slots are released on finish, so two single-attempt
+        # calls consume exactly two RPD entries (and the third is rejected).
+        assert requests == 2
+        assert tokens == 150  # actual usage reconciles below the 500-token reservation
         operation = METRICS.snapshot()["llm_operations"][
             "BOOKLET_GENERATION|avalai|test-model"
         ]

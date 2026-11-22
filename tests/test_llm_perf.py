@@ -350,7 +350,7 @@ class ShippedDefaultWiringTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_fresh_install_streams_and_sends_the_schema(self):
         settings = self.settings()
-        self.assertEqual(settings.note_ttfb_timeout, 25.0)
+        self.assertEqual(settings.note_ttfb_timeout, 60.0)
         expected = {"sections": [{"heading": "مقدمه"}]}
         lines = [
             sse(delta(json.dumps(expected, ensure_ascii=False))),

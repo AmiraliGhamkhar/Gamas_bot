@@ -662,7 +662,7 @@ class ContextOverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(notes.quality_state, "RECOVERED")
         self.assertTrue(notes.sections)
         self.assertGreater(len(session.calls), 1)
-        self.assertLessEqual(len(session.calls), 1 + 2 ** 1 + 2 ** MAX_CONTEXT_SPLITS)
+        self.assertLessEqual(len(session.calls), (2 ** (MAX_CONTEXT_SPLITS + 1)) - 1)
 
 
 class _AsyncCM:

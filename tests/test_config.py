@@ -365,11 +365,11 @@ class NoteChainPolicyTests(unittest.TestCase):
         settings = self.settings(AVALAI_API_KEY="av", OPENROUTER_API_KEY="or")
         self.assertEqual(settings.openrouter_model, DEFAULT_OPENROUTER_MODEL)
         self.assertEqual(settings.note_context_tokens, DEFAULT_NOTE_CONTEXT_TOKENS)
-        self.assertEqual(settings.note_context_tokens, 131072)
+        self.assertEqual(settings.note_context_tokens, 262144)
         self.assertEqual(settings.note_chunk_chars, DEFAULT_NOTE_CHUNK_CHARS)
         self.assertEqual(settings.note_chunk_chars, 64000)
-        self.assertEqual(settings.note_max_output_tokens, 16384)
-        self.assertLess(settings.note_max_output_tokens, 32768)
+        self.assertEqual(settings.note_pack_target_chars, 20000)
+        self.assertEqual(settings.note_max_output_tokens, 65536)
         # Automatic compile budget and provider-default reasoning out of the box.
         self.assertEqual(settings.note_compile_max_chars, 0)
         self.assertEqual(settings.note_reasoning_effort, "")
@@ -383,7 +383,7 @@ class NoteChainPolicyTests(unittest.TestCase):
 
     def test_the_request_deadline_is_configurable(self):
         settings = self.settings(AVALAI_API_KEY="a")
-        self.assertEqual(settings.note_request_timeout, 900.0)
+        self.assertEqual(settings.note_request_timeout, 1200.0)
         self.assertEqual(settings.note_request_timeout, DEFAULT_NOTE_REQUEST_TIMEOUT_SECONDS)
         settings = self.settings(AVALAI_API_KEY="a", NOTE_REQUEST_TIMEOUT_SECONDS="600")
         self.assertEqual(settings.note_request_timeout, 600.0)
@@ -704,8 +704,9 @@ class ShippedDefaultTests(unittest.TestCase):
         self.assertEqual(self.settings.llm_fallback_max_in_flight, 1)
 
     def test_note_performance_defaults(self):
-        self.assertEqual(self.settings.note_ttfb_timeout, 25.0)
+        self.assertEqual(self.settings.note_ttfb_timeout, 60.0)
         self.assertEqual(self.settings.note_hedge_after, 0.0)
+        self.assertEqual(self.settings.note_pack_target_chars, 20000)
         self.assertEqual(self.settings.note_concurrency, 3)
         self.assertTrue(self.settings.note_structured_output)
         # Gamas 2.0 sends one completion message with independent downloads;

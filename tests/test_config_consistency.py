@@ -93,6 +93,7 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("NOTE_MAX_OUTPUT_TOKENS", "note_max_output_tokens", "int"),
     ("NOTE_REQUEST_TIMEOUT_SECONDS", "note_request_timeout", "float"),
     ("NOTE_CHUNK_CHARS", "note_chunk_chars", "int"),
+    ("NOTE_PACK_TARGET_CHARS", "note_pack_target_chars", "int"),
     ("NOTE_CONCURRENCY", "note_concurrency", "int"),
     ("LLM_PRIMARY_MAX_IN_FLIGHT", "llm_primary_max_in_flight", "int"),
     ("LLM_FALLBACK_MAX_IN_FLIGHT", "llm_fallback_max_in_flight", "int"),
@@ -283,6 +284,10 @@ class DocumentedDefaultsTests(unittest.TestCase):
     #: number here is a documentation bug with a performance cost.
     SHIPPED_DEFAULT_EXAMPLES = (
         ("STT_PROVIDERS", "stt_providers", "csv"),
+        ("NOTE_CONTEXT_TOKENS", "note_context_tokens", "int"),
+        ("NOTE_MAX_OUTPUT_TOKENS", "note_max_output_tokens", "int"),
+        ("NOTE_PACK_TARGET_CHARS", "note_pack_target_chars", "int"),
+        ("NOTE_REQUEST_TIMEOUT_SECONDS", "note_request_timeout", "float"),
         ("NOTE_CONCURRENCY", "note_concurrency", "int"),
         ("NOTE_TTFB_TIMEOUT_SECONDS", "note_ttfb_timeout", "float"),
         ("NOTE_HEDGE_AFTER_SECONDS", "note_hedge_after", "float"),
