@@ -669,8 +669,6 @@ class GamasBot(
                 Button.inline(texts.BTN_HISTORY, b"results"),
             ],
         ]
-        if self.settings.office_enabled:
-            rows.append([Button.inline(texts.BTN_OFFICE, b"office:start")])
         rows.extend(
             [
                 [Button.inline(texts.BTN_HELP, b"help"),
