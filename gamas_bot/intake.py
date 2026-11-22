@@ -85,8 +85,9 @@ FAILURE_KIND_LABELS_FA: dict[str, str] = {
     # Reported when the row carries no recorded category (reserved for NULL).
     "unclassified": "طبقه‌بندی‌نشده",
     # Partial-delivery notices recorded against status='partial' submissions;
-    # surfaced in the processing report's partial-issue block.
-    "notes": "ساخت جزوهٔ ساختارمند",
+    # surfaced in the processing report's partial-issue block. Each one is its
+    # own kind: a plain ``notes`` kind is the *stage* failure above, so it must
+    # not be redefined here (a repeated dict key would silently win).
     "notes_quality": "کیفیت جزوه (پشتوانهٔ ناکافی)",
     "notes_structure": "ساختار نامعتبر جزوه",
     "notes_incomplete": "جزوهٔ ناقص تأییدشده",

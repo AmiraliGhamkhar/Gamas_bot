@@ -717,9 +717,11 @@ class Settings:
     note_repair_max_output_tokens: int = 0
     note_llm_planner: bool = False
     #: CR-4: after the map-reduce draft, re-scan the source and fill detected
-    #: coverage gaps with bounded, strictly grounded LLM requests. Enabled in
-    #: production by default; tests use the dataclass default (``False``) so
-    #: offline fixtures keep a fixed request count.
+    #: coverage gaps with bounded, strictly grounded LLM requests. Off unless an
+    #: operator opts in with ``NOTE_COMPLETENESS_FILL=true``; the shipped
+    #: default is ``False`` (``.env.example`` and ``docs/CONFIGURATION.md``
+    #: agree), so a booklet is never charged for a second coverage pass by
+    #: default. Tests keep the same dataclass default to fix the request count.
     note_completeness_fill: bool = False
     #: Hard call cap for command-driven booklet repair. The implementation has
     #: three ordered passes, but stops early and never exceeds this bound.

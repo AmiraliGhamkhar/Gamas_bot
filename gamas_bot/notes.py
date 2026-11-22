@@ -188,10 +188,6 @@ MAX_NOTE_CHUNKS = 200
 #: Hard ceiling on practical tips in one booklet; a long lecture may contain
 #: more advice than a study document should surface at once.
 MAX_PRACTICAL_TIPS = 8
-#: How many sections one targeted repair request may carry when the whole
-#: booklet does not fit the repair budget. The lost facts live in a handful of
-#: sections, and the rest of the booklet is delivered unchanged and uncharged.
-MAX_REPAIR_SECTIONS = 6
 #: How many missing signals one repair request may carry. The windows are
 #: bounded, so the repair request stays far below the compile budget.
 MAX_REPAIR_SIGNALS = 40
@@ -210,21 +206,15 @@ REPAIR_MISSING_TERM = "REPAIR_MISSING_TERM"
 REPAIR_MISSING_CONTENT = "REPAIR_MISSING_CONTENT"
 REPAIR_WRONG_NUMBER = "REPAIR_WRONG_NUMBER"
 REPAIR_WRONG_TERM = "REPAIR_WRONG_TERM"
-REPAIR_STRUCTURE = "REPAIR_STRUCTURE"
-REPAIR_DUPLICATE = "REPAIR_DUPLICATE"
 REPAIR_TABLE = "REPAIR_TABLE"
 REPAIR_LOCATOR = "REPAIR_LOCATOR"
 REPAIR_COVERAGE = "REPAIR_COVERAGE"
-REPAIR_FORMAT = "REPAIR_FORMAT"
 
 REPAIR_CRITICAL_CODES = frozenset(
     {REPAIR_UNSUPPORTED_CLAIM, REPAIR_WRONG_NUMBER, REPAIR_WRONG_TERM}
 )
 REPAIR_COVERAGE_CODES = frozenset(
     {REPAIR_MISSING_NUMBER, REPAIR_MISSING_TERM, REPAIR_MISSING_CONTENT, REPAIR_COVERAGE}
-)
-REPAIR_STRUCTURAL_CODES = frozenset(
-    {REPAIR_STRUCTURE, REPAIR_DUPLICATE, REPAIR_TABLE, REPAIR_LOCATOR, REPAIR_FORMAT}
 )
 
 QUALITY_VERIFIED = "VERIFIED"
@@ -1974,11 +1964,6 @@ def compact_notes_payload(notes: StructuredNotes) -> dict:
     return payload
 
 
-def build_compile_document(context: LectureContext, notes: StructuredNotes) -> str:
-    """Legacy draft envelope retained for callers sizing targeted repair."""
-    return build_edit_message(build_source_digest(context), _notes_draft_json(notes))
-
-
 def build_source_digest(context: LectureContext) -> str:
     """The editorial orientation map; it is not source evidence.
 
@@ -1994,10 +1979,6 @@ def build_source_digest(context: LectureContext) -> str:
     if not listed_topics:
         return "موضوع‌های درس به ترتیب در دسترس نیست."
     return "موضوع‌های درس به ترتیب: " + "، ".join(listed_topics)
-
-
-def _notes_draft_json(notes: StructuredNotes) -> str:
-    return json.dumps(compact_notes_payload(notes), ensure_ascii=False)
 
 
 def _notes_structured_item_count(notes: StructuredNotes) -> int:
@@ -2321,24 +2302,6 @@ def structurally_valid_booklet(notes: StructuredNotes) -> bool:
     return True
 
 
-def completeness_failure(report: NoteQualityReport, *, mode: str = "full") -> str | None:
-    """A user-facing PARTIAL reason, never a hard acceptance rejection.
-
-    Recall floors and lexical sentence coverage are diagnostic only. They may
-    trigger a bounded repair or a partial-result notice, but do not make a safe
-    structured booklet disappear.
-    """
-    _ = resolve_note_mode(mode)  # retained for API compatibility
-    audit = report.audit
-    if any(signal.kind == "number" for signal in audit.missing):
-        return "missing_numbers"
-    if audit.missing:
-        return "missing_terms"
-    if report.coverage.ratio < FINAL_SENTENCE_COVERAGE_FLOOR:
-        return "low_instructional_coverage"
-    return None
-
-
 def enforce_final_acceptance(
     notes: StructuredNotes,
     report: NoteQualityReport,
@@ -2558,60 +2521,6 @@ def build_repair_issues(
         key=lambda issue: dict(issue.source_signal_metadata).get("risk") != "high"
     )
     return tuple(unique[:max(1, limit)])
-
-
-def _repair_issues_for_pass(issues: Sequence[RepairIssue], pass_name: str) -> tuple[RepairIssue, ...]:
-    if pass_name == "claim_repair":
-        allowed = REPAIR_CRITICAL_CODES
-    elif pass_name == "coverage_repair":
-        allowed = REPAIR_COVERAGE_CODES
-    else:
-        allowed = REPAIR_STRUCTURAL_CODES
-    return tuple(issue for issue in issues if issue.code in allowed)
-
-
-def repair_target_indexes(
-    notes: StructuredNotes,
-    report: NoteQualityReport,
-    source: str,
-    *,
-    limit: int = MAX_REPAIR_SECTIONS,
-) -> list[int]:
-    """Which sections a bounded repair request should carry, best first.
-
-    A booklet above the repair budget cannot be re-sent whole, but the lost
-    facts belong to particular sections. Sections whose text overlaps the source
-    window of a missing or fabricated signal score highest (that is where the
-    fact belongs); the remaining slots are filled in document order so a
-    booklet-wide pattern is not hidden behind the first few sections. The caller
-    presents the chosen sections in document order.
-    """
-    total = len(notes.sections)
-    if total <= limit:
-        return list(range(total))
-    # Each section's words are computed once: the booklet can hold hundreds of
-    # sections and every signal window would otherwise re-tokenize all of them.
-    section_words = [
-        content_words(section_plain_text(section)) for section in notes.sections
-    ]
-    scores = [0] * total
-    signals = [*report.audit.missing, *report.audit.fabricated]
-    for _signal, window in evidence_windows(source, signals, radius=REPAIR_WINDOW_CHARS):
-        window_words = content_words(window)
-        if not window_words:
-            continue
-        for index, words in enumerate(section_words):
-            overlap = len(window_words & words)
-            if overlap:
-                scores[index] += overlap
-    if not any(scores):
-        # No signal locates itself in the booklet: spread the bounded request
-        # across it instead of repairing only its opening sections, which is
-        # where a booklet-wide pattern (a repeated term, a recurring unit) would
-        # never be found.
-        step = total / limit
-        return [min(total - 1, int(position * step)) for position in range(limit)]
-    return sorted(range(total), key=lambda index: (-scores[index], index))[:limit]
 
 
 def _subset_notes(notes: StructuredNotes, sections: Sequence[NoteSection]) -> StructuredNotes:
