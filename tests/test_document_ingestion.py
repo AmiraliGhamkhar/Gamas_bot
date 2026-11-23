@@ -43,7 +43,7 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
         self.settings = make_settings(
-            db_path=root / "docs.db", temp_dir=root / "tmp", flashcard_ai_deck_size=6,
+            db_path=root / "docs.db", temp_dir=root / "tmp",
             # Document generation flow tests build a fake avalai route behind
             # the mocked complete_json (tests must never perform live I/O).
             avalai_api_key="avalai-test-key",
@@ -109,7 +109,6 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("پیش‌نمایش متن", sent)
         self.assertIn("ATP", sent)  # the extracted text really is in the preview
         payloads = self.button_payloads(self.client.texts)
-        self.assertIn(f"doc:fc:{document['id']}".encode(), payloads)
         self.assertIn(f"doc:quiz:{document['id']}".encode(), payloads)
         # The document is mirrored as a library item so decks/quizzes can cite it.
         self.assertTrue(document["library_item_id"])
@@ -227,41 +226,6 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("📥 دریافت فایل اصلی", [b.text for row in card.edits[-1]["buttons"] for b in row])
 
     # ------------------------------------------------------------ generation
-    async def test_flashcards_from_a_document_carry_source_locators(self):
-        await self.ingest("notes.pdf", make_pdf_bytes(), mime="application/pdf")
-        document = (await self.db.documents_list(OWNER))[0]
-        screen = self.press(f"doc:fc:{document['id']}".encode())
-        await self.bot._handle_callback(screen)
-        payloads = {
-            button.type.data
-            for row in screen.edits[-1]["buttons"]
-            for button in row
-        }
-        self.assertIn(
-            f"doc:gen:fc:{document['id']}:standard".encode(), payloads
-        )
-
-        with mock.patch(
-            "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=cards_payload(10)),
-        ) as generator:
-            event = self.press(f"doc:gen:fc:{document['id']}:quick".encode())
-            await self.bot._handle_callback(event)
-            generator.assert_awaited_once()
-        # The prompt names the chunk locator, so the model can anchor items.
-        user_prompt = generator.await_args.kwargs["user"]
-        self.assertIn("صفحهٔ", user_prompt)
-        # Delivered directly as interactive HTML without curation step.
-        decks = await self.db.decks_list(OWNER)
-        self.assertEqual(len(decks), 1)
-        cards = await self.db.deck_cards(decks[0]["deck_id"])
-        self.assertTrue(all(card["source"] for card in cards))
-        lib_items = await self.db.library_list_kind(OWNER, "flashcards")
-        self.assertEqual(len(lib_items), 1)
-        blob = await self.db.library_file_blob(OWNER, lib_items[0]["item_id"])
-        self.assertIsNotNone(blob)
-        self.assertTrue(blob["filename"].endswith(".html"))
-
     async def test_questions_from_a_document_are_created_directly_as_html(self):
         await self.ingest("lecture.docx", make_docx_bytes(), mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         document = (await self.db.documents_list(OWNER))[0]
@@ -297,15 +261,14 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
             calls += 1
             if calls == 1:
                 raise LLMContextOverflowError("overflow")
-            return {"cards": [
-                {"front": f"پرسش شماره {calls * 100 + i}", "back": "پاسخ", "source": "fabricated"}
-                for i in range(10)
+            return {"questions": [
+                {"question": f"پرسش شماره {calls * 100 + i}", "options": ["الف", "ب", "ج", "د"], "correct": 0, "explain": "چرا", "difficulty": "medium", "source": "fabricated"}
+                for i in range(5)
             ]}
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
-            await self.bot._generate_learning(self.press(b"menu:main"), user_id=OWNER, kind="deck",
-                                               source=source, wanted=10, cost=0, note="test", title="سند")
-        await self.bot._handle_callback(self.press(b"fc:cur:save"))
-        rows = await self.db.db.execute_fetchall("SELECT source FROM flashcards")
+            await self.bot._generate_learning(self.press(b"menu:main"), user_id=OWNER,
+                                               source=source, wanted=5, cost=0, note="test", title="سند")
+        rows = await self.db.db.execute_fetchall("SELECT source FROM quiz_questions")
         self.assertGreaterEqual(len(rows), 5)
         self.assertTrue(all(row[0].startswith("صفحه ۳") for row in rows))
         self.assertTrue(all(row[0] != "بخش ۱" for row in rows))
@@ -329,9 +292,7 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
             # The first chunk's provider is down; the second one is healthy.
             if "بخش نخست" in str(kwargs.get("user", "")):
                 raise RuntimeError("provider down")
-            payload = cards_payload(10)
-            for card in payload["cards"]:
-                card["source"] = "صفحهٔ ۲"
+            payload = quiz_payload(5, source="صفحهٔ ۲")
             return payload
 
         with mock.patch(
@@ -340,56 +301,20 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._generate_learning(
                 self.press(b"menu:main"),
                 user_id=OWNER,
-                kind="deck",
                 source=source,
                 wanted=10,
                 cost=0,
-                note="fc-pending:doc:1",
-                title="جزوهٔ دو بخشی — فلش‌کارت",
+                note="quiz-pending:doc:1",
+                title="جزوهٔ دو بخشی — آزمون",
             )
         sent = "\n".join(item["text"] for item in self.client.texts)
         self.assertIn("بخش به‌طور کامل پردازش نشد", sent)
         # The cards that did arrive are delivered directly as HTML and saved.
-        decks = await self.db.decks_list(OWNER)
-        self.assertEqual(len(decks), 1)
-        cards = await self.db.deck_cards(decks[0]["deck_id"])
-        self.assertGreaterEqual(len(cards), 5)
+        qs = list(await self.db.db.execute_fetchall("SELECT question_id FROM quiz_questions"))
+        self.assertGreaterEqual(len(qs), 3)
         # Coverage is exactly what the user is told: one of two parts.
         self.assertIn("۱ بخش", sent)
 
-
-    async def test_pptx_upload_to_anchored_flashcards_and_presentation_queue(self):
-        upload, documents = await self.ingest(
-            "lesson.pptx", make_pptx_bytes(),
-            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        )
-        self.assertEqual(len(documents), 1)
-        document = documents[0]
-        self.assertEqual(document["source_type"], "pptx")
-        self.assertEqual(self.bot.queue.pending, 0)  # extraction precedes the optional audio job
-        self.assertIn(f"doc:lecture:{document['id']}".encode(), self.button_payloads(self.client.texts))
-        payload = cards_payload(10)
-        for card in payload["cards"]:
-            card["source"] = "اسلاید ۱"
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=payload)), \
-             mock.patch("gamas_bot.bot.extract_document", side_effect=AssertionError("cached extraction expected")):
-            await self.bot._handle_callback(self.press(f"doc:gen:fc:{document['id']}:quick".encode()))
-        await self.bot._handle_callback(self.press(b"fc:cur:save"))
-        cards = await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])
-        self.assertEqual(len(cards), 10)
-        self.assertTrue(all(card["source"] == "اسلاید ۱" for card in cards))
-
-        # Exercise the real presentation admission and Job shape, not just the adapter call.
-        await self.db.add_credit(OWNER, 20_000, note="presentation", validity_days=30)
-        self.client.get_messages = mock.AsyncMock(return_value=upload.message)
-        await self.bot._handle_callback(self.press(f"doc:lecture:{document['id']}".encode()))
-        self.client.get_messages.assert_awaited_once_with(OWNER, ids=upload.message.id)
-        self.assertEqual(self.bot.queue.pending, 1)
-        job = self.bot.queue.pop_pending()
-        self.assertEqual(job.kind, "presentation")
-        self.assertEqual(job.meta["presentation_kind"], "native")
-        self.assertIs(job.message, upload.message)
-        await job.meta["progress"].complete()
 
     async def test_legacy_ppt_best_effort_uses_existing_converter(self):
         source = Path("tests/fixtures/visual_minimal.ppt").read_bytes()
@@ -512,15 +437,13 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         """
         await self.ingest("notes.pdf", make_pdf_bytes(), mime="application/pdf")
         doc_id = (await self.db.documents_list(OWNER))[0]["id"]
-        bad = cards_payload(6)
-        for card in bad["cards"]:
-            card["source"] = "صفحهٔ ساختگی"
+        bad = quiz_payload(3, source="صفحهٔ ساختگی")
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=bad)) as generator:
-            await self.bot._handle_callback(self.press(f"doc:gen:fc:{doc_id}:quick".encode()))
+            await self.bot._handle_callback(self.press(f"doc:gen:quiz:{doc_id}:5".encode()))
         # A top-up was requested for the four cards still missing after the
         # first six arrived; the answer is not thrown away.
         self.assertEqual(generator.await_count, 2)
-        cards = await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])
+        cards = list(await self.db.db.execute_fetchall("SELECT source FROM quiz_questions"))
         self.assertTrue(cards)
         self.assertTrue(all(card["source"].startswith("صفحهٔ") for card in cards))
         self.assertTrue(all("ساختگی" not in card["source"] for card in cards))
@@ -609,7 +532,7 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         placeholder = await self.press(b"menu:main").respond("در حال ساخت")
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
             items, failures = await self.bot._generate_chunks(
-                kind="quiz", chunks=chunks, counts=[3] * len(chunks), placeholder=placeholder
+                chunks=chunks, counts=[3] * len(chunks), placeholder=placeholder
             )
         self.assertGreaterEqual(peak, 3)
         self.assertLessEqual(peak, 5)
@@ -623,14 +546,14 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         await self.ingest("notes.pdf", make_pdf_bytes(), mime="application/pdf")
         doc_id = (await self.db.documents_list(OWNER))[0]["id"]
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(
-                side_effect=[cards_payload(6), cards_payload(4)])) as generator:
-            await self.bot._handle_callback(self.press(f"doc:gen:fc:{doc_id}:quick".encode()))
+                side_effect=[quiz_payload(3), quiz_payload(2)])) as generator:
+            await self.bot._handle_callback(self.press(f"doc:gen:quiz:{doc_id}:5".encode()))
         self.assertEqual(generator.await_count, 2)
-        cards = await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])
-        self.assertEqual(len(cards), 6)  # retain the best valid partial
+        cards = list(await self.db.db.execute_fetchall("SELECT source FROM quiz_questions"))
+        self.assertEqual(len(cards), 3)  # retain the best valid partial
         summary = self.client.texts[-1]["text"]
-        self.assertIn("۱۰ مورد درخواست‌شده", summary)
-        self.assertIn("۶ مورد معتبر", summary)
+        self.assertIn("۵ مورد درخواست‌شده", summary)
+        self.assertIn("۳ مورد معتبر", summary)
 
     async def test_unallocated_chunks_are_reported_to_the_user(self):
         from gamas_bot.doc_extract import DocChunk
@@ -643,11 +566,11 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
             # Read the source line, not a substring of a prior stem or page 10.
             source_line = kwargs["user"].split("متن منبع:\n", 1)[1].split("\n", 1)[0]
             chunk = next(c for c in chunks if c.text == source_line)
-            return {"cards": [{"front": f"پرسش {chunk.index} مورد {i}", "back": "پاسخ", "source": chunk.locator} for i in range(5)]}
+            return {"questions": [{"question": f"پرسش {chunk.index} مورد {i}", "options": ["الف", "ب", "ج", "د"], "correct": 0, "explain": "چرا", "difficulty": "medium", "source": chunk.locator} for i in range(5)]}
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
-            await self.bot._generate_learning(self.press(b"menu:main"), user_id=OWNER, kind="deck",
+            await self.bot._generate_learning(self.press(b"menu:main"), user_id=OWNER,
                                                source=source, wanted=5, cost=0, note="test", title="سند")
-        cards = await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])
+        cards = list(await self.db.db.execute_fetchall("SELECT source FROM quiz_questions"))
         self.assertEqual(len(cards), 5)
         summary = self.client.texts[-1]["text"]
         self.assertIn("۱۰ بخش", summary)

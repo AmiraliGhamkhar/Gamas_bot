@@ -209,22 +209,18 @@ class CallbackRouterAndStateTests(unittest.IsolatedAsyncioTestCase):
         store = ConversationStateStore()
         store.pending_payments[7] = 99
         store.support_states[7] = ("new", "technical")
-        store.pending_flashcard[7] = (3, "front")
         store.pending_broadcast.add(7)
         store.pending_reject_reason[7] = 55
 
         store.on_callback_navigation(7, "library")
         self.assertNotIn(7, store.pending_payments)
         self.assertNotIn(7, store.support_states)
-        self.assertNotIn(7, store.pending_flashcard)
         self.assertNotIn(7, store.pending_broadcast)
         self.assertNotIn(7, store.pending_reject_reason)
 
         store.support_admin_states[7] = 12
-        store.pending_flashcard[7] = (4, "back")
         store.disarm_admin_command_prompts(7)
         self.assertNotIn(7, store.support_admin_states)
-        self.assertNotIn(7, store.pending_flashcard)
 
     async def test_reply_menu_navigation_clears_prompts_but_can_keep_office_draft(self) -> None:
         store = ConversationStateStore()
@@ -234,8 +230,6 @@ class CallbackRouterAndStateTests(unittest.IsolatedAsyncioTestCase):
         store.support_states[7] = ("new", "technical", 0.0)
         store.support_admin_states[7] = (12, 0.0)
         store.pending_reject_reason[7] = 55
-        store.pending_flashcard[7] = (3, "front")
-        store.pending_flashcard_front[7] = "question"
         store.pending_user_search.add(7)
         store.pending_free_reset[7] = 42
         store.office_sessions[7] = office
@@ -247,8 +241,6 @@ class CallbackRouterAndStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(7, store.support_states)
         self.assertNotIn(7, store.support_admin_states)
         self.assertNotIn(7, store.pending_reject_reason)
-        self.assertNotIn(7, store.pending_flashcard)
-        self.assertNotIn(7, store.pending_flashcard_front)
         self.assertNotIn(7, store.pending_user_search)
         self.assertNotIn(7, store.pending_free_reset)
         self.assertIs(store.office_sessions[7], office)

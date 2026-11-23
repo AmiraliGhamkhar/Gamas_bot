@@ -1638,7 +1638,6 @@ class JobPipelineMixin:
         from .artifacts import (
             KIND_BOOKLET,
             KIND_DOCX,
-            KIND_FLASHCARDS,
             KIND_KEYPOINTS,
             KIND_QUIZ,
             KIND_REVIEW_HTML,
@@ -1653,7 +1652,7 @@ class JobPipelineMixin:
         if has_keypoints:
             kinds.add(KIND_KEYPOINTS)
         if has_booklet:
-            kinds.update({KIND_BOOKLET, KIND_QUIZ, KIND_FLASHCARDS})
+            kinds.update({KIND_BOOKLET, KIND_QUIZ})
         if has_docx:
             kinds.add(KIND_DOCX)
         if has_review_html:

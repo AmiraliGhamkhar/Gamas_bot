@@ -147,7 +147,6 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(event)
         text, buttons = event.edits[-1]
         self.assertEqual(text, texts.LIBRARY_EMPTY)
-        self.assertIn(b"fc:man", menu_payloads(buttons))
 
     async def test_library_screen_paginates_six_newest_items_and_counts_in_persian(self):
         for index in range(8):
@@ -164,7 +163,6 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("سایر فایل‌ها: ۸", home_text)
         self.assertIn(b"lib:cat:booklet:0", home_payloads)
         self.assertIn(b"lib:cat:quiz:0", home_payloads)
-        self.assertIn(b"lib:cat:flashcards:0", home_payloads)
         self.assertIn(b"lib:cat:other:0", home_payloads)
 
         # Opening the "other" category paginates six newest items with 1-click download.
@@ -345,7 +343,6 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         payloads = menu_payloads(buttons)
         self.assertIn(f"lib:f:{item_id}".encode(), payloads)
         self.assertIn(f"quiz:new:{item_id}".encode(), payloads)
-        self.assertIn(f"fc:ai:{item_id}".encode(), payloads)
         self.assertIn(b"lib:cat:booklet:0", payloads)
 
     async def test_detail_screen_legacy_booklet_shows_notice_without_learning_buttons(self):

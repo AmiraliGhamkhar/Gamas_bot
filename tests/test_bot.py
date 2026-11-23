@@ -1588,15 +1588,8 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         detail_text, detail_buttons = detail.edits[-1]
         self.assertIn(texts.LEARNING_GENERATION_UNAVAILABLE, detail_text)
         self.assertFalse(
-            any(data.startswith((b"quiz:", b"fc:ai:")) for data in menu_payloads(detail_buttons))
+            any(data.startswith(b"quiz:") for data in menu_payloads(detail_buttons))
         )
-
-        cards = FakeCallbackEvent(self.user_id, b"library:fc")
-        await self.bot._handle_callback(cards)
-        cards_text, cards_buttons = cards.edits[-1]
-        self.assertIn("کارت‌های دستی", cards_text)
-        self.assertNotIn(b"fc:pick:0", menu_payloads(cards_buttons))
-        self.assertIn(b"fc:man", menu_payloads(cards_buttons))
 
         board = FakeCallbackEvent(self.user_id, b"board")
         await self.bot._handle_callback(board)
@@ -2258,7 +2251,7 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(start.replies[0].startswith(
             "به گاماس خوش آمدید\n\n"
             "فایل درس را همین‌جا بفرستید؛ متن و جزوه در کتابخانه می‌مانند، "
-            "بعد می‌توانید از جزوه آزمون یا فلش‌کارت بسازید."
+            "بعد می‌توانید از جزوه آزمون بسازید."
         ))
         keyboard = start.client.texts[0].get("buttons")
         self.assertEqual(
@@ -2716,7 +2709,6 @@ class ReplyKeyboardRoutingTests(BotPipelineTestCase):
         self.bot._support_states[USER_ID] = (
             "new", "technical", self.bot.deps.monotonic()
         )
-        self.bot._pending_flashcard[USER_ID] = (77, "front")
         event = FakeMessageEvent(USER_ID, texts.BTN_OFFICE)
         self.bot.client = event.client
 
@@ -2724,7 +2716,6 @@ class ReplyKeyboardRoutingTests(BotPipelineTestCase):
 
         self.assertIs(self.bot._office_sessions[USER_ID], office)
         self.assertNotIn(USER_ID, self.bot._support_states)
-        self.assertNotIn(USER_ID, self.bot._pending_flashcard)
         self.assertTrue(any("آفیس رایگان" in reply for reply in event.replies))
 
     async def test_reply_menu_navigation_cannot_reject_upload_or_continue_a_broadcast(self):

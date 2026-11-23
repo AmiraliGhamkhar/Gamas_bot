@@ -377,7 +377,7 @@ def validate_learning_html_artifact(
     expected_kind: str | None = None,
     max_bytes: int = MAX_REVIEW_HTML_BYTES,
 ) -> None:
-    """Raise ``ValueError`` when an interactive quiz/flashcard HTML is unsafe or invalid."""
+    """Raise ``ValueError`` when an interactive quiz HTML is unsafe or invalid."""
     from .review_sheet_html import script_hash
 
     if not content or len(content) > max_bytes:
@@ -459,11 +459,11 @@ def validate_learning_html_artifact(
     if not isinstance(payload, dict):
         raise ValueError("learning HTML JSON payload must be an object")
     kind = payload.get("kind")
-    if kind not in {"quiz", "flashcards"}:
+    if kind != "quiz":
         raise ValueError("learning HTML JSON payload has unsupported kind")
     if expected_kind is not None and kind != expected_kind:
         raise ValueError(f"learning HTML kind mismatch: expected {expected_kind}, got {kind}")
-    items_key = "questions" if kind == "quiz" else "cards"
+    items_key = "questions"
     items = payload.get(items_key)
     if not isinstance(items, list) or not items:
         raise ValueError(f"learning HTML JSON payload must contain non-empty {items_key}")

@@ -121,10 +121,6 @@ class UserIdentityTests(unittest.IsolatedAsyncioTestCase):
         item = await self.db.library_add(HUGE_ID, "booklet", 1, 2, None, title="جزوه")
         await self.db.library_set_content(item, "متن")
         await self.db.add_credit(HUGE_ID, 600, note="t", validity_days=30)
-        deck = await self.db.deck_create_with_cards(
-            HUGE_ID, item, "دسته", [{"front": "پ", "back": "پاسخ"}]
-        )
-        self.assertGreater(deck, 0)
         await self.db.quiz_create_session(
             HUGE_ID,
             item,

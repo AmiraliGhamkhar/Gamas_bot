@@ -7,7 +7,7 @@ Architecture:
 * :mod:`gamas_bot.db_users` — user accounts, identity, bans, and free tries.
 * :mod:`gamas_bot.db_library` — submissions, transcripts, and Telegram library.
 * :mod:`gamas_bot.db_documents` — owner-scoped study document cache.
-* :mod:`gamas_bot.db_learning` — quizzes and flashcards.
+* :mod:`gamas_bot.db_learning` — quizzes (historical flashcard tables are preserved in the schema).
 * :mod:`gamas_bot.db_billing` — append-only ledger, FIFO lots, and holds.
 * :mod:`gamas_bot.db_payments` — tariff catalog and manual receipt payments.
 * :mod:`gamas_bot.db_support` — support tickets and state transitions.
@@ -49,6 +49,7 @@ from .db_library import LibraryRepositoryMixin
 from .db_payments import PaymentsRepositoryMixin
 from .db_referrals import ReferralsRepositoryMixin
 from .db_reporting import ReportingRepositoryMixin
+from .db_study_packs import StudyPackRepository
 from .db_support import SupportRepositoryMixin
 from .db_users import UsersRepositoryMixin
 from .protocols import (
@@ -111,13 +112,18 @@ class Database(
 
     @property
     def learning(self) -> LearningStoreProtocol:
-        """Segregated quiz/flashcard persistence view (ISP)."""
+        """Segregated quiz persistence view (ISP)."""
         return self
 
     @property
     def reporting(self) -> ReportingStoreProtocol:
         """Segregated read-only admin reporting/audit view (ISP)."""
         return self
+
+    @property
+    def study_packs(self) -> StudyPackRepository:
+        """Study Packs, private Study Assets, and Reward Points persistence."""
+        return StudyPackRepository(self)
 
 
 __all__ = [

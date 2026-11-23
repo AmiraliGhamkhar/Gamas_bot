@@ -48,7 +48,6 @@ KIND_TRANSCRIPT = "transcript"
 KIND_TXT = "txt"
 KIND_KEYPOINTS = "keypoints"
 KIND_QUIZ = "quiz"
-KIND_FLASHCARDS = "flashcards"
 KINDS = (
     KIND_BOOKLET,
     KIND_DOCX,
@@ -57,7 +56,6 @@ KINDS = (
     KIND_TXT,
     KIND_KEYPOINTS,
     KIND_QUIZ,
-    KIND_FLASHCARDS,
 )
 
 #: Prefix of a fetch callback (``art:GMS-12:transcript``).
@@ -231,20 +229,13 @@ def delivery_markup(
                 )
             ]
         )
-    # Learning buttons (quiz / flashcards)
+    # Learning buttons (quiz)
     learning: list[Any] = []
     if learning_available and item_id and KIND_QUIZ in kinds:
         learning.append(
             Button.inline(
                 texts.BTN_QUIZ_FROM_BOOKLET,
                 f"quiz:new:{int(item_id)}".encode("ascii"),
-            )
-        )
-    if learning_available and item_id and KIND_FLASHCARDS in kinds:
-        learning.append(
-            Button.inline(
-                texts.BTN_CARDS_FROM_BOOKLET,
-                f"fc:ai:{int(item_id)}".encode("ascii"),
             )
         )
     if learning:

@@ -1,9 +1,9 @@
 """Learning-loop content: prompts, strict JSON shapes and validation.
 
-The quiz and AI-flashcard features both turn an archived booklet text into
-strictly validated Persian JSON through :mod:`gamas_bot.llm`. This module keeps
-every prompt, schema and clamp in one place so the bot layer only orchestrates
-billing and screens, and the rules can be unit-tested without Telethon.
+The quiz feature turns an archived booklet text into strictly validated
+Persian JSON through :mod:`gamas_bot.llm`. This module keeps every prompt,
+schema and clamp in one place so the bot layer only orchestrates billing and
+screens, and the rules can be unit-tested without Telethon.
 
 Nothing here performs I/O: functions are pure validators/parsers, which keeps
 the billing-then-generation discipline in ``bot.py`` easy to follow.
@@ -36,16 +36,8 @@ MAX_MODEL_INPUT_CHARS = 56_000
 MAX_QUESTION_CHARS = 400
 MAX_OPTION_CHARS = 120
 MAX_EXPLAIN_CHARS = 400
-MAX_CARD_FRONT_CHARS = 160
-MAX_CARD_BACK_CHARS = 400
-#: Manual cards are user-typed in chat, so they get the slightly larger chat
-#: budgets from the feature spec rather than the model-output ceilings.
-MAX_MANUAL_FRONT_CHARS = 200
-MAX_MANUAL_BACK_CHARS = 500
-
 #: A generation that yields fewer usable units is a failure the caller refunds.
 MIN_VALID_QUESTIONS = 3
-MIN_VALID_CARDS = 5
 
 #: Per-chunk model calls run concurrently through ``llm.complete_json`` (which
 #: owns the provider failover). Four is the sweet spot measured against the
@@ -63,12 +55,6 @@ SIZE_PRESETS: tuple[tuple[str, str, int, int], ...] = (
     ("full", "🎯 کامل", 40, 20),
 )
 
-
-def preset_cards(code: str) -> int | None:
-    for preset_code, _label, cards, _questions in SIZE_PRESETS:
-        if preset_code == code:
-            return cards
-    return None
 
 
 _TOPIC_SIGNAL_RE = re.compile(
@@ -162,9 +148,6 @@ def _dedupe_items(items: list[dict[str, Any]], field: str) -> list[dict[str, Any
     return unique
 
 
-def dedupe_cards(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return _dedupe_items(cards, "front")
-
 
 def dedupe_questions(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return _dedupe_items(questions, "question")
@@ -255,15 +238,15 @@ def quiz_system_prompt(
     )
 
 
-def learning_user_prompt(kind: str, count: int, sources: tuple[str, ...], text: str) -> str:
+def learning_user_prompt(count: int, sources: tuple[str, ...], text: str) -> str:
     """Per-call instructions, deliberately separate from the cached system prompt."""
     count = int(count)
-    label = "کارت" if kind == "deck" else "سؤال"
-    detail = f"دقیقاً {to_persian_digits(count)} {label} بساز.\n"
-    if kind != "deck":
-        medium = max(1, round(count * 0.4))
-        detail += (f"تقریباً {to_persian_digits(medium)} متوسط و "
-                   f"{to_persian_digits(max(0, count-medium))} سخت.\n")
+    medium = max(1, round(count * 0.4))
+    detail = (
+        f"دقیقاً {to_persian_digits(count)} سؤال بساز.\n"
+        f"تقریباً {to_persian_digits(medium)} متوسط و "
+        f"{to_persian_digits(max(0, count-medium))} سخت.\n"
+    )
     return detail + _source_rule(None, sources) + "متن منبع:\n" + text
 
 
@@ -508,9 +491,6 @@ _OPTION_LETTERS: dict[str, int] = {
 
 _QUIZ_LIST_KEYS: tuple[str, ...] = (
     "questions", "quiz", "items", "mcqs", "سوالات", "سؤالات", "پرسش‌ها", "پرسشها",
-)
-_CARD_LIST_KEYS: tuple[str, ...] = (
-    "cards", "flashcards", "items", "فلش‌کارت‌ها", "فلش کارت ها", "کارت‌ها", "کارتها",
 )
 _CORRECT_KEYS: tuple[str, ...] = (
     "correct", "correct_index", "answer", "correct_option", "پاسخ", "گزینه_صحیح",
@@ -809,125 +789,3 @@ def parse_quiz_payload(
         count, len(raw_questions), len(validated), rejected_item_count, rejected
     )
     return validated
-
-
-# ---------------------------------------------------------------------------
-# Flashcards
-# ---------------------------------------------------------------------------
-
-FLASHCARD_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "cards": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "front": {"type": "string"},
-                    "back": {"type": "string"},
-                    # Source anchoring (page/slide/section locator).
-                    "source": {"type": "string"},
-                },
-                "required": ["front", "back", "source"],
-            },
-        }
-    },
-    "required": ["cards"],
-}
-
-
-def flashcard_system_prompt(
-    count: int, *, source: str | None = None, sources: tuple[str, ...] | None = None
-) -> str:
-    """Persian minimum-information, cloze-first and source-anchored cards."""
-    example_source = json.dumps("نشانگر منبع", ensure_ascii=False)
-    return (
-        "تو طراح فلش‌کارت آموزشی فارسی هستی. فقط از متن داده‌شده کارت بساز؛ "
-        "اطلاعات بیرونی یا ادعاهای بدون پشتوانه اضافه نکن.\n"
-        "قانون کمینه‌سازی اطلاعات:\n"
-        "- هر کارت فقط یک واقعیت را بپرسد؛ پاسخ چندنکته‌ای را به چند کارت جدا بشکن.\n"
-        "- فهرست‌های بیش از ۵ مورد را به کارت‌های شمارشی جداگانه تقسیم کن.\n"
-        "- پرسش بله/خیر ممنوع است؛ هیچ کارت دو مفهوم بی‌ربط را نپرسد.\n"
-        "- هر روی کارت حداکثر ۱۶۰ نویسه باشد و پاسخ بلند را خلاصه کن.\n"
-        "- برای اصطلاح، تعریف و فرمول ابتدا از قالب جای‌خالی استفاده کن؛ "
-        "برای مفهوم و رابطهٔ علت و معلول از پرسش‌وپاسخ کوتاه.\n\n"
-        + "منبع هر مورد را دقیقاً از نشانگرهای مشخص‌شده در پیام کاربر انتخاب کن.\n\n"
-        + "خروجی فقط JSON معتبر با این ساختار باشد و هیچ متن اضافه‌ای ننویس:\n"
-        '{"cards":[{"front":"پرسش کوتاه", "back":"پاسخ یک‌خطی", "source":' + example_source + '}]}'
-    )
-
-
-def parse_flashcard_payload(
-    payload: dict[str, Any], count: int, *, require_source: bool = True
-) -> list[dict[str, str]]:
-    """Validate/clamp a model answer into at most ``count`` Q/A cards.
-
-    ``source`` is the grounding contract of every newly generated document and
-    booklet card, so it is required by default (matching the generation
-    boundary in ``bot_learning``); explicitly permissive callers may still
-    parse older untagged items. A yes/no front is dropped.
-    """
-    raw_cards = _list_from_payload(payload, _CARD_LIST_KEYS)
-    if not isinstance(raw_cards, list):
-        return []
-    validated: list[dict[str, str]] = []
-    for entry in raw_cards:
-        if not isinstance(entry, dict):
-            continue
-        # «question»/«answer» is a common paraphrase of the example's
-        # «front»/«back»; a field name is cosmetic, losing a valid card is not.
-        front = _clean_str(
-            _entry_text(
-                entry,
-                "front", "question", "q", "prompt", "term",
-                "روی_کارت", "پرسش", "سوال", "سؤال",
-            ),
-            MAX_CARD_FRONT_CHARS,
-        )
-        back = _clean_str(
-            _entry_text(
-                entry,
-                "back", "answer", "a", "definition",
-                "پشت_کارت", "پاسخ", "جواب",
-            ),
-            MAX_CARD_BACK_CHARS,
-        )
-        if not front or not back:
-            continue
-        if _is_yes_no(front, back):
-            continue
-        card = {"front": front, "back": back}
-        source = _clean_source(_source_field(entry))
-        if source:
-            card["source"] = source
-        elif require_source:
-            continue
-        validated.append(card)
-        if len(validated) >= int(count):
-            break
-    return validated
-
-
-_ALTERNATIVE_CHOICE_RE = re.compile(r"\sیا\s")
-_YES_NO_ANSWERS: frozenset[str] = frozenset(
-    {"بله", "خیر", "نه", "آری", "بلی", "درست", "نادرست", "صحیح", "غلط", "yes", "no", "true", "false"}
-)
-
-
-def _is_yes_no(front: str, back: str = "") -> bool:
-    """True for a card whose whole answer is «بله»/«خیر» (banned by R5.1).
-
-    Comparative «آیا A است یا B؟» cards are kept unless the answer itself is
-    literally a yes/no word.
-    """
-    if back:
-        norm_back = normalize_front(back)
-        if norm_back in _YES_NO_ANSWERS:
-            return True
-    stripped = front.strip()
-    starters = ("آیا ", "آیا‌", "ایا ")
-    if not stripped.startswith(starters):
-        return False
-    if _ALTERNATIVE_CHOICE_RE.search(stripped):
-        return False
-    return True

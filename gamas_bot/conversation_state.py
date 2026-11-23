@@ -26,8 +26,6 @@ class ConversationStateStore:
     support_states: dict[int, tuple[str, Any, float]] = field(default_factory=dict)
     support_admin_states: dict[int, tuple[int, float]] = field(default_factory=dict)
     pending_reject_reason: dict[int, int] = field(default_factory=dict)
-    pending_flashcard: dict[int, tuple[int, str]] = field(default_factory=dict)
-    pending_flashcard_front: dict[int, str] = field(default_factory=dict)
     pending_user_search: set[int] = field(default_factory=set)
     pending_free_reset: dict[int, int] = field(default_factory=dict)
     office_sessions: dict[int, OfficeSession] = field(default_factory=dict)
@@ -50,8 +48,6 @@ class ConversationStateStore:
         self.pending_payments.pop(user_id, None)
         self.support_states.pop(user_id, None)
         self.support_admin_states.pop(user_id, None)
-        self.pending_flashcard.pop(user_id, None)
-        self.pending_flashcard_front.pop(user_id, None)
         self.pending_user_search.discard(user_id)
         self.pending_free_reset.pop(user_id, None)
         self.office_sessions.pop(user_id, None)
@@ -62,8 +58,6 @@ class ConversationStateStore:
         self.office_sessions.pop(user_id, None)
         self.support_states.pop(user_id, None)
         self.support_admin_states.pop(user_id, None)
-        self.pending_flashcard.pop(user_id, None)
-        self.pending_flashcard_front.pop(user_id, None)
         self.pending_user_search.discard(user_id)
         self.pending_free_reset.pop(user_id, None)
 
@@ -76,18 +70,14 @@ class ConversationStateStore:
         self.pending_payments.pop(user_id, None)
         self.support_states.pop(user_id, None)
         self.support_admin_states.pop(user_id, None)
-        self.pending_flashcard.pop(user_id, None)
-        self.pending_flashcard_front.pop(user_id, None)
         self.pending_user_search.discard(user_id)
         self.pending_free_reset.pop(user_id, None)
         if not preserve_office_session:
             self.office_sessions.pop(user_id, None)
 
     def disarm_admin_command_prompts(self, admin_id: int) -> None:
-        """Any slash-command from an admin exits support-reply and manual-card flows."""
+        """Any slash-command from an admin exits support-reply flows."""
         self.support_admin_states.pop(admin_id, None)
-        self.pending_flashcard.pop(admin_id, None)
-        self.pending_flashcard_front.pop(admin_id, None)
 
     def on_callback_navigation(self, user_id: int, data: str) -> None:
         """Apply navigation-boundary disarm rules when callback *data* fires."""
@@ -116,10 +106,6 @@ class ConversationStateStore:
             self.support_states.pop(user_id, None)
         if not data.startswith("adm:sr:"):
             self.support_admin_states.pop(user_id, None)
-
-        if not data.startswith("fc:man:"):
-            self.pending_flashcard.pop(user_id, None)
-            self.pending_flashcard_front.pop(user_id, None)
 
         if not data.startswith("office:"):
             self.office_sessions.pop(user_id, None)

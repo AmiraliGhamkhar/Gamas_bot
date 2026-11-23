@@ -22,7 +22,6 @@ from gamas_bot import billing
 from gamas_bot.artifacts import (
     KIND_BOOKLET,
     KIND_DOCX,
-    KIND_FLASHCARDS,
     KIND_KEYPOINTS,
     KIND_QUIZ,
     KIND_TRANSCRIPT,
@@ -372,14 +371,13 @@ class DeliveryMarkupTests(unittest.TestCase):
         buttons = delivery_markup(
             reference="GMS-7", speakers=2, has_booklet=True,
             kinds={KIND_BOOKLET, KIND_DOCX, KIND_TRANSCRIPT, KIND_TXT,
-                   KIND_KEYPOINTS, KIND_QUIZ, KIND_FLASHCARDS},
+                   KIND_KEYPOINTS, KIND_QUIZ},
             item_id=11,
         )
         payloads = self._payloads(buttons)
         for kind in ("booklet", "docx", "transcript", "txt", "keypoints"):
             self.assertIn(f"art:GMS-7:{kind}", payloads)
         self.assertIn("quiz:new:11", payloads)
-        self.assertIn("fc:ai:11", payloads)
         self.assertFalse(any("استودیو" in str(p) for p in payloads))
 
     def test_learning_buttons_are_hidden_when_generation_is_not_configured(self):
@@ -387,7 +385,7 @@ class DeliveryMarkupTests(unittest.TestCase):
             reference="GMS-7",
             speakers=0,
             has_booklet=True,
-            kinds={KIND_BOOKLET, KIND_QUIZ, KIND_FLASHCARDS},
+            kinds={KIND_BOOKLET, KIND_QUIZ},
             item_id=11,
             learning_available=False,
         )
@@ -531,14 +529,14 @@ class CentralSubmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["overlap_count"], 2)
         self.assertIn("speaker_0", str(row["speaker_turns_json"]))
 
-        for kind in ("booklet", "transcript", "txt", "keypoints", "quiz", "flashcards"):
+        for kind in ("booklet", "transcript", "txt", "keypoints", "quiz"):
             await self.db.artifact_upsert(submission, 42, kind, reference="GMS-1")
         kinds = await self.db.artifact_kinds(submission)
-        self.assertEqual(kinds, {"booklet", "transcript", "txt", "keypoints", "quiz", "flashcards"})
+        self.assertEqual(kinds, {"booklet", "transcript", "txt", "keypoints", "quiz"})
         # A second registration updates in place instead of duplicating a button.
         await self.db.artifact_upsert(submission, 42, "booklet", available=False)
         self.assertNotIn("booklet", await self.db.artifact_kinds(submission))
-        self.assertEqual(len(await self.db.artifact_list(submission)), 6)
+        self.assertEqual(len(await self.db.artifact_list(submission)), 5)
 
         await self.db.set_speaker_name(submission, "0", "استاد")
         self.assertEqual(await self.db.speaker_names(submission), {"0": "استاد"})

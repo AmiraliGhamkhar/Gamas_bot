@@ -32,3 +32,6 @@ data/
 
 # Local visual-QA render scratch (rasterized pages for inspection).
 .render/
+
+miniapp/node_modules/
+miniapp/dist/
