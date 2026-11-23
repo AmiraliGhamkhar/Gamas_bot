@@ -38,11 +38,21 @@ def save_private_asset(
     target_path = (target_dir / safe_name).resolve()
     if not target_path.is_relative_to(root):
         raise ValueError("Invalid asset storage path")
-    target_path.write_bytes(data)
-    try:
-        os.chmod(target_path, 0o600)
-    except OSError:
-        pass
+    if not target_path.exists():
+        tmp_path = target_path.with_name(f".{safe_name}.{os.getpid()}.tmp")
+        try:
+            tmp_path.write_bytes(data)
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_path, target_path)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
     rel_path = target_path.relative_to(root).as_posix()
     return rel_path, len(data), digest
 
@@ -54,3 +64,11 @@ def resolve_private_asset(base_dir: Path, storage_path: str) -> Path:
     if not candidate.is_relative_to(root):
         raise ValueError("Invalid asset storage path")
     return candidate
+
+
+def read_private_asset(base_dir: Path, storage_path: str) -> bytes | None:
+    """Safely read a private asset; returns ``None`` if the file is missing."""
+    path = resolve_private_asset(base_dir, storage_path)
+    if not path.is_file():
+        return None
+    return path.read_bytes()

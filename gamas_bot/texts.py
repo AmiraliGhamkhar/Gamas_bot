@@ -127,6 +127,9 @@ BTN_CHANNEL_JOIN: Final = "🔗 عضویت در کانال"
 BTN_CHANNEL_CHECK: Final = "✅ بررسی عضویت"
 
 # ----------------------------------------------------------------- start/menu
+MINI_APP_BUTTON: Final = "🚀 ورود به مینی‌اپ گاماس"
+
+
 def main_screen(
     *,
     first_start: bool,
@@ -135,32 +138,9 @@ def main_screen(
     notes_configured: bool,
     streak_days: int = 0,
 ) -> str:
-    """Action-first start/home copy, tailored to the configured pipeline."""
-    del streak_days  # Do not use streaks to pressure return visits.
-    if first_start:
-        if notes_configured and office_enabled:
-            invitation = (
-                "فایل درس را همین‌جا بفرستید؛ متن و جزوه در کتابخانه می‌مانند، "
-                "بعد می‌توانید از جزوه آزمون بسازید."
-            )
-        elif notes_configured:
-            invitation = (
-                "فایل صوتی یا ویدیویی بفرستید تا جزوه بسازیم؛ "
-                "از متن سند هم می‌توانید تمرین بسازید."
-            )
-        else:
-            invitation = "فایل درس را همین‌جا بفرستید؛ متن استخراج‌شده در کتابخانه می‌ماند."
-        lines = [
-            "به گاماس خوش آمدید",
-            "",
-            invitation,
-            "",
-            "صوت، ویدیو، PDF، Word یا PowerPoint",
-        ]
-    else:
-        lines = ["فایل درس بعدی را همین‌جا بفرستید."]
-    lines.extend(["", f"اعتبار: {balance}"])
-    return "\n".join(lines)
+    """Single-purpose file-to-study-material start instruction."""
+    del first_start, balance, office_enabled, notes_configured, streak_days
+    return "فایل درسی خود را برای گاماس بفرستید.\n\nصوت، ویدیو، PDF، Word یا PowerPoint"
 
 
 # ---------------------------------------------------------------------------
@@ -168,18 +148,15 @@ def main_screen(
 # ---------------------------------------------------------------------------
 
 #: Placeholder shown inside the message box while the keyboard is attached.
-REPLY_KEYBOARD_PLACEHOLDER: Final = "فایل درس را بفرستید یا یک گزینه را انتخاب کنید"
+REPLY_KEYBOARD_PLACEHOLDER: Final = "فایل درس را بفرستید"
 #: Old label accepted by the message router for already displayed keyboards.
 BTN_MENU_GUIDE: Final = "ℹ️ راهنما"
 
 
 def reply_menu_rows(*, is_admin: bool, office_enabled: bool = True) -> list[list[str]]:
-    """The single, compact global navigation; feature actions stay contextual."""
-    del office_enabled  # Conditional features live in the secondary menu.
-    rows = [
-        [BTN_LIBRARY, BTN_WALLET],
-        [BTN_MORE, BTN_SUPPORT],
-    ]
+    """Minimal reply keyboard: only admin entry when applicable."""
+    del office_enabled
+    rows: list[list[str]] = []
     if is_admin:
         rows.append([BTN_ADMIN])
     return rows

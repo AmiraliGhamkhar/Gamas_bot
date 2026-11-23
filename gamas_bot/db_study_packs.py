@@ -81,6 +81,21 @@ class StudyPackRepository:
         await self._core.db.commit()
         return cur.rowcount > 0
 
+    async def study_pack_update_status(
+        self, user_id: int, pack_id: int, status: str
+    ) -> bool:
+        now = _utc_now_iso()
+        cur = await self._core.db.execute(
+            """
+            UPDATE study_packs
+            SET status = ?, updated_at = ?
+            WHERE pack_id = ? AND user_id = ? AND deleted_at IS NULL
+            """,
+            (status, now, int(pack_id), int(user_id)),
+        )
+        await self._core.db.commit()
+        return cur.rowcount > 0
+
     async def study_asset_add(
         self,
         pack_id: int,
@@ -93,6 +108,17 @@ class StudyPackRepository:
         byte_size: int = 0,
         sha256: str = "",
     ) -> int:
+        if sha256:
+            existing = await self._core.db.execute_fetchall(
+                """
+                SELECT asset_id FROM study_assets
+                WHERE pack_id = ? AND user_id = ? AND kind = ? AND sha256 = ?
+                LIMIT 1
+                """,
+                (int(pack_id), int(user_id), kind, sha256),
+            )
+            if existing:
+                return int(existing[0]["asset_id"])
         now = _utc_now_iso()
         clean_title = (title or "").strip()[:200] or "فایل"
         cur = await self._core.db.execute(
@@ -155,3 +181,63 @@ class StudyPackRepository:
             (int(user_id),),
         )
         return int(rows[0]["bal"]) if rows else 0
+
+    async def study_pack_manifest(
+        self, user_id: int, pack_id: int
+    ) -> dict[str, Any] | None:
+        pack = await self.study_pack_get(user_id, pack_id)
+        if pack is None:
+            return None
+        assets = await self.study_pack_assets(user_id, pack_id)
+        return {
+            "pack_id": pack["pack_id"],
+            "title": pack["title"],
+            "source_type": pack["source_type"],
+            "processing_status": pack["status"],
+            "created_at": pack["created_at"],
+            "updated_at": pack["updated_at"],
+            "assets": [
+                {
+                    "asset_id": a["asset_id"],
+                    "kind": a["kind"],
+                    "title": a["title"],
+                    "mime_type": a["mime_type"],
+                    "byte_size": a["byte_size"],
+                    "sha256": a["sha256"],
+                    "created_at": a["created_at"],
+                }
+                for a in assets
+            ],
+        }
+
+    async def backfill_from_library(self, *, dry_run: bool = True) -> dict[str, int]:
+        """Safely map existing library booklets to Study Packs without deleting data."""
+        rows = await self._core.db.execute_fetchall(
+            """
+            SELECT item_id, user_id, kind, title, created_at
+            FROM library_items
+            WHERE kind IN ('booklet', 'document') AND delivered = 1
+            ORDER BY item_id ASC
+            """
+        )
+        scanned = len(rows)
+        created = 0
+        if not dry_run:
+            now = _utc_now_iso()
+            for r in rows:
+                await self._core.db.execute(
+                    """
+                    INSERT INTO study_packs(user_id, title, source_type, status, created_at, updated_at)
+                    VALUES(?, ?, ?, 'ready', ?, ?)
+                    """,
+                    (
+                        int(r["user_id"]),
+                        (r["title"] or "بستهٔ مطالعاتی")[:200],
+                        str(r["kind"]),
+                        str(r["created_at"] or now),
+                        now,
+                    ),
+                )
+                created += 1
+            await self._core.db.commit()
+        return {"scanned": scanned, "created": created, "dry_run": int(dry_run)}
