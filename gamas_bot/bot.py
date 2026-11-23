@@ -639,17 +639,16 @@ class GamasBot(
         )
 
     def _user_menu(self, *, is_admin: bool = False) -> list:
-        """Compact global navigation; less-used destinations live under More."""
-        rows = [
-            [
-                Button.inline(texts.BTN_LIBRARY, b"library"),
-                Button.inline(texts.BTN_WALLET, b"wallet"),
-            ],
-            [
-                Button.inline(texts.BTN_MORE, b"menu:more"),
-                Button.inline(texts.BTN_SUPPORT, b"support"),
-            ],
-        ]
+        """Minimal primary menu: Mini App launch (if configured) and admin entry."""
+        rows: list[list] = []
+        webapp_url = getattr(self.settings, "webapp_url", "") or getattr(
+            self.settings, "public_url", ""
+        )
+        if webapp_url:
+            url = str(webapp_url).rstrip("/")
+            if not url.endswith("/app"):
+                url = f"{url}/app"
+            rows.append([Button.url(texts.MINI_APP_BUTTON, url)])
         if is_admin:
             rows.append([Button.inline(texts.BTN_ADMIN, b"adm:home")])
         return rows
@@ -717,8 +716,8 @@ class GamasBot(
             # one-message results screen removes. It rides on the /start message
             # and is re-attached whenever the user sends text.
             reply_markup=None
-            if hasattr(event, "data")
-            else self._reply_keyboard(is_admin=self._is_admin(user_id)),
+            if (hasattr(event, "data") or not self._is_admin(user_id))
+            else self._reply_keyboard(is_admin=True),
         )
 
     # -------------------------------------------------------- membership gate
