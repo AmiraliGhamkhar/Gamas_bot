@@ -25,18 +25,24 @@ class RoundingTests(unittest.TestCase):
             self.assertEqual(round_display_credits(original), displayed)
         self.assertEqual(seconds_to_credits(10 * 3600), 333_334)
 
-    def test_referral_only_for_available_booklet(self):
-        for kinds, has_booklet, expected in [
-            ({KIND_BOOKLET, KIND_TRANSCRIPT}, True, True),
-            ({KIND_DOCX, KIND_TRANSCRIPT}, False, True),
-            ({KIND_TRANSCRIPT}, False, False),
+    def test_the_delivery_keyboard_is_only_artifacts_and_the_quiz(self):
+        """No referral or menu row: a finished file is the whole screen."""
+        for kinds, has_booklet in [
+            ({KIND_BOOKLET, KIND_TRANSCRIPT}, True),
+            ({KIND_DOCX, KIND_TRANSCRIPT}, False),
+            ({KIND_TRANSCRIPT}, False),
         ]:
-            for _ in range(2):
-                rows = delivery_markup(reference="GMS-1", speakers=0,
-                                       has_booklet=has_booklet, kinds=kinds)
-                self.assertEqual(b"ref:result" in payloads(rows), expected)
-                if has_booklet:
-                    self.assertTrue(any(value.startswith(b"art:") for value in payloads(rows)))
+            rows = delivery_markup(reference="GMS-1", speakers=0,
+                                   has_booklet=has_booklet, kinds=kinds)
+            data = payloads(rows)
+            self.assertNotIn(b"ref:result", data)
+            self.assertNotIn(b"menu:main", data)
+            self.assertTrue(
+                all(value.startswith(b"art:") or value.startswith(b"quiz:") for value in data),
+                data,
+            )
+            if has_booklet:
+                self.assertTrue(any(value.startswith(b"art:") for value in data))
 
 
 class WalletPresentationTests(unittest.IsolatedAsyncioTestCase):

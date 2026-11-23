@@ -74,14 +74,17 @@ or deployment compatibility is implied by offline tests. See
 
 ## Features
 
-| Input or menu | Result |
+The bot asks for a file and nothing else: `/start` is one line, sending a
+supported file starts the pipeline, and the completion screen offers only what
+that file produced. Account screens (credit, subscription, payments, referrals,
+library, review, explore) live in the Mini App, which is the one button on that
+screen; `/buy` and `/support` reach the two things the Mini App cannot do.
+
+| Input | Result |
 | --- | --- |
-| Audio, video, voice note | Transcript saved before optional note generation; one results screen offers the transcript and any generated Word/PDF booklet and offline HTML review sheet |
+| Audio, video, voice note | Transcript saved before optional note generation; the completion screen offers the transcript, the PDF and Word booklet, the offline HTML review sheet and «۲۰ سؤال نمونه» |
 | PDF, DOCX, PowerPoint | Extracted text, source-based notes, exports and per-slide mapping |
-| Free Office / آفیس رایگان | Text, TXT, Markdown, CSV or TSV to Word, Excel, PowerPoint or PDF |
-| Library | References to delivered Telegram files |
-| Wallet | Credit, plans and manually reviewed receipts |
-| Support | Persistent support tickets |
+| Free Office (office draft) | Text, TXT, Markdown, CSV or TSV to Word, Excel, PowerPoint or PDF |
 
 PowerPoint narration starts only from its audio button. Scans and photos are
 refused (there is no text layer to read); send a text PDF or a Word file.

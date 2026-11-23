@@ -4,6 +4,157 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**The Mini App is a product, not a dashboard (phase 7).** The four tabs are fixed —
+حساب من، کتابخانه، مرور، اکسپلور — and each one is built from the same token layer
+(one ink scale, one amber accent, Vazirmatn bundled locally, 20px cards, 44px
+touch targets, Persian numerals and Jalali dates). **حساب من** shows the Telegram
+identity, the credit balance split into hours and minutes, the active plan window,
+purchase options, referral count and invite link, the reward balance with the
+catalogue, and the payment history — every figure comes from `/api/v1/me`,
+`/me/plan`, `/plans`, `/me/referrals`, `/me/payments` and `/rewards/*`, and buying
+still happens in the bot (deep link `?start=buy`, which the bot now honours for an
+existing user instead of showing the file request; `?start=support` likewise).
+**کتابخانه** lists one row per Study Pack with its processing state, and the detail
+screen downloads the pack's real assets, offers Review only when the pack owns
+questions, and re-reads itself quietly while the pipeline is still working.
+**مرور** groups the user's own questions by the pack that produced them, records
+answers through `/review/answers`, shows the stored verdict and explanation, and
+files a publication request through `/review/share`. **اکسپلور** is one card at a
+time: topic and difficulty chips, large options, the server's verdict and
+explanation, the points the server says were awarded (never a computed number),
+engagement recorded as dwell time, and a fresh round when the queue runs out. No
+counts of the seed bank, no internal scores, no fake links: no screen shows a
+number the backend did not send. The app ships with five jsdom integration tests
+(`npm test`) that walk all four tabs against the real JSON shapes.
+
+**The bot is a file interface again (phase 6).** A student's whole journey is
+`/start` → send a file → watch it process → press the outputs. `/start` is one
+line and one input list ("فایل درس را بفرستید تا متن خام، جزوهٔ PDF و Word و ۲۰
+سؤال نمونه بگیرید"), identical on the first and every later visit: no balance,
+no greeting paragraph, no streak, and no "returning panel" to re-read. It is the
+only screen with a button — `WEBAPP_URL` (new setting, `{origin}/app`) — and that
+button is the Mini App, which now owns every account screen. The persistent
+reply keyboard is gone (`reply_menu_rows()` returns nothing and
+`_reply_keyboard` no longer exists), the second-level `menu:more` menu is gone
+with its `_more_menu`/`_show_more`, and the completed-file keyboard is only what
+the file produced: PDF booklet, transcript/key points/TXT, Word booklet, the
+interactive review sheet, and «🧪 ۲۰ سؤال نمونه» (`quiz:new:<item>`, which opens
+the size/price screen — the tap itself spends nothing). The referral row and the
+"back to main menu" row are gone from that keyboard, and
+`LEARNING_DELIVERY_CTA` no longer points at a label that was never drawn.
+
+Labels from keyboards already on screen keep answering, once each:
+`/start`-like `🎓 شروع` returns to the file request; `خرید اشتراک` /
+`افزایش اعتبار` / `آفیس رایگان` / `پشتیبانی` / `راهنما` / `🛠 پنل مدیریت` still open
+their screens, because the Mini App cannot sell credits or run a support
+conversation; `📦 خروجی‌های من`, `نتایج پردازش`, `📚 کتابخانه من`, `🤝 دعوت دوستان` and
+`بیشتر` answer with one line and the Mini App button (`texts.MINI_APP_REDIRECT`)
+instead of re-opening a chat-side copy of the account. `/help`, `/buy` and
+`/support` are the same screens by command, and `/office` opens the free Office
+draft whose keyboard entry retired with the others, so nothing needs a keyboard
+to be reachable. `help_screen` is a short guide again (what to send, what you
+get, the commands, the billing and input notices) whose single button is «📤
+ارسال فایل» → the start screen, and the raw-only deployment still never promises
+a booklet it cannot build.
+
+Nothing was deleted from the backend: billing, credit deduction, subscriptions,
+payment confirmation and receipts, referrals, support tickets, admin commands,
+the database, the API, background jobs, STT and booklet generation are untouched
+and still reachable through their callbacks and the Mini App. Flashcards stay
+absent from every user-facing surface. `WEBAPP_URL` is documented in
+`.env.example` and `docs/DEPLOY_MINIAPP.md` (empty = no menu button, never a dead
+link).
+
+**The Explore bank is 200 distinct questions (migration 042).** The seed "bank"
+was ten questions emitted twenty times with a `(پرسش N)` suffix, and nothing
+seeded it in production, so Explore had either 190 near-duplicates or no content
+at all. `gamas_bot/explore_bank.py` now holds 200 hand-written Persian questions at
+`easy` difficulty across 12 topics (زیست‌شناسی ۱۸، بدن انسان ۱۸،
+سلامت و پزشکی ۱۴، شیمی ۱۸، فیزیک ۱۸، ریاضی ۱۶، فناوری ۱۴، رایانه ۱۴، تاریخ ۲۰،
+جغرافیا ۲۰، محیط زیست ۱۴، دانش روزمره ۱۶), each with four distinct options, one
+unambiguous correct answer (position spread 45/62/45/48 across the four slots)
+and a one-line explanation; the correct answer is never in a predictable slot.
+`explore_questions.seed_key` (new nullable column, unique when present) gives
+every seed question a stable identity, so `seed_explore_questions()` is
+idempotent: it inserts only missing keys, never rewrites a row, and skips a
+question whose normalized text already exists — a seed question can therefore
+never become a twin of something a user published. Text normalization folds
+Arabic/Persian letter variants, diacritics, ZWNJ, punctuation and spacing before
+comparing, and a Jaccard check over content words rejects conceptual duplicates
+(the bank's worst pair scores 0.50, against a 0.60 gate). The numbered
+placeholders written by the old generator are demoted to `status='rejected'`
+rather than deleted, so their impressions and rewards survive and an admin can
+restore one (`--keep-legacy` keeps them). Nothing seeds at `connect()`, so tests
+and scripts that insert a fixture question with an explicit id keep working; the
+bot's `run()` seeds once at startup (best-effort, logged), and
+`python3 scripts/validate_explore_bank.py --db gamas_bot.db` does the same from
+the shell. Explore still exposes no count, progress or seed concept: the feed
+returns `{"items": [...]}` and the recommender's topic affinity, diversity cap,
+freshness and seen-question exclusion are untouched.
+
+**Reward redemption grants real credits, atomically (migration 041).**
+Redeeming reward points used to debit `reward_points_ledger` and then report a
+`credit_seconds_granted` that no `ledger` row backed, so points were spent and
+nothing was delivered (audit D-05), while repeating the request spent again. A
+redemption is now one `BEGIN IMMEDIATE` transaction that creates a
+`reward_redemptions` row, debits the points against it
+(`ref_id = 'redemption:<id>'`), inserts the credit lot through the ordinary
+billing grant (`ledger`, `kind='credit'`, FIFO-consumable like a paid one, no
+separate wallet) and points the redemption at that lot; any failure rolls the
+whole thing back and nothing is reported as granted. `POST
+/api/v1/rewards/redeem` reads the price and the grant from the server-owned
+catalog (`gamas_bot/rewards.py`), enforces `max_per_user` (pre-041 debits still
+count, so an upgrade hands out no extra uses), refuses an insufficient balance
+and never lets a balance go negative; it accepts an optional
+`idempotency_key` (body or `Idempotency-Key` header, unique per user) so a
+retried tap or request returns the original redemption instead of spending
+again, and the response reports `credit_seconds_granted`, `credited`,
+`ledger_id`, `available_seconds` and `idempotent` from what was committed.
+`/api/v1/me` and `/api/v1/me/credits` used to read a `credit_seconds` key
+`user_identity` never returned and therefore always answered 0 (D-04); they now
+answer from the ledger, so the Mini App can refresh credits after a redemption.
+Catalog entries that grant no processing credit (`theme`, `badge`, discount)
+still debit their points and record the redemption, but report
+`credited: false` — no credit is ever claimed for them. Prices, plans, reward
+earning and the billing system are unchanged; the migration is additive and
+touches no existing row.
+
+**Review is a Study Pack view (migration 040).** The Review API
+(`/api/v1/review/groups`, `/questions`, `/questions/{id}`, `/answers`, `/share`)
+now reads questions through the pack that owns them and groups them by it, so a
+group is titled with its pack instead of `بسته آزمون #<session_id>`. Questions
+generated before packs existed are returned as explicit **legacy** groups built
+from their real library row — never attached to a pack they did not come from.
+Both halves of ownership are checked on every read (session owner and pack
+owner), a deleted pack hides its questions, and the answer key is only revealed
+for questions the user has already answered. Answering is once-only and
+idempotent (a repeated tap returns the stored answer instead of an
+`IntegrityError`), and offering a question to Explore is idempotent per question
+and its moderation status is visible on the question. Retention no longer
+deletes an item that owns questions or is a pack's source row, which is what
+previously erased finished quizzes; a pruned delivered file also drops its pack
+asset so no manifest points at a missing file. To give pre-pack uploads their
+pack and link their questions, run `Database(...).study_packs.
+backfill_from_library(dry_run=False)` once after deploying (it is idempotent);
+until then those questions are shown as legacy groups. The Mini App builds again
+(`npm run build`): the Review tab's missing API bindings and the Library → Review
+button are wired to the endpoints above.
+
+**Study Packs come from the pipeline (migration 039).** Every accepted upload now
+creates exactly one Study Pack: media, presentation and pasted text by submission,
+PDF/DOCX/PPTX uploads by document. The pack is opened at admission with status
+`processing` and is finalized by the delivery step from the submission's own
+outcome (`ready`, `partial` or `failed`, with `error`/`error_kind`), so a crashed
+or failed job can never leave a pack looking ready. Packs own the outputs the
+pipeline produced — raw transcript, PDF, Word, review HTML and the delivered
+question file — by *reference* into the storage that already holds them
+(`transcriptions`, `submission_binary_artifacts`, `documents`,
+`library_file_blobs`); no bytes are copied and nothing is duplicated on a retry.
+Generated questions record their pack in `quiz_sessions.pack_id`. Historical
+library rows are mapped by an idempotent backfill, and the private-asset download
+endpoints resolve references only for the owning account. Prices, plans, STT
+provider settings and booklet generation are unchanged.
+
 **Office navigation.** The standalone Office button is no longer shown in the
 more menu. Existing callbacks, text-file drafts and document exports remain
 available; this navigation change does not merge or reprice Office workflows.

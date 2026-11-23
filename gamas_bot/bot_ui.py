@@ -46,7 +46,7 @@ LEARNING_CREDIT_RESTORED = "💳 اعتبار شما کامل برگشت داد�
 DOC_EXTRACTION_STOPPED = "📄 استخراج متن سند متوقف شد."
 OFFICE_UPLOAD_STOPPED = "🗂 آفیس رایگان متوقف شد."
 LEARNING_DELIVERY_CTA = (
-    "\n🧪 از همین جزوه آزمون بده: «📚 کتابخانه من»"
+    "\n🧪 ۲۰ سؤال نمونه از همین جزوه: دکمهٔ «۲۰ سؤال نمونه»"
 )
 LEARNING_STALE_ALERT = "این آزمون دیگر معتبر نیست."
 LEARNING_BUSY_ALERT = "درخواست قبلی شما در حال پردازش است؛ کمی صبر کنید."

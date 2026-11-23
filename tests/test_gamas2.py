@@ -404,14 +404,17 @@ class DeliveryMarkupTests(unittest.TestCase):
         self.assertEqual(parse_callback("art:GMS-7:txt"), ("GMS-7", "txt"))
         self.assertEqual(callback_for("GMS-7", "txt"), b"art:GMS-7:txt")
 
-    def test_delivery_screen_mentions_learning_without_the_removed_studio(self):
+    def test_delivery_screen_offers_the_20_question_pack(self):
         from gamas_bot import texts
 
         body = texts.delivery_screen(
             reference="GMS-7", speakers=2, has_booklet=True, has_keypoints=True,
         )
-        self.assertIn("آزمون", body)
+        # The offer is the concrete pack the button opens, not a generic "quiz".
+        self.assertIn("۲۰ سؤال نمونه", body)
+        self.assertEqual(texts.BTN_QUIZ_FROM_BOOKLET, "🧪 ۲۰ سؤال نمونه")
         self.assertNotIn("استودیو", body)
+        self.assertNotIn("فلش", body)
 
     def test_delivery_copy_only_names_artifacts_that_have_buttons(self):
         from gamas_bot import texts

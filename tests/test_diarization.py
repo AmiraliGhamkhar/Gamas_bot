@@ -269,71 +269,30 @@ class ResultsScreenTests(unittest.TestCase):
 
 
 class ReplyKeyboardTests(unittest.TestCase):
-    def test_global_keyboard_is_compact_and_more_contains_secondary_destinations(self):
-        labels = [
-            label
-            for row in texts.reply_menu_rows(is_admin=False)
-            for label in row
-        ]
-        self.assertEqual(labels, [
-            texts.BTN_LIBRARY, texts.BTN_WALLET, texts.BTN_MORE, texts.BTN_SUPPORT
-        ])
-        self.assertNotIn(texts.BTN_START_HERE, labels)
-        self.assertNotIn(texts.BTN_HISTORY, labels)
-
-    def test_the_admin_button_is_only_for_admins(self):
-        user = [label for row in texts.reply_menu_rows(is_admin=False) for label in row]
-        admin = [label for row in texts.reply_menu_rows(is_admin=True) for label in row]
-        self.assertNotIn(texts.BTN_ADMIN, user)
-        self.assertIn(texts.BTN_ADMIN, admin)
-
-    def test_conditional_features_are_disclosed_in_secondary_navigation(self):
-        for office_enabled in (True, False):
-            labels = [
-                label
-                for row in texts.reply_menu_rows(
-                    is_admin=False, office_enabled=office_enabled
-                )
-                for label in row
-            ]
-            # Secondary actions do not crowd the always-visible keyboard.
-            self.assertNotIn(texts.BTN_OFFICE, labels)
-
-    def test_the_telegram_reply_keyboard_has_no_webview_buttons(self):
-        from types import SimpleNamespace
-
+    def test_the_bot_draws_no_reply_keyboard(self):
+        """No bottom keyboard, for admins either: the message box is the input."""
         from gamas_bot.bot import GamasBot
-        from tests.support import make_settings
 
-        settings = make_settings()
-        for is_admin in (False, True):
-            markup = GamasBot._reply_keyboard(
-                SimpleNamespace(settings=settings), is_admin=is_admin
-            )
-            labels = [button.text for row in markup.rows for button in row.buttons]
-            expected = [
-                label
-                for row in texts.reply_menu_rows(
-                    is_admin=is_admin, office_enabled=settings.office_enabled
-                )
-                for label in row
-            ]
-            with self.subTest(is_admin=is_admin):
-                self.assertEqual(labels, expected)
-                for row in markup.rows:
-                    for button in row.buttons:
-                        self.assertEqual(
-                            type(button.type).__name__, "ButtonTypeDefault"
-                        )
+        self.assertFalse(hasattr(GamasBot, "_reply_keyboard"))
+        for is_admin in (True, False):
+            self.assertEqual(texts.reply_menu_rows(is_admin=is_admin), [])
 
-    def test_every_label_fits_a_telegram_button(self):
-        """Telegram rejects a keyboard button longer than a short label."""
-        for row in texts.reply_menu_rows(is_admin=True):
-            for label in row:
-                self.assertLessEqual(len(label), 24, label)
-        self.assertNotIn("\n", "".join(
-            label for row in texts.reply_menu_rows(is_admin=True) for label in row
-        ))
+    def test_retired_labels_stay_routable_strings(self):
+        """Old keyboards still send these labels, so they stay valid buttons."""
+        for label in (
+            texts.BTN_START_HERE,
+            texts.BTN_LIBRARY,
+            texts.BTN_WALLET,
+            texts.BTN_MORE,
+            texts.BTN_SUPPORT,
+            texts.BTN_HELP,
+            texts.BTN_ADMIN,
+            texts.BTN_OFFICE,
+        ):
+            self.assertIsInstance(label, str)
+            # Telegram rejects a keyboard button longer than a short label.
+            self.assertLessEqual(len(label), 24, label)
+            self.assertNotIn("\n", label)
 
 
 class TranscriptDocumentSpeakerRenderingTests(unittest.TestCase):

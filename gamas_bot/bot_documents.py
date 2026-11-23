@@ -35,6 +35,10 @@ from .bot_ui import (
     QUIZ_COUNTS,
     TELEGRAM_CAPTION_LIMIT,
 )
+from .db_study_packs import (
+    ASSET_KIND_TRANSCRIPT,
+    SOURCE_KIND_DOCUMENT_TEXT,
+)
 from .document_model import NormalizedDocument
 from .doc_extract import (
     SOURCE_TYPE_LABELS_FA,
@@ -146,6 +150,59 @@ class DocumentOfficeWorkflowMixin:
                 str(document.get("title") or ""), fallback=FALLBACK_DOCUMENT
             ),
         )
+
+    async def _index_document_study_pack(
+        self,
+        user_id: int,
+        document: dict[str, Any],
+        *,
+        source_type: str,
+        filename: str | None,
+    ) -> None:
+        """Give one ingested document its Study Pack (idempotent, non-fatal).
+
+        Document extraction runs inline instead of through the job queue, so the
+        pack is created once the extracted text and its library row exist.
+        Re-uploading the same file resolves to the same document and therefore
+        to the same pack, and the extracted text is attached by reference rather
+        than copied.
+        """
+        try:
+            document_id = int(document["id"])
+            pack_id = await self.db.study_packs.study_pack_ensure(
+                int(user_id),
+                document_id=document_id,
+                title=short_title(
+                    str(document.get("title") or ""), fallback=FALLBACK_DOCUMENT
+                ),
+                source_type=str(source_type or "document"),
+                source_filename=str(filename or ""),
+                status="ready",
+            )
+            item_id = document.get("library_item_id") or await self._document_library_item(
+                user_id, document
+            )
+            if item_id:
+                await self.db.study_packs.study_pack_set_source_item(
+                    int(user_id), pack_id, int(item_id)
+                )
+            text = str(document.get("text") or "")
+            if text.strip():
+                await self.db.study_packs.study_asset_add(
+                    pack_id,
+                    int(user_id),
+                    kind=ASSET_KIND_TRANSCRIPT,
+                    title="متن استخراج‌شدهٔ سند",
+                    storage_path="",
+                    mime_type="text/plain; charset=utf-8",
+                    byte_size=len(text.encode("utf-8")),
+                    source_kind=SOURCE_KIND_DOCUMENT_TEXT,
+                    source_ref=str(document_id),
+                )
+        except Exception:
+            logger.warning(
+                "could not index study pack for document user=%s", user_id, exc_info=True
+            )
 
     async def _save_document(
         self,
@@ -1577,6 +1634,9 @@ class DocumentOfficeWorkflowMixin:
             return
         finally:
             await run_file_io(shutil.rmtree, workdir, True)
+        await self._index_document_study_pack(
+            user_id, document, source_type=source_type, filename=filename
+        )
         header = (
             ""
             if created

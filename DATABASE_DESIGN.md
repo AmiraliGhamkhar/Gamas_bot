@@ -20,6 +20,7 @@
 - `explanation TEXT NOT NULL DEFAULT ''`
 - `status TEXT NOT NULL DEFAULT 'pending'` (`pending`, `approved`, `rejected`)
 - `created_by INTEGER` (admin `telegram_id`, nullable for seeded questions)
+- `seed_key TEXT` (stable identity of a curated seed question, `NULL` for user-published ones; unique when present)
 - `created_at TEXT NOT NULL`
 - **Indexes**: `idx_explore_questions_status_topic ON explore_questions(status, topic, question_id)`
 

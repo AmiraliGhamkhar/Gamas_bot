@@ -55,6 +55,32 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                 return "rate"
             return None
 
+    async def _pack_id_for_item_locked(self, user_id: int, item_id: int) -> int | None:
+        """Resolve the Study Pack of a quiz source inside the current transaction.
+
+        The source item is the pack's own library row when it still exists; the
+        user may equally have started the quiz from the *delivered* booklet of
+        that submission, which is why the submission link is the fallback. A
+        historical source with no pack simply yields ``None`` and stays valid.
+        """
+        rows = await _rows(
+            self.db,
+            "SELECT pack_id FROM study_packs WHERE user_id = ? AND source_item_id = ? "
+            "AND deleted_at IS NULL ORDER BY pack_id DESC LIMIT 1",
+            (int(user_id), int(item_id)),
+        )
+        if rows:
+            return int(rows[0][0])
+        rows = await _rows(
+            self.db,
+            "SELECT p.pack_id FROM study_packs p "
+            "JOIN library_items i ON i.submission_id = p.submission_id "
+            "WHERE p.user_id = ? AND i.user_id = ? AND i.item_id = ? "
+            "AND p.deleted_at IS NULL ORDER BY p.pack_id DESC LIMIT 1",
+            (int(user_id), int(user_id), int(item_id)),
+        )
+        return int(rows[0][0]) if rows else None
+
     async def quiz_create_session(
         self,
         user_id: int,
@@ -82,11 +108,17 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                 raise ValueError("invalid quiz question shape")
         now = iso(self._now())
         async with self._transaction():
+            # Questions belong to the Study Pack that produced their source, so
+            # Review can group them by pack instead of by ad-hoc session.
+            pack_id = await self._pack_id_for_item_locked(int(user_id), int(item_id))
             cursor = await self.db.execute(
                 "INSERT INTO quiz_sessions(user_id, item_id, question_count, "
-                "current_index, score, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, 0, 0, ?, ?, ?)",
-                (int(user_id), int(item_id), len(questions), status, now, now),
+                "current_index, score, status, created_at, updated_at, pack_id) "
+                "VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?)",
+                (
+                    int(user_id), int(item_id), len(questions), status, now, now,
+                    pack_id,
+                ),
             )
             session_id = int(cursor.lastrowid or 0)
             await self.db.executemany(
@@ -109,7 +141,7 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
         rows = await _rows(
             self.read_db,
             "SELECT session_id, user_id, item_id, question_count, current_index, "
-            "score, status, created_at, updated_at FROM quiz_sessions "
+            "score, status, created_at, updated_at, pack_id FROM quiz_sessions "
             "WHERE session_id = ? AND user_id = ?",
             (int(session_id), int(user_id)),
         )

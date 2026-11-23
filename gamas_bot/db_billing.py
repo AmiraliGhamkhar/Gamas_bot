@@ -229,6 +229,33 @@ class BillingRepositoryMixin(DatabaseCore):
             )
             return cursor.rowcount > 0
 
+    async def _add_credit_locked(
+        self,
+        user_id: int,
+        seconds: int,
+        *,
+        note: str,
+        validity_days: int | None = None,
+    ) -> int:
+        """Insert one credit lot inside the caller's transaction.
+
+        This is the single way a credit lot is created; callers that already hold
+        a transaction (a redemption, for instance) use this instead of
+        :meth:`add_credit`, which would try to open a nested ``BEGIN IMMEDIATE``.
+        The insert is what marks the balance cache dirty, so the caller's commit
+        also refreshes ``available_seconds``. Returns the new ``ledger.id``.
+        """
+        now_dt = self._now()
+        expires = (
+            iso(now_dt + timedelta(days=validity_days)) if validity_days else None
+        )
+        cursor = await self.db.execute(
+            "INSERT INTO ledger(user_id, seconds, kind, note, expires_at, created_at) "
+            "VALUES (?, ?, 'credit', ?, ?, ?)",
+            (int(user_id), int(seconds), note, expires, iso(now_dt)),
+        )
+        return int(cursor.lastrowid or 0)
+
     async def add_credit(
         self,
         user_id: int,
@@ -238,16 +265,13 @@ class BillingRepositoryMixin(DatabaseCore):
         validity_days: int | None = None,
         admin_id: int | None = None,
     ) -> None:
-        now_dt = self._now()
-        expires = (
-            iso(now_dt + timedelta(days=validity_days)) if validity_days else None
-        )
-        now = iso(now_dt)
+        now = iso(self._now())
         async with self._transaction():
-            await self.db.execute(
-                "INSERT INTO ledger(user_id, seconds, kind, note, expires_at, created_at) "
-                "VALUES (?, ?, 'credit', ?, ?, ?)",
-                (user_id, int(seconds), note, expires, now),
+            await self._add_credit_locked(
+                user_id,
+                seconds,
+                note=note,
+                validity_days=validity_days,
             )
             if admin_id is not None:
                 await self.db.execute(

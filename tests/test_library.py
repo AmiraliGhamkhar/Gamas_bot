@@ -305,7 +305,15 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.db.library_mark_unavailable(newest["item_id"]))
         self.assertTrue((await self.db.library_item(OWNER, newest["item_id"]))["unavailable"])
 
-    async def test_prune_keeps_newest_items_and_a_paid_quiz_source_until_it_ends(self):
+    async def test_prune_keeps_newest_items_and_never_drops_review_material(self):
+        """A quiz source is content, not a disposable delivered file.
+
+        Superseded expectation: once the quiz ended, its source item was pruned,
+        which cascaded into the session, its questions and their answers. Review
+        is now a Study Pack view over those rows, so retention never deletes an
+        item that owns questions (the user can still delete it explicitly); the
+        newest ``keep`` ordinary files are still pruned exactly as before.
+        """
         source = await self._add_item(OWNER, "منبع آزمون", message_id=50)
         questions = [{
             "question": "سؤال", "options": ["الف", "ب", "ج", "د"],
@@ -315,13 +323,24 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         for index in range(4):
             await self._add_item(OWNER, f"جدید {index}", message_id=100 + index)
         await self.db.library_prune(OWNER, keep=3)
-        self.assertEqual(await self.db.library_count(OWNER), 4)  # newest three plus active source
+        self.assertEqual(await self.db.library_count(OWNER), 4)  # newest three plus the source
         self.assertIsNotNone(await self.db.quiz_get_session(session, OWNER))
         self.assertIsNotNone(await self.db.quiz_current_question(session))
         await self.db.quiz_finish(session, "quit")
         await self.db.library_prune(OWNER, keep=3)
-        self.assertEqual(await self.db.library_count(OWNER), 3)
-        self.assertIsNone(await self.db.quiz_get_session(session, OWNER))
+        self.assertEqual(await self.db.library_count(OWNER), 4)
+        self.assertIsNotNone(await self.db.library_item(OWNER, source))
+        self.assertIsNotNone(await self.db.quiz_get_session(session, OWNER))
+        # The question is still reviewable after retention ran twice.
+        still_there, still_total = await self.db.review.review_questions(
+            OWNER, legacy_item_id=source
+        )
+        self.assertEqual(still_total, 1)
+        self.assertEqual(still_there[0]["question"], "سؤال")
+        # Retention still applies to every other delivered file.
+        newest = [item["item_id"] for item in await self.db.library_list(OWNER, limit=10)]
+        self.assertIn(source, newest)
+        self.assertEqual(len(newest), 4)
 
     async def _booklet(self, *, with_content: bool) -> int:
         item_id = await self.db.library_add(

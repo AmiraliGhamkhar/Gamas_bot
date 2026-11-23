@@ -180,6 +180,11 @@ def delivery_markup(
     * ⭐ دریافت نکات کلیدی
     * 📄 دریافت نسخه Word  (when the DOCX artifact is available)
     * 🌐 دریافت جزوه مرور تعاملی HTML  (when the review sheet is available)
+    * 🧪 ۲۰ سؤال نمونه  (opens the quiz start screen; the size and its price are
+      confirmed there, nothing is spent by this tap)
+
+    There is no referral or "back to menu" row: the completed file is the whole
+    screen, and account navigation belongs to the Mini App.
 
     Nothing appears here unless it really exists: ``kinds`` comes from the
     central submission artifact registry. Every button retrieves a persisted
@@ -240,7 +245,4 @@ def delivery_markup(
         )
     if learning:
         rows.append(learning)
-    if has_booklet or KIND_DOCX in kinds:
-        rows.append([Button.inline(texts.BTN_REFERRALS, b"ref:result")])
-    rows.append([Button.inline(texts.BTN_BACK_MAIN, b"menu:main")])
     return rows

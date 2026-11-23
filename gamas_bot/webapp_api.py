@@ -9,10 +9,12 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import parse_qs
 
 from .config import Settings, from_env
 from .db import Database
 from .explore_recommender import recommend_explore_feed
+from .rewards import REWARD_CATALOG as _REWARD_CATALOG
 from .study_storage import resolve_private_asset
 from .telegram_auth import InitDataError, validate_init_data
 
@@ -23,13 +25,6 @@ _V1_LIB_PACK_RE = re.compile(r"^/api/v1/library/(\d+)$")
 _V1_LIB_ASSETS_RE = re.compile(r"^/api/v1/library/(\d+)/assets$")
 _V1_LIB_DL_RE = re.compile(r"^/api/v1/library/(\d+)/download/(\d+)$")
 _V1_REVIEW_Q_RE = re.compile(r"^/api/v1/review/questions/(\d+)$")
-
-_REWARD_CATALOG = [
-    {"code": "theme_ocean", "category": "theme", "title": "تم اقیانوسی مینی‌اپ", "cost_points": 30, "credit_seconds": 0, "enabled": True, "expires_at": None, "max_per_user": 1},
-    {"code": "badge_scholar", "category": "badge", "title": "نشان پژوهشگر برتر", "cost_points": 40, "credit_seconds": 0, "enabled": True, "expires_at": None, "max_per_user": 1},
-    {"code": "credit_5m", "category": "credit_bonus", "title": "۵ دقیقه اعتبار گاماس", "cost_points": 50, "credit_seconds": 300, "enabled": True, "expires_at": None, "max_per_user": 5},
-    {"code": "discount_10", "category": "discount", "title": "کد تخفیف ۱۰٪", "cost_points": 80, "credit_seconds": 0, "enabled": True, "expires_at": None, "max_per_user": 2},
-]
 
 
 def _utc_now_iso() -> str:
@@ -66,6 +61,27 @@ def _json_response(
         ],
     )
     return [b"" if method == "HEAD" else body]
+
+
+def _query_params(environ: dict[str, Any]) -> dict[str, str]:
+    """First value of every query-string parameter (empty for no query)."""
+    raw = str(environ.get("QUERY_STRING") or "")
+    if not raw:
+        return {}
+    return {key: values[0] for key, values in parse_qs(raw).items() if values}
+
+
+def _paging(params: dict[str, str], *, default: int = 50, maximum: int = 200) -> tuple[int, int]:
+    """Clamped ``(limit, offset)`` from the query string; never raises."""
+    try:
+        limit = int(params.get("limit", default))
+    except (TypeError, ValueError):
+        limit = default
+    try:
+        offset = int(params.get("offset", 0))
+    except (TypeError, ValueError):
+        offset = 0
+    return max(1, min(maximum, limit)), max(0, offset)
 
 
 def _read_json_body(environ: dict[str, Any]) -> dict[str, Any]:
@@ -118,33 +134,95 @@ def make_wsgi_app(
         finally:
             await db.close()
 
-    def _serve_asset(
-        start_response: Callable, cfg: Settings, asset: dict[str, Any] | None
-    ) -> list[bytes]:
-        if asset is None:
-            return _json_response(
-                start_response, "404 Not Found", {"error": "not found"}
-            )
-        try:
-            file_path = resolve_private_asset(
-                _assets_root(cfg), str(asset["storage_path"])
-            )
-        except ValueError:
-            return _json_response(
-                start_response, "404 Not Found", {"error": "not found"}
-            )
-        if not file_path.is_file():
-            return _json_response(
-                start_response, "404 Not Found", {"error": "file missing"}
-            )
-        data = file_path.read_bytes()
+    def _safe_filename(name: str) -> str:
+        """A download name that can never break the header or the path."""
+        cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", name or "").strip("._")
+        return cleaned or "file"
+
+    async def _read_asset(
+        db: Database, user_id: int, cfg: Settings, asset: dict[str, Any]
+    ) -> tuple[bytes, str, str] | None:
+        """Resolve one asset to ``(bytes, content_type, filename)``.
+
+        A pack asset is a *reference*: the bytes stay in the store that already
+        owns them (transcription, submission artifact, document text or library
+        blob), so nothing is copied and every source keeps a single owner. The
+        owning row's ``user_id`` is re-checked here so a reference can never be
+        used to read another account's content.
+        """
+        source_kind = str(asset.get("source_kind") or "file")
+        ref = str(asset.get("source_ref") or "")
         mime = str(asset.get("mime_type") or "application/octet-stream")
+        if source_kind == "file":
+            try:
+                path = resolve_private_asset(_assets_root(cfg), str(asset["storage_path"]))
+            except ValueError:
+                return None
+            if not path.is_file():
+                return None
+            return path.read_bytes(), mime, path.name
+        if source_kind == "artifact":
+            submission_part, _, kind = ref.partition(":")
+            if not submission_part.isdigit() or not kind:
+                return None
+            row = await db.binary_artifact(int(submission_part), int(user_id), kind)
+            if row is None:
+                return None
+            return (
+                bytes(row.get("content") or b""),
+                str(row.get("content_type") or mime),
+                str(row.get("filename") or kind),
+            )
+        if source_kind == "transcription":
+            if not ref.isdigit():
+                return None
+            submission = await db.submission(int(ref))
+            if submission is None or int(submission.user_id) != int(user_id):
+                return None
+            row = await db.transcription(int(ref))
+            text = str((row or {}).get("text") or "")
+            return text.encode("utf-8"), mime, f"transcript-{ref}.txt"
+        if source_kind == "document_text":
+            if not ref.isdigit():
+                return None
+            document = await db.document_get(int(user_id), int(ref))
+            if document is None:
+                return None
+            return (
+                str(document.get("text") or "").encode("utf-8"),
+                mime,
+                f"document-{ref}.txt",
+            )
+        if source_kind == "library_blob":
+            if not ref.isdigit():
+                return None
+            blob = await db.library_file_blob(int(user_id), int(ref))
+            if blob is None:
+                return None
+            return (
+                bytes(blob.get("content") or b""),
+                str(blob.get("content_type") or mime),
+                str(blob.get("filename") or f"file-{ref}"),
+            )
+        return None
+
+    def _serve_asset(
+        start_response: Callable, resolved: tuple[bytes, str, str] | None
+    ) -> list[bytes]:
+        if resolved is None:
+            return _json_response(
+                start_response, "404 Not Found", {"error": "not found"}
+            )
+        data, mime, filename = resolved
         start_response(
             "200 OK",
             [
                 ("Content-Type", mime),
                 ("Content-Length", str(len(data))),
-                ("Content-Disposition", f'attachment; filename="{file_path.name}"'),
+                (
+                    "Content-Disposition",
+                    f'attachment; filename="{_safe_filename(filename)}"',
+                ),
                 ("Cache-Control", "private, no-store"),
             ],
         )
@@ -176,7 +254,10 @@ def make_wsgi_app(
                 async def _me(db: Database) -> dict[str, Any]:
                     await db.ensure_user(user_id, "")
                     ident = await db.user_identity(user_id) or {}
-                    bal = int(ident.get("credit_seconds", 0))
+                    # ``user_identity`` carries no credit balance, so reading one
+                    # from it always produced 0. Ask the ledger instead: this is
+                    # the same authoritative number a redemption increases.
+                    bal = int(await db.available_seconds(int(user_id)))
                     pts = await db.study_packs.reward_points_balance(user_id)
                     return {
                         "user_id": user_id,
@@ -184,6 +265,9 @@ def make_wsgi_app(
                         "reward_points": int(pts),
                         "free_uses": ident.get("free_uses", {"quiz": True}),
                         "banned": bool(ident.get("banned", False)),
+                        # The Mini App builds invite/share/support/purchase links
+                        # from this, so no deployment name is baked into the UI.
+                        "bot_username": cfg.bot_username,
                     }
 
                 return _json_response(
@@ -191,17 +275,112 @@ def make_wsgi_app(
                 )
 
             if path == "/api/v1/me/subscription" and method == "GET":
+                # ``required_channel`` never existed on Settings: the endpoint
+                # raised AttributeError for every caller. The field is
+                # ``subscription_channel``, and its public URL is derived from it.
+                channel = (cfg.subscription_channel or "").strip()
                 return _json_response(
                     start_response,
                     "200 OK",
-                    {"required_channel": cfg.required_channel or None},
+                    {
+                        "required_channel": channel or None,
+                        "channel_url": cfg.subscription_channel_url if channel else None,
+                        "required": bool(cfg.subscription_required and channel),
+                    },
+                )
+
+            if path == "/api/v1/me/plan" and method == "GET":
+                """The user's current plan, read from the rows that own it.
+
+                Nothing here is derived from the client: the plan is the one on
+                the latest *approved* payment, and the active window is the
+                earliest expiry among live credit lots. An admin-granted
+                unlimited flag is reported as ``unlimited``.
+                """
+
+                async def _plan(db: Database) -> dict[str, Any]:
+                    unlimited = bool(await db.is_unlimited(int(user_id)))
+                    credit = int(await db.available_seconds(int(user_id)))
+                    expiry_rows = list(await db.db.execute_fetchall(
+                        """
+                        SELECT MIN(expires_at) AS expires_at
+                        FROM ledger
+                        WHERE user_id = ? AND kind = 'credit'
+                          AND expires_at IS NOT NULL
+                          AND julianday(expires_at) > julianday('now')
+                        """,
+                        (int(user_id),),
+                    ))
+                    expires_at = expiry_rows[0]["expires_at"] if expiry_rows else None
+                    plan_rows = list(await db.db.execute_fetchall(
+                        """
+                        SELECT p.plan_code, pl.hours, pl.price, pl.original_price,
+                               pl.validity_days, p.created_at AS purchased_at
+                        FROM payments p
+                        LEFT JOIN plans pl ON pl.code = p.plan_code
+                        WHERE p.user_id = ? AND p.status = 'approved'
+                        ORDER BY p.payment_id DESC LIMIT 1
+                        """,
+                        (int(user_id),),
+                    ))
+                    plan: dict[str, Any] | None = None
+                    if plan_rows:
+                        row = dict(plan_rows[0])
+                        plan = {
+                            "code": row.get("plan_code"),
+                            "hours": row.get("hours"),
+                            "price": row.get("price"),
+                            "original_price": row.get("original_price"),
+                            "validity_days": row.get("validity_days"),
+                            "purchased_at": row.get("purchased_at"),
+                        }
+                    return {
+                        "unlimited": unlimited,
+                        "credit_seconds": credit,
+                        "expires_at": expires_at,
+                        "plan": plan,
+                    }
+
+                return _json_response(
+                    start_response, "200 OK", asyncio.run(_with_db(cfg, _plan))
+                )
+
+            if path == "/api/v1/plans" and method == "GET":
+                """Purchase options, exactly as the billing table defines them.
+
+                Prices come from ``plans`` (the same rows the bot's wallet
+                renders), so the Mini App can never show a different price.
+                """
+
+                async def _plans(db: Database) -> dict[str, Any]:
+                    rows = await db.plans()
+                    return {
+                        "plans": [
+                            {
+                                "code": row["code"],
+                                "hours": row["hours"],
+                                "price": int(row["price"]),
+                                "original_price": (
+                                    int(row["original_price"])
+                                    if row.get("original_price") is not None
+                                    else None
+                                ),
+                                "validity_days": row.get("validity_days"),
+                            }
+                            for row in rows
+                            if int(row["price"]) > 0
+                        ]
+                    }
+
+                return _json_response(
+                    start_response, "200 OK", asyncio.run(_with_db(cfg, _plans))
                 )
 
             if path == "/api/v1/me/credits" and method == "GET":
                 async def _credits(db: Database) -> dict[str, Any]:
                     ident = await db.user_identity(user_id) or {}
                     return {
-                        "credit_seconds": int(ident.get("credit_seconds", 0)),
+                        "credit_seconds": int(await db.available_seconds(int(user_id))),
                         "free_uses": ident.get("free_uses", {"quiz": True}),
                     }
 
@@ -223,9 +402,14 @@ def make_wsgi_app(
 
             if path == "/api/v1/me/payments" and method == "GET":
                 async def _pays(db: Database) -> dict[str, Any]:
+                    # ``payments`` has no ``amount_toman`` column: the price is
+                    # snapshotted at order time in ``purchased_price``. Selecting
+                    # the missing column made this endpoint fail for every user.
                     rows = await db.db.execute_fetchall(
                         """
-                        SELECT payment_id, amount_toman, status, created_at
+                        SELECT payment_id, plan_code, status, created_at,
+                               COALESCE(purchased_price, 0) AS amount_toman,
+                               purchased_seconds
                         FROM payments WHERE user_id = ?
                         ORDER BY payment_id DESC LIMIT 50
                         """,
@@ -282,6 +466,11 @@ def make_wsgi_app(
                         return {
                             "pack": pack,
                             "assets": [_sanitize_asset(a) for a in assets],
+                            # Review is the pack's own questions; the count lets
+                            # the detail screen offer Review only when it exists.
+                            "question_count": await db.review.review_question_count(
+                                user_id, pack_id
+                            ),
                         }
 
                     res = asyncio.run(_with_db(cfg, _get))
@@ -324,62 +513,93 @@ def make_wsgi_app(
             if m_v1_dl and method == "GET":
                 pack_id, asset_id = int(m_v1_dl.group(1)), int(m_v1_dl.group(2))
 
-                async def _get_v1_asset(db: Database) -> dict[str, Any] | None:
+                async def _get_v1_asset(
+                    db: Database,
+                ) -> tuple[bytes, str, str] | None:
                     asset = await db.study_packs.study_asset_get(user_id, asset_id)
                     if asset is None or int(asset["pack_id"]) != pack_id:
                         return None
-                    return asset
+                    return await _read_asset(db, user_id, cfg, asset)
 
                 return _serve_asset(
-                    start_response, cfg, asyncio.run(_with_db(cfg, _get_v1_asset))
+                    start_response, asyncio.run(_with_db(cfg, _get_v1_asset))
                 )
 
             m_dl = _ASSET_DL_RE.match(path)
             if m_dl and method == "GET":
                 asset_id = int(m_dl.group(1))
 
-                async def _get_asset(db: Database) -> dict[str, Any] | None:
-                    return await db.study_packs.study_asset_get(user_id, asset_id)
+                async def _get_asset(
+                    db: Database,
+                ) -> tuple[bytes, str, str] | None:
+                    asset = await db.study_packs.study_asset_get(user_id, asset_id)
+                    if asset is None:
+                        return None
+                    return await _read_asset(db, user_id, cfg, asset)
 
                 return _serve_asset(
-                    start_response, cfg, asyncio.run(_with_db(cfg, _get_asset))
+                    start_response, asyncio.run(_with_db(cfg, _get_asset))
                 )
 
             # ------------------------------------------------- Review APIs
+            # Review is a Study Pack view: questions are read through the pack
+            # that owns them, grouped by it, and titled with the pack's own
+            # title. Questions whose source predates Study Packs are returned as
+            # explicit legacy groups instead of being attached to a pack they
+            # never belonged to.
             if path == "/api/v1/review/groups" and method == "GET":
+                params = _query_params(environ)
+                limit, offset = _paging(params)
+
                 async def _groups(db: Database) -> dict[str, Any]:
-                    rows = await db.db.execute_fetchall(
-                        """
-                        SELECT session_id, item_id, question_count, status, created_at
-                        FROM quiz_sessions WHERE user_id = ?
-                        ORDER BY session_id DESC LIMIT 50
-                        """,
-                        (user_id,),
+                    groups, total = await db.review.review_groups(
+                        user_id, limit=limit, offset=offset
                     )
-                    return {"groups": [dict(r) for r in rows]}
+                    return {
+                        "groups": groups,
+                        "limit": limit,
+                        "offset": offset,
+                        "total": total,
+                    }
 
                 return _json_response(
                     start_response, "200 OK", asyncio.run(_with_db(cfg, _groups))
                 )
 
             if path == "/api/v1/review/questions" and method == "GET":
-                async def _r_qs(db: Database) -> dict[str, Any]:
-                    rows = await db.db.execute_fetchall(
-                        """
-                        SELECT q.question_id, q.session_id, q.idx, q.question, q.options_json
-                        FROM quiz_questions q
-                        JOIN quiz_sessions s ON s.session_id = q.session_id
-                        WHERE s.user_id = ?
-                        ORDER BY q.question_id DESC LIMIT 50
-                        """,
-                        (user_id,),
+                params = _query_params(environ)
+                limit, offset = _paging(params)
+                review_pack_id: int | None = None
+                review_legacy_item_id: int | None = None
+                try:
+                    if params.get("pack_id"):
+                        review_pack_id = int(params["pack_id"])
+                    group_key = str(params.get("group_key") or "")
+                    if group_key.startswith("pack:"):
+                        review_pack_id = int(group_key[len("pack:"):])
+                    elif group_key.startswith("legacy:"):
+                        review_legacy_item_id = int(group_key[len("legacy:"):])
+                    elif group_key:
+                        raise ValueError("unknown group")
+                except ValueError:
+                    return _json_response(
+                        start_response, "400 Bad Request", {"error": "invalid group"}
                     )
-                    items = []
-                    for r in rows:
-                        d = dict(r)
-                        d["options"] = json.loads(d.pop("options_json"))
-                        items.append(d)
-                    return {"questions": items}
+
+                async def _r_qs(db: Database) -> dict[str, Any]:
+                    questions, total = await db.review.review_questions(
+                        user_id,
+                        pack_id=review_pack_id,
+                        legacy_item_id=review_legacy_item_id,
+                        limit=limit,
+                        offset=offset,
+                    )
+                    return {
+                        "questions": questions,
+                        "limit": limit,
+                        "offset": offset,
+                        "total": total,
+                    }
 
                 return _json_response(
                     start_response, "200 OK", asyncio.run(_with_db(cfg, _r_qs))
@@ -390,20 +610,7 @@ def make_wsgi_app(
                 qid = int(m_rq.group(1))
 
                 async def _r_q(db: Database) -> dict[str, Any] | None:
-                    rows = await db.db.execute_fetchall(
-                        """
-                        SELECT q.question_id, q.session_id, q.idx, q.question, q.options_json
-                        FROM quiz_questions q
-                        JOIN quiz_sessions s ON s.session_id = q.session_id
-                        WHERE q.question_id = ? AND s.user_id = ?
-                        """,
-                        (qid, user_id),
-                    )
-                    if not rows:
-                        return None
-                    d = dict(rows[0])
-                    d["options"] = json.loads(d.pop("options_json"))
-                    return d
+                    return await db.review.review_question(user_id, qid)
 
                 res = asyncio.run(_with_db(cfg, _r_q))
                 if res is None:
@@ -414,40 +621,27 @@ def make_wsgi_app(
 
             if path == "/api/v1/review/answers" and method == "POST":
                 body = _read_json_body(environ)
-                qid = body.get("question_id")
-                chosen = body.get("chosen_index")
-                if not isinstance(qid, int) or not isinstance(chosen, int) or chosen < 0 or chosen > 3:
+                raw_qid = body.get("question_id")
+                raw_chosen = body.get("chosen_index")
+                if not isinstance(raw_qid, int) or not isinstance(raw_chosen, int):
+                    return _json_response(
+                        start_response, "400 Bad Request", {"error": "invalid payload"}
+                    )
+                answer_qid: int = raw_qid
+                answer_choice: int = raw_chosen
+                if (
+                    isinstance(raw_qid, bool)
+                    or isinstance(raw_chosen, bool)
+                    or not 0 <= answer_choice <= 3
+                ):
                     return _json_response(
                         start_response, "400 Bad Request", {"error": "invalid payload"}
                     )
 
                 async def _r_ans(db: Database) -> dict[str, Any] | None:
-                    rows = await db.db.execute_fetchall(
-                        """
-                        SELECT q.session_id, q.correct_index, q.explanation
-                        FROM quiz_questions q
-                        JOIN quiz_sessions s ON s.session_id = q.session_id
-                        WHERE q.question_id = ? AND s.user_id = ?
-                        """,
-                        (qid, user_id),
+                    return await db.review.review_answer(
+                        user_id, answer_qid, answer_choice
                     )
-                    if not rows:
-                        return None
-                    correct_idx = int(rows[0]["correct_index"])
-                    is_correct = 1 if chosen == correct_idx else 0
-                    await db.db.execute(
-                        """
-                        INSERT INTO quiz_answers(session_id, question_id, chosen_index, is_correct, answered_at)
-                        VALUES(?, ?, ?, ?, ?)
-                        """,
-                        (int(rows[0]["session_id"]), qid, chosen, is_correct, _utc_now_iso()),
-                    )
-                    await db.db.commit()
-                    return {
-                        "is_correct": bool(is_correct),
-                        "correct_index": correct_idx,
-                        "explanation": rows[0]["explanation"] or "",
-                    }
 
                 res = asyncio.run(_with_db(cfg, _r_ans))
                 if res is None:
@@ -458,54 +652,26 @@ def make_wsgi_app(
 
             if path == "/api/v1/review/share" and method == "POST":
                 body = _read_json_body(environ)
-                qid = body.get("question_id")
-                if not isinstance(qid, int):
+                raw_share_qid = body.get("question_id")
+                if not isinstance(raw_share_qid, int) or isinstance(raw_share_qid, bool):
                     return _json_response(
                         start_response, "400 Bad Request", {"error": "invalid payload"}
                     )
+                share_qid: int = raw_share_qid
 
                 async def _share(db: Database) -> dict[str, Any] | None:
-                    rows = await db.db.execute_fetchall(
-                        """
-                        SELECT q.question, q.options_json, q.correct_index, q.explanation
-                        FROM quiz_questions q
-                        JOIN quiz_sessions s ON s.session_id = q.session_id
-                        WHERE q.question_id = ? AND s.user_id = ?
-                        """,
-                        (qid, user_id),
-                    )
-                    if not rows:
-                        return None
-                    r = rows[0]
-                    cur = await db.db.execute(
-                        """
-                        INSERT INTO explore_questions(
-                            topic, difficulty, question_text, options_json,
-                            correct_index, explanation, status, created_by, created_at
-                        ) VALUES ('عمومی', 'easy', ?, ?, ?, ?, 'pending', ?, ?)
-                        """,
-                        (
-                            str(r["question"]),
-                            str(r["options_json"]),
-                            int(r["correct_index"]),
-                            str(r["explanation"] or ""),
-                            user_id,
-                            _utc_now_iso(),
-                        ),
-                    )
-                    await db.db.commit()
-                    return {
-                        "shared": True,
-                        "explore_question_id": int(cur.lastrowid),
-                        "status": "pending",
-                    }
+                    return await db.review.review_share(user_id, share_qid)
 
                 res = asyncio.run(_with_db(cfg, _share))
                 if res is None:
                     return _json_response(
                         start_response, "404 Not Found", {"error": "not found"}
                     )
-                return _json_response(start_response, "201 Created", res)
+                return _json_response(
+                    start_response,
+                    "200 OK" if res.get("already_shared") else "201 Created",
+                    res,
+                )
 
             # ------------------------------------------ Admin Moderation APIs
             if path == "/api/v1/admin/explore/pending" and method == "GET":
@@ -690,52 +856,75 @@ def make_wsgi_app(
             if path == "/api/v1/rewards/redeem" and method == "POST":
                 body = _read_json_body(environ)
                 code = str(body.get("reward_code") or "").strip()
-                item = next((c for c in _REWARD_CATALOG if c["code"] == code), None)
-                if item is None or not item.get("enabled", True):
+                client_key = body.get("idempotency_key")
+                if client_key is None:
+                    client_key = environ.get("HTTP_IDEMPOTENCY_KEY")
+                if client_key is not None and not isinstance(client_key, str):
                     return _json_response(
-                        start_response, "400 Bad Request", {"error": "invalid or disabled reward_code"}
-                    )
-                if item.get("expires_at") and str(item["expires_at"]) < _utc_now_iso():
-                    return _json_response(
-                        start_response, "400 Bad Request", {"error": "reward expired"}
+                        start_response,
+                        "400 Bad Request",
+                        {"error": "idempotency_key must be a string"},
                     )
 
-                async def _redeem(db: Database) -> tuple[str, dict[str, Any]]:
-                    await db.db.execute("BEGIN IMMEDIATE")
-                    try:
-                        max_u = item.get("max_per_user")
-                        if max_u is not None:
-                            cnt_rows = await db.db.execute_fetchall(
-                                "SELECT COUNT(*) AS cnt FROM reward_points_ledger WHERE user_id = ? AND reason = ?",
-                                (user_id, f"redeem:{code}"),
-                            )
-                            if int(cnt_rows[0]["cnt"]) >= int(max_u):
-                                await db.db.execute("ROLLBACK")
-                                return "400 Bad Request", {"error": "usage limit reached"}
-                        bal = await db.study_packs.reward_points_balance(user_id)
-                        if bal < int(item["cost_points"]):
-                            await db.db.execute("ROLLBACK")
-                            return "400 Bad Request", {"error": "insufficient points"}
-                        await db.db.execute(
-                            """
-                            INSERT INTO reward_points_ledger(user_id, delta, reason, ref_id, created_at)
-                            VALUES(?, ?, ?, NULL, ?)
-                            """,
-                            (user_id, -int(item["cost_points"]), f"redeem:{code}", _utc_now_iso()),
+                async def _redeem(db: Database) -> dict[str, Any]:
+                    # The catalog, the rules, the debit and the credit grant all
+                    # live in one transaction owned by the repository; the handler
+                    # only translates the outcome. Client-supplied balances are
+                    # never read, and nothing is reported as granted until the
+                    # transaction that wrote the credit lot has committed.
+                    result = await db.rewards.redeem(
+                        user_id, code, idempotency_key=client_key
+                    )
+                    result["available_seconds"] = int(
+                        await db.available_seconds(int(user_id))
+                    )
+                    return result
+
+                try:
+                    result = asyncio.run(_with_db(cfg, _redeem))
+                except Exception:  # noqa: BLE001 - the transaction rolled back
+                    # Nothing was committed: no points were spent and no credit
+                    # was granted, so this is the only honest answer.
+                    return _json_response(
+                        start_response,
+                        "500 Internal Server Error",
+                        {
+                            "error": "redemption_failed",
+                            "detail": "no points were deducted and no credit was granted",
+                        },
+                    )
+                if not result.get("ok"):
+                    error = str(result.get("error") or "")
+                    if error in {"unknown_reward", "reward_expired"}:
+                        return _json_response(
+                            start_response,
+                            "400 Bad Request",
+                            {"error": "invalid or disabled reward_code"},
                         )
-                        await db.db.commit()
-                        new_bal = await db.study_packs.reward_points_balance(user_id)
-                        return "200 OK", {
-                            "balance": int(new_bal),
-                            "credit_seconds_granted": int(item["credit_seconds"]),
-                            "reward_code": code,
-                        }
-                    except Exception:
-                        await db.db.execute("ROLLBACK")
-                        raise
+                    if error == "usage_limit":
+                        return _json_response(
+                            start_response, "400 Bad Request", {"error": "usage limit reached"}
+                        )
+                    return _json_response(
+                        start_response,
+                        "400 Bad Request",
+                        {
+                            "error": "insufficient points",
+                            "balance": int(result.get("reward_points") or 0),
+                        },
+                    )
 
-                status, payload = asyncio.run(_with_db(cfg, _redeem))
-                return _json_response(start_response, status, payload)
+                payload = {
+                    "balance": int(result["reward_points"]),
+                    "credit_seconds_granted": int(result["credit_seconds_granted"]),
+                    "credited": bool(result.get("credited")),
+                    "reward_code": str(result["reward_code"]),
+                    "redemption_id": int(result["redemption_id"]),
+                    "ledger_id": result.get("ledger_id"),
+                    "available_seconds": int(result.get("available_seconds") or 0),
+                    "idempotent": bool(result.get("idempotent")),
+                }
+                return _json_response(start_response, "200 OK", payload)
 
             return _json_response(
                 start_response, "404 Not Found", {"error": "not found"}, method=method

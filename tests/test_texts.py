@@ -32,40 +32,49 @@ def _persian_literals(path: Path) -> list[tuple[int, str]]:
 
 
 class MainAndHelpCopyTests(unittest.TestCase):
-    def test_welcome_screen_is_deterministic_and_within_one_message(self):
+    def test_start_screen_is_one_action_and_fits_in_one_message(self):
         first = texts.main_screen(
             first_start=True,
             balance="۲۵ ساعت",
             office_enabled=True,
             notes_configured=True,
         )
-        second = texts.main_screen(
+        again = texts.main_screen(
             first_start=True,
             balance="۲۵ ساعت",
             office_enabled=True,
             notes_configured=True,
         )
-        self.assertEqual(first, second)
-        self.assertTrue(first.startswith("به گاماس خوش آمدید\n\n"))
-        self.assertIn("اعتبار: ۲۵ ساعت", first)
-        # One invitation, stated in one sentence.
-        self.assertIn("فایل درس را همین‌جا بفرستید", first)
+        self.assertEqual(first, again)
+        self.assertTrue(first.startswith("فایل درس را بفرستید تا "))
+        # What the user gets back is the promise; the inputs are the whole menu.
+        self.assertIn("متن خام", first)
+        self.assertIn("جزوهٔ PDF", first)
+        self.assertIn("Word", first)
+        self.assertIn("۲۰ سؤال نمونه", first)
+        self.assertIn("صوت، ویدیو، PDF، Word یا PowerPoint", first)
         self.assertLessEqual(len(first.encode("utf-16-le")) // 2, TELEGRAM_TEXT_LIMIT)
 
-    def test_returning_screen_uses_the_main_menu_heading(self):
-        text = texts.main_screen(
-            first_start=False,
+    def test_the_start_screen_carries_no_balance_and_never_changes_on_return(self):
+        first_visit = texts.main_screen(
+            first_start=True,
             balance="۱ ساعت",
             office_enabled=False,
-            notes_configured=False,
+            notes_configured=True,
         )
-        self.assertTrue(text.startswith("فایل درس بعدی را همین‌جا بفرستید."))
-        self.assertNotIn("آفیس", text)
-        self.assertNotIn("کتابخانه", text)
-        self.assertIn("اعتبار: ۱ ساعت", text)
-        # The returning screen is shorter than the welcome screen: the pitch has
-        # already been made, so all that is left is the next file and the balance.
-        self.assertLess(len(text), 200)
+        returning = texts.main_screen(
+            first_start=False,
+            balance="۹۹ ساعت",
+            office_enabled=True,
+            notes_configured=True,
+        )
+        self.assertEqual(first_visit, returning)
+        self.assertNotIn("اعتبار", returning)
+        self.assertNotIn("آفیس", returning)
+        self.assertNotIn("کتابخانه", returning)
+        # Two lines plus one separator: the screen is a request, not a brochure.
+        self.assertEqual(len(returning.splitlines()), 3)
+        self.assertLess(len(returning), 200)
 
     def test_raw_only_welcome_does_not_promise_generated_learning_outputs(self):
         text = texts.main_screen(
@@ -74,8 +83,9 @@ class MainAndHelpCopyTests(unittest.TestCase):
             office_enabled=False,
             notes_configured=False,
         )
-        self.assertIn("متن استخراج‌شده در کتابخانه می‌ماند", text)
-        self.assertNotIn("جزوه و تمرین آماده می‌شوند", text)
+        self.assertTrue(text.startswith("فایل درس را بفرستید تا متن خام"))
+        self.assertNotIn("جزوه", text)
+        self.assertNotIn("سؤال", text)
 
     def test_home_screen_does_not_use_streaks_to_pressure_return_visits(self):
         one = texts.main_screen(

@@ -10,6 +10,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from gamas_bot import texts
 from gamas_bot.bot import GamasBot
 from gamas_bot.db import Database, MIGRATIONS_DIR
 from gamas_bot.db import TicketStateError
@@ -288,9 +289,21 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
     async def latest_ticket(self, user=USER_A):
         return (await self.db.list_user_tickets(user, limit=1))[0]
 
-    async def test_main_menu_offers_support(self):
+    async def test_support_is_reached_by_command_not_a_menu_button(self):
         from tests.test_bot import menu_payloads
-        self.assertIn(b"support", menu_payloads(self.bot._user_menu()))
+
+        # The menu is the Mini App; support is one typed command away and the
+        # help screen names it.
+        self.assertEqual(menu_payloads(self.bot._user_menu()), set())
+        self.assertIn("/support", texts.help_screen(office_enabled=False))
+
+        event = await self.say(USER_A, "/support")
+        self.assertEqual(event.replies, [texts.SUPPORT_MENU])
+
+    async def test_the_retired_support_label_still_opens_the_hub(self):
+        for label in (texts.BTN_SUPPORT, texts.BTN_SUPPORT_LEGACY):
+            event = await self.say(USER_A, label)
+            self.assertEqual(event.replies, [texts.SUPPORT_MENU], label)
 
     async def test_create_ticket_end_to_end_with_admin_notification(self):
         event = await self.open_ticket()
