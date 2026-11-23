@@ -38,6 +38,7 @@ from .bot_ui import (
     TELEGRAM_CAPTION_LIMIT,
 )
 from .db import InsufficientBalanceError
+from .db_study_packs import ASSET_KIND_QUIZ, SOURCE_KIND_LIBRARY_BLOB
 from .doc_extract import (
     DocChunk,
     chunk_text,
@@ -330,6 +331,43 @@ class LearningWorkflowMixin:
             else 0
         )
         return sent_chat_id, sent_message_id
+
+    async def _index_quiz_study_pack(
+        self,
+        user_id: int,
+        *,
+        source_item_id: int,
+        quiz_item_id: int,
+        byte_size: int,
+    ) -> None:
+        """Attach the delivered question file to the pack that produced it.
+
+        The questions themselves are linked through ``quiz_sessions.pack_id``
+        when the session is created; this indexes the interactive HTML the user
+        actually received, by reference to its library blob. A source with no
+        pack (a historical row) is not an error.
+        """
+        try:
+            pack = await self.db.study_packs.study_pack_get_for_item(
+                int(user_id), int(source_item_id)
+            )
+            if pack is None:
+                return
+            await self.db.study_packs.study_asset_add(
+                int(pack["pack_id"]),
+                int(user_id),
+                kind=ASSET_KIND_QUIZ,
+                title="آزمون تعاملی HTML",
+                storage_path="",
+                mime_type="text/html; charset=utf-8",
+                byte_size=int(byte_size),
+                source_kind=SOURCE_KIND_LIBRARY_BLOB,
+                source_ref=str(int(quiz_item_id)),
+            )
+        except Exception:
+            logger.warning(
+                "could not index quiz html into study pack user=%s", user_id, exc_info=True
+            )
 
     async def _generate_chunks(
         self,
@@ -770,7 +808,7 @@ class LearningWorkflowMixin:
                     f"{short_title(source_title or clean_title, fallback=FALLBACK_BOOKLET)} "
                     f"({to_persian_digits(len(final_items))} سؤال)"
                 )
-                await self.db.library_record_delivered_file(
+                quiz_item_id = await self.db.library_record_delivered_file(
                     user_id,
                     "quiz",
                     title=library_title,
@@ -782,6 +820,12 @@ class LearningWorkflowMixin:
                     content=artifact.content,
                 )
                 committed = True
+                await self._index_quiz_study_pack(
+                    user_id,
+                    source_item_id=int(source_item_id),
+                    quiz_item_id=int(quiz_item_id),
+                    byte_size=len(artifact.content),
+                )
                 await self.db.library_prune(user_id, self.settings.library_max_items)
             finally:
                 if current_task is not None:

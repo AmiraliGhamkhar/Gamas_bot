@@ -102,6 +102,7 @@ from .db import Database, iso
 from .db_core import BINARY_ARTIFACT_KINDS
 from .doc_extract import extract_document
 from .docx_export import jalali_date
+from .explore_seed import seed_explore_questions
 from .fileio import run_file_io
 from .gate_resume import ResumedEvent
 from .intake import (
@@ -311,6 +312,19 @@ class GamasBot(
             ],
             full_sync=True,
         )
+        # The Explore feed has nothing to show until the bank is in place, and
+        # nothing else seeds it. Idempotent: it only fills gaps, never rewrites a
+        # question and never touches one a user published.
+        try:
+            seeded = await seed_explore_questions(self.db)
+            if seeded["inserted"] or seeded["retired_legacy"]:
+                logger.info(
+                    "Explore bank: %s seeded, %s legacy placeholders retired",
+                    seeded["inserted"],
+                    seeded["retired_legacy"],
+                )
+        except Exception:
+            logger.warning("Explore seed failed", exc_info=True)
         await self.db.recover_interrupted()
         recovered = await self.db.recover_pending_free_uses()
         if recovered:
@@ -605,39 +619,6 @@ class GamasBot(
                     )
 
     # ----------------------------------------------------------------- menus
-    def _reply_keyboard(self, *, is_admin: bool) -> Any:
-        """The persistent bottom keyboard attached to the menu message.
-
-        ``resize_keyboard`` keeps it one line tall; ``is_persistent`` asks
-        Telegram to keep showing it once the user starts typing instead of
-        hiding it behind the keyboard toggle, which is what makes it a real
-        navigation bar rather than a one-off prompt.
-        """
-        from telethon.tl.types import (
-            ButtonTypeDefault,
-            KeyboardButton,
-            KeyboardButtonRow,
-            ReplyKeyboardMarkup,
-        )
-
-        rows = [
-            KeyboardButtonRow(
-                buttons=[
-                    KeyboardButton(text=label, type=ButtonTypeDefault())
-                    for label in row
-                ]
-            )
-            for row in texts.reply_menu_rows(
-                is_admin=is_admin, office_enabled=self.settings.office_enabled
-            )
-        ]
-        return ReplyKeyboardMarkup(
-            rows=rows,
-            resize=True,
-            persistent=True,
-            placeholder=texts.REPLY_KEYBOARD_PLACEHOLDER,
-        )
-
     def _user_menu(self, *, is_admin: bool = False) -> list:
         """Minimal primary menu: Mini App launch (if configured) and admin entry."""
         rows: list[list] = []
@@ -652,28 +633,6 @@ class GamasBot(
         if is_admin:
             rows.append([Button.inline(texts.BTN_ADMIN, b"adm:home")])
         return rows
-
-    def _more_menu(self) -> list:
-        """Secondary destinations, shown only when their feature is available."""
-        rows = [
-            [
-                Button.inline(texts.BTN_START_HERE, b"menu:main"),
-                Button.inline(texts.BTN_HISTORY, b"results"),
-            ],
-        ]
-        rows.extend(
-            [
-                [Button.inline(texts.BTN_HELP, b"help"),
-                 Button.inline(texts.BTN_REFERRALS, b"ref:home")],
-                [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
-            ]
-        )
-        return rows
-
-    async def _show_more(self, event) -> None:
-        await self._edit_or_reply(
-            event, texts.MORE_MENU_TITLE, self._more_menu()
-        )
 
     def _admin_menu(self) -> list:
         """The admin panel: three hubs, unrelated sections, and the way back."""
@@ -706,18 +665,25 @@ class GamasBot(
             office_enabled=self.settings.office_enabled,
             notes_configured=self.settings.note_configured,
         )
+        # One screen, one row: the Mini App (plus the admin panel for admins).
+        # No reply keyboard and no reply_markup: nothing in the bot competes
+        # with the message box for "send your file here".
+        await self._edit_or_reply(
+            event, text, self._user_menu(is_admin=self._is_admin(user_id))
+        )
+
+    async def _redirect_to_mini_app(self, event) -> None:
+        """Answer a retired navigation label: one line and the Mini App.
+
+        Library, results, referrals, credits and subscription are owned by the
+        Mini App. The bot keeps the inline screens reachable through their
+        callbacks (old messages still work) but no longer re-implements the
+        account menu as chat navigation.
+        """
         await self._edit_or_reply(
             event,
-            text,
-            self._user_menu(is_admin=self._is_admin(user_id)),
-            # A reply keyboard is set once and stays: attaching it again on every
-            # screen would turn every menu tap into a new message (Telegram
-            # cannot add a keyboard by editing), which is exactly the clutter the
-            # one-message results screen removes. It rides on the /start message
-            # and is re-attached whenever the user sends text.
-            reply_markup=None
-            if (hasattr(event, "data") or not self._is_admin(user_id))
-            else self._reply_keyboard(is_admin=True),
+            texts.MINI_APP_REDIRECT,
+            self._user_menu(is_admin=self._is_admin(event.sender_id)),
         )
 
     # -------------------------------------------------------- membership gate
@@ -1244,7 +1210,8 @@ class GamasBot(
 
         r.register_exact("help", self._cb_help)
         r.register_exact("menu:main", lambda e, _u, _d: self._show_main(e))
-        r.register_exact("menu:more", lambda e, _u, _d: self._show_more(e))
+        # Retired "more" buttons in old messages land on the start screen.
+        r.register_exact("menu:more", lambda e, _u, _d: self._show_main(e))
         r.register_exact("results", lambda e, _u, _d: self._show_results_hub(e))
         r.register_exact("library", lambda e, _u, _d: self._show_library(e))
         r.register_prefix("res:", self._cb_result_set)
@@ -1295,23 +1262,36 @@ class GamasBot(
         r.register_prefix("quiz:", self._route_quiz_callback)
 
     async def _route_reply_menu(self, event, user_id: int, text: str) -> bool:
-        """Run the screen behind a bottom-keyboard label; ``False`` if not one."""
+        """Route a label from a keyboard that is no longer drawn.
+
+        Telegram keeps sending the old labels for as long as a keyboard is on
+        screen, so each one keeps an answer. Content and money work in the bot
+        (buying credits, support, the free Office draft, admin) because the Mini
+        App cannot do all of it; account browsing is redirected to the app that
+        owns it. ``False`` means "not a label".
+        """
         label = text.strip()
-        routes = {
+        actions = {
             texts.BTN_START_HERE: self._show_main,
-            texts.BTN_MY_RESULTS: self._show_results_hub,
-            texts.BTN_HISTORY: self._show_results_hub,
-            texts.BTN_LIBRARY: lambda e: self._show_library(e),
-            texts.BTN_LIBRARY_LEGACY: lambda e: self._show_library(e),
             texts.BTN_WALLET: lambda e: self._show_wallet(e),
             texts.BTN_WALLET_LEGACY: lambda e: self._show_wallet(e),
             texts.BTN_WALLET_UPGRADE_LEGACY: lambda e: self._show_wallet(e),
-            texts.BTN_OFFICE: lambda e: self._route_office_callback(e, user_id, "office:start"),
-            texts.BTN_OFFICE_LEGACY: lambda e: self._route_office_callback(e, user_id, "office:start"),
+            texts.BTN_OFFICE: lambda e: self._route_office_callback(
+                e, user_id, "office:start"
+            ),
+            texts.BTN_OFFICE_LEGACY: lambda e: self._route_office_callback(
+                e, user_id, "office:start"
+            ),
             texts.BTN_SUPPORT: lambda e: self._show_support_home(e),
             texts.BTN_SUPPORT_LEGACY: lambda e: self._show_support_home(e),
-            texts.BTN_REFERRALS: lambda e: self._show_referrals(e, user_id),
-            texts.BTN_MORE: self._show_more,
+        }
+        mini_app_labels = {
+            texts.BTN_MY_RESULTS,
+            texts.BTN_HISTORY,
+            texts.BTN_LIBRARY,
+            texts.BTN_LIBRARY_LEGACY,
+            texts.BTN_REFERRALS,
+            texts.BTN_MORE,
         }
         if label in {texts.BTN_HELP, texts.BTN_HELP_LEGACY, texts.BTN_MENU_GUIDE}:
             await self._cb_help(event, user_id, "")
@@ -1321,11 +1301,14 @@ class GamasBot(
             # panel, reached by two paths, with no second implementation to drift.
             await self._show_admin_overview(event)
             return True
-        handler = routes.get(label)
-        if handler is None:
-            return False
-        await handler(event)
-        return True
+        handler = actions.get(label)
+        if handler is not None:
+            await handler(event)
+            return True
+        if label in mini_app_labels:
+            await self._redirect_to_mini_app(event)
+            return True
+        return False
 
     async def _show_results_hub(self, event, *, page: int = 0) -> None:
         """Page through the user's submission history and artifact sets."""
@@ -1489,12 +1472,13 @@ class GamasBot(
         await self._fetch_artifact(event, user_id, data)
 
     async def _cb_help(self, event, _user_id: int, _data: str) -> None:
+        # The only button on the guide is the bot's one action, not a menu.
         await event.respond(
             texts.help_screen(
                 office_enabled=self.settings.office_enabled,
                 notes_configured=self.settings.note_configured,
             ),
-            buttons=[[Button.inline(texts.BTN_BACK_MAIN, b"menu:main")]],
+            buttons=[[Button.inline(texts.BTN_BACK_TO_UPLOAD, b"menu:main")]],
         )
 
     async def _cb_lib_category(self, event, _user_id: int, data: str) -> None:
@@ -1777,11 +1761,19 @@ class GamasBot(
             self._broadcast_resume.pop(user_id, None)
             self.conversations.reset_on_start(user_id)
             self._office_sessions.pop(user_id, None)
-            if not existed:
-                parts = text.split(maxsplit=1)
-                payload = parts[1].strip() if len(parts) == 2 else ""
-                if payload.lower().startswith("ref_"):
-                    await self._apply_referral(event, user_id, payload[4:])
+            parts = text.split(maxsplit=1)
+            payload = parts[1].strip() if len(parts) == 2 else ""
+            if not existed and payload.lower().startswith("ref_"):
+                await self._apply_referral(event, user_id, payload[4:])
+            # The Mini App links back with ``?start=buy`` / ``?start=support``, so
+            # an already-registered user lands on the screen they asked for
+            # instead of on the file request.
+            if payload.lower() == "buy":
+                await self._show_wallet(event)
+                return
+            if payload.lower() == "support":
+                await self._show_support_home(event)
+                return
             await self._show_main(event, first_start=True)
             return
 
@@ -1868,6 +1860,21 @@ class GamasBot(
 
         if user_id in self._pending_payments and not command:
             await self._handle_receipt_upload(event, user_id)
+            return
+
+        if command == "/help":
+            await self._cb_help(event, user_id, "")
+            return
+        if command == "/buy":
+            await self._show_wallet(event)
+            return
+        if command == "/support":
+            await self._show_support_home(event)
+            return
+        if command == "/office":
+            # Its keyboard entry is retired; the command keeps the feature usable
+            # (and the callback route still answers old messages).
+            await self._route_office_callback(event, user_id, "office:start")
             return
 
         if command == "/cancel":

@@ -503,8 +503,10 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.capture.file_payloads, [])
 
     async def test_office_button_hidden_but_existing_callbacks_still_work(self):
-        for menu in (self.bot._user_menu(), self.bot._more_menu()):
-            payloads = {button.type.data for row in menu for button in row}
+        for menu in (self.bot._user_menu(), self.bot._admin_menu()):
+            payloads = {
+                getattr(button.type, "data", None) for row in menu for button in row
+            }
             self.assertNotIn(b"office:start", payloads)
         callback = self.callback("office:start")
         await self.bot._handle_callback(callback)

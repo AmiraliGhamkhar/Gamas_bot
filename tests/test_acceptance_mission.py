@@ -425,21 +425,17 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.db.submission(job.submission_id)).status, "done")
 
     async def test_main_menu_matches_the_mission_buttons(self):
+        """The bot's whole navigation is the Mini App; nothing is duplicated."""
         from tests.test_bot import menu_payloads
 
         menu = self.bot._user_menu()
-        payloads = menu_payloads(menu)
-        flat_labels = [button.text for row in menu for button in row]
-        self.assertEqual(flat_labels, ["کتابخانه", "اعتبار", "بیشتر", "پشتیبانی"])
-        self.assertEqual(
-            payloads,
-            {b"library", b"wallet", b"menu:more", b"support"},
-        )
-        more_payloads = menu_payloads(self.bot._more_menu())
-        self.assertNotIn(b"office:start", more_payloads)
-        self.assertNotIn(b"board", more_payloads)
-        self.assertIn(b"results", more_payloads)
-        self.assertIn(b"ref:home", more_payloads)
+        # No inline navigation at all: the account, library, review and explore
+        # screens live in the Mini App, the bot keeps only its file request.
+        self.assertEqual(menu_payloads(menu), set())
+        self.assertFalse(hasattr(self.bot, "_more_menu"))
+        self.assertFalse(hasattr(self.bot, "_reply_keyboard"))
+        for retired in (b"library", b"wallet", b"support", b"results", b"ref:home"):
+            self.assertNotIn(retired, menu_payloads(self.bot._admin_menu()))
 
         admin_labels = [button.text for row in self.bot._admin_menu() for button in row]
         # R1: the nine payment/user/health buttons are three hubs now.

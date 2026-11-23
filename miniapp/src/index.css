@@ -1,3 +1,105 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+    /* Telegram reports the viewport as a CSS variable; keep our own default. */
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+    --ease-smooth: cubic-bezier(0.22, 0.61, 0.36, 1);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: #0b0c0e;
+    color: #f2f3f5;
+    font-family: "Vazirmatn Variable", "Vazirmatn", "Segoe UI", Tahoma, system-ui,
+      sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overscroll-behavior-y: none;
+  }
+
+  /* Mobile taps should feel like the surface answered, not like a selection. */
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  button,
+  input {
+    font: inherit;
+    color: inherit;
+  }
+
+  :focus-visible {
+    outline: 2px solid #f0b54a;
+    outline-offset: 2px;
+    border-radius: 8px;
+  }
+
+  ::selection {
+    background: rgba(240, 181, 74, 0.28);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-card border border-line bg-surface shadow-card;
+  }
+
+  /* Every tappable surface answers with the same 2% press, never a bounce. */
+  .pressable {
+    @apply transition-transform duration-150 ease-smooth active:scale-[0.985];
+  }
+
+  .nums {
+    font-feature-settings: "tnum" 1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .skeleton {
+    background-image: linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0.04) 25%,
+      rgba(255, 255, 255, 0.08) 37%,
+      rgba(255, 255, 255, 0.04) 63%
+    );
+    background-size: 200% 100%;
+    @apply animate-shimmer rounded-field;
+  }
+
+  .no-scrollbar {
+    scrollbar-width: none;
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .safe-bottom {
+    padding-bottom: calc(var(--safe-bottom) + 0.5rem);
+  }
+
+  /* A list that arrives without a hard cut: the stagger is capped in JS. */
+  .stagger > * {
+    animation: rise 0.3s var(--ease-smooth) both;
+  }
+}

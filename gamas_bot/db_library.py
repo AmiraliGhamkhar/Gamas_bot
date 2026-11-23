@@ -609,24 +609,61 @@ class LibraryRepositoryMixin(DatabaseCore):
     async def library_prune(
         self, user_id: int, keep: int, *, protected_item_ids: Collection[int] = ()
     ) -> int:
+        """Drop the oldest delivered files beyond ``keep`` for one user.
+
+        Two rules keep Review intact without changing what retention means:
+
+        * an item that owns quiz sessions, or that is a Study Pack's source row,
+          is **content** rather than a delivered artifact — deleting it cascades
+          into ``quiz_sessions``/``quiz_questions`` and would silently erase the
+          user's review material, so it is never pruned;
+        * a delivered file that a pack references through a ``library_blob``
+          asset is still pruned, and its asset row is dropped in the same
+          transaction, so the pack manifest never points at a missing file.
+        """
         keep = max(0, int(keep))
         protected = tuple(int(item_id) for item_id in protected_item_ids)
         exclusion = (
             " AND item_id NOT IN (" + ",".join("?" for _ in protected) + ")"
             if protected else ""
         )
+        where = (
+            "user_id = ? AND delivered = 1 "
+            "AND item_id NOT IN ("
+            "SELECT item_id FROM library_items WHERE user_id = ? AND delivered = 1 "
+            "ORDER BY item_id DESC LIMIT ?) "
+            "AND NOT EXISTS (SELECT 1 FROM quiz_sessions q "
+            "WHERE q.user_id = library_items.user_id AND q.item_id = library_items.item_id) "
+            "AND NOT EXISTS (SELECT 1 FROM study_packs p "
+            "WHERE p.user_id = library_items.user_id "
+            "AND p.source_item_id = library_items.item_id AND p.deleted_at IS NULL)"
+            + exclusion
+        )
+        params: tuple[Any, ...] = (int(user_id), int(user_id), keep, *protected)
         async with self._transaction():
-            cursor = await self.db.execute(
-                "DELETE FROM library_items WHERE user_id = ? AND delivered = 1 "
-                "AND item_id NOT IN ("
-                "SELECT item_id FROM library_items WHERE user_id = ? AND delivered = 1 "
-                "ORDER BY item_id DESC LIMIT ?) "
-                "AND NOT EXISTS (SELECT 1 FROM quiz_sessions q "
-                "WHERE q.user_id = library_items.user_id AND q.item_id = library_items.item_id "
-                "AND q.status = 'active')" + exclusion,
-                (int(user_id), int(user_id), keep, *protected),
+            doomed = await _rows(
+                self.db,
+                f"SELECT item_id FROM library_items WHERE {where}",
+                params,
             )
-            return max(0, int(cursor.rowcount))
+            item_ids = [int(row["item_id"]) for row in doomed]
+            if not item_ids:
+                return 0
+            cursor = await self.db.execute(
+                f"DELETE FROM library_items WHERE {where}",
+                params,
+            )
+            removed = max(0, int(cursor.rowcount))
+            # Chunked so a large backlog cannot exceed SQLite's parameter cap.
+            for start in range(0, len(item_ids), 400):
+                chunk = item_ids[start:start + 400]
+                await self.db.execute(
+                    "DELETE FROM study_assets WHERE user_id = ? "
+                    "AND source_kind = 'library_blob' AND source_ref IN ("
+                    + ",".join("?" for _ in chunk) + ")",
+                    (int(user_id), *[str(item_id) for item_id in chunk]),
+                )
+            return removed
 
     async def library_list_kind(
         self, user_id: int, kind: str, *, limit: int = 6, offset: int = 0
@@ -779,6 +816,23 @@ class LibraryRepositoryMixin(DatabaseCore):
         rows = await _rows(
             self.read_db,
             f"SELECT {selected_columns} FROM submission_binary_artifacts "
+            "WHERE submission_id = ? AND user_id = ? AND kind = ?",
+            (int(submission_id), int(user_id), str(kind)),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def binary_artifact_meta(
+        self, submission_id: int, user_id: int, kind: str
+    ) -> dict[str, Any] | None:
+        """Describe one persisted artifact without loading its bytes.
+
+        Study Packs reference these rows instead of copying the file, so they
+        only need the size, digest and content type for display.
+        """
+        rows = await _rows(
+            self.read_db,
+            "SELECT kind, filename, content_type, sha256, length(content) AS byte_size "
+            "FROM submission_binary_artifacts "
             "WHERE submission_id = ? AND user_id = ? AND kind = ?",
             (int(submission_id), int(user_id), str(kind)),
         )

@@ -39,8 +39,8 @@ BTN_HELP: Final = "راهنما"
 BTN_HELP_LEGACY: Final = "ℹ️ راهنما"
 BTN_ADMIN: Final = "🛠 پنل مدیریت"
 BTN_MORE: Final = "بیشتر"
-MORE_MENU_TITLE: Final = "بخش‌های دیگر"
 BTN_BACK_MAIN: Final = "↩️ منوی اصلی"
+BTN_BACK_TO_UPLOAD: Final = "📤 ارسال فایل"
 BTN_BACK: Final = "↩️ بازگشت"
 BTN_CANCEL: Final = "لغو"
 BTN_BOOKLETS: Final = "همهٔ موارد"
@@ -71,8 +71,7 @@ BTN_DOWNLOAD_TXT: Final = "دانلود متن خام (TXT)"
 BTN_GET_KEYPOINTS: Final = "دریافت نکات کلیدی"
 BTN_MY_RESULTS: Final = "📦 خروجی‌های من"
 BTN_START_HERE: Final = "🎓 شروع"
-BTN_UPGRADE: Final = "🛒 افزایش اعتبار"
-BTN_QUIZ_FROM_BOOKLET: Final = "آزمون از این جزوه"
+BTN_QUIZ_FROM_BOOKLET: Final = "🧪 ۲۰ سؤال نمونه"
 OFFICE_CREDIT_NOTICE: Final = (
     "🗂 تبدیل متن به Word، Excel، PowerPoint یا PDF؛ "
     "سقف ورودی و محدودیت ظرفیت اعمال می‌شود."
@@ -138,28 +137,44 @@ def main_screen(
     notes_configured: bool,
     streak_days: int = 0,
 ) -> str:
-    """Single-purpose file-to-study-material start instruction."""
-    del first_start, balance, office_enabled, notes_configured, streak_days
-    return "فایل درسی خود را برای گاماس بفرستید.\n\nصوت، ویدیو، PDF، Word یا PowerPoint"
+    """The whole bot entry point: send a file, get the outputs back.
+
+    Deliberately one sentence plus the input list. The first visit and every
+    later visit render the same screen: there is no returning "panel" to learn,
+    keep in balance, or read a second time.
+    """
+    del first_start, balance, office_enabled, streak_days
+    # Never promise a booklet the deployment cannot produce.
+    if notes_configured:
+        promise = "متن خام، جزوهٔ PDF و Word و ۲۰ سؤال نمونه"
+        action = f"فایل درس را بفرستید تا {promise} بگیرید."
+    else:
+        action = "فایل درس را بفرستید تا متن خام آن را بگیرید."
+    return f"{action}\n\nصوت، ویدیو، PDF، Word یا PowerPoint"
+
+
+#: What a retried legacy label gets: one line and the Mini App, nothing else.
+MINI_APP_REDIRECT: Final = (
+    "حساب، اعتبار، اشتراک، پرداخت‌ها، کتابخانه و کاوش در مینی‌اپ گاماس است."
+)
 
 
 # ---------------------------------------------------------------------------
 # The always-visible menu keyboard (Telegram reply keyboard, not inline glass)
 # ---------------------------------------------------------------------------
 
-#: Placeholder shown inside the message box while the keyboard is attached.
-REPLY_KEYBOARD_PLACEHOLDER: Final = "فایل درس را بفرستید"
 #: Old label accepted by the message router for already displayed keyboards.
 BTN_MENU_GUIDE: Final = "ℹ️ راهنما"
 
 
 def reply_menu_rows(*, is_admin: bool, office_enabled: bool = True) -> list[list[str]]:
-    """Minimal reply keyboard: only admin entry when applicable."""
-    del office_enabled
-    rows: list[list[str]] = []
-    if is_admin:
-        rows.append([BTN_ADMIN])
-    return rows
+    """The reply keyboard is retired: the bot has no bottom navigation.
+
+    Kept as an empty result so stale callers (and the tests that pin the
+    keyboard away) do not need a special case.
+    """
+    del is_admin, office_enabled
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +193,7 @@ DELIVERY_ROW_TRANSCRIPT: Final = "متن خام گفتار را می‌توان�
 DELIVERY_ROW_TXT: Final = "متن خام گفتار به‌صورت فایل TXT آماده است."
 DELIVERY_ROW_KEYPOINTS: Final = "نکات کلیدی آماده است."
 DELIVERY_ROW_DOCX: Final = "نسخهٔ Word آماده است."
-DELIVERY_ROW_LEARNING: Final = "از جزوه می‌توانید آزمون بسازید."
+DELIVERY_ROW_LEARNING: Final = "۲۰ سؤال نمونه از همین جزوه آمادهٔ ساخت است."
 DELIVERY_ROW_NOTES_PENDING: Final = "نکات کلیدی در حال آماده‌شدن است."
 DELIVERY_SPEAKERS_TEMPLATE: Final = "گویندگان شناسایی‌شده: {count} نفر"
 DELIVERY_SPEAKERS_ONE: Final = "یک گوینده شناسایی شد."
@@ -300,45 +315,38 @@ def help_screen(
     office_enabled: bool,
     notes_configured: bool = True,
 ) -> str:
-    """The one-screen guide: what to send, what you get, and what it costs."""
+    """A short guide: what to send, what comes back, the two bot commands.
+
+    Everything that used to be a manual here (library, credits, referrals,
+    quiz building) is one line pointing at the place that owns it.
+    """
+    if notes_configured:
+        outputs = "متن خام، جزوهٔ PDF، نسخهٔ Word و ۲۰ سؤال نمونه"
+    else:
+        outputs = "متن خام و فایل‌های استخراج‌شده"
     lines = [
         "ℹ️ راهنمای گاماس",
         "",
-        "📤 فایل درس بفرستید:",
+        "📤 فایل بفرستید: صوت، ویدیو، ویس، PDF، Word یا PowerPoint",
+        f"✅ در پایان می‌گیرید: {outputs}",
     ]
-    if notes_configured:
-        lines.append(
-            "صوت/ویدیو/ویس → متن خام + جزوه | "
-            "PDF/Word/PowerPoint → متن + جزوه و مرور سریع"
-        )
-    else:
-        lines.append(
-            "صوت/ویدیو/ویس → متن خام | PDF/Word/PowerPoint → متن استخراج‌شده"
-        )
-    if office_enabled:
-        lines.append(OFFICE_CREDIT_NOTICE)
+    if not notes_configured:
+        lines.append("⚠️ ساخت خودکار جزوه و آزمون هوشمند فعلاً فعال نیست.")
     lines.extend(
         [
-            "",
-            "📚 خروجی‌ها در «کتابخانه» می‌مانند (تا ۵۰ فایل).",
+            "🛒 خرید اعتبار: /buy    🎧 پشتیبانی: /support",
+            "🚀 حساب، کتابخانه، مرور و کاوش: مینی‌اپ",
         ]
     )
-    if notes_configured:
-        lines.append(
-            "🧪 از جزوه آزمون بسازید."
-        )
-    else:
-        lines.append(
-            "⚠️ ساخت خودکار جزوه و آزمون هوشمند فعلاً فعال نیست."
-        )
+    if office_enabled:
+        lines.append("✍️ آفیس رایگان: /office")
+        lines.append(OFFICE_CREDIT_NOTICE)
     lines.extend(
         [
             "🎧 صدای PowerPoint خودکار پردازش نمی‌شود؛ "
             "دکمهٔ پردازش صدا را از کارت سند بزنید.",
             DOCUMENT_SCANNED_NOTICE,
             DOCUMENT_EMBEDDED_IMAGES_NOTICE,
-            "",
-            "💳 اطلاعات اعتبار و قیمت‌ها را در بخش خرید اعتبار ببینید.",
         ]
     )
     return "\n".join(lines)

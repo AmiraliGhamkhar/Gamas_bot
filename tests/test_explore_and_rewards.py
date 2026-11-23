@@ -32,7 +32,7 @@ class ExploreAndRewardsTests(unittest.IsolatedAsyncioTestCase):
         self.db = Database(self.settings.db_path)
         await self.db.connect()
         await self.db.ensure_user(101, "Alice")
-        await seed_explore_questions(self.db, count=200)
+        await seed_explore_questions(self.db)
         await self.db.close()
         self.app = make_wsgi_app(self.settings, private_assets_dir=root / "assets")
 

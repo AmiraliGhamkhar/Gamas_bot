@@ -39,9 +39,14 @@ def _call_wsgi(app, method: str, path: str, *, headers: dict[str, str] | None = 
     def start_response(status, _headers, _exc=None):
         status_holder.append(status)
 
+    # A route may carry a query string (pagination, group filters): WSGI splits
+    # it into QUERY_STRING, so the helper must too instead of matching "?" as
+    # part of PATH_INFO.
+    path_only, _, query = path.partition("?")
     environ = {
         "REQUEST_METHOD": method,
-        "PATH_INFO": path,
+        "PATH_INFO": path_only,
+        "QUERY_STRING": query,
         "CONTENT_LENGTH": str(len(body)),
         "wsgi.input": io.BytesIO(body),
     }

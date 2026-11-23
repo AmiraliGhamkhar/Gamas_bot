@@ -49,6 +49,8 @@ from .db_library import LibraryRepositoryMixin
 from .db_payments import PaymentsRepositoryMixin
 from .db_referrals import ReferralsRepositoryMixin
 from .db_reporting import ReportingRepositoryMixin
+from .db_rewards import RewardRepository
+from .db_review import ReviewRepository
 from .db_study_packs import StudyPackRepository
 from .db_support import SupportRepositoryMixin
 from .db_users import UsersRepositoryMixin
@@ -124,6 +126,16 @@ class Database(
     def study_packs(self) -> StudyPackRepository:
         """Study Packs, private Study Assets, and Reward Points persistence."""
         return StudyPackRepository(self)
+
+    @property
+    def review(self) -> ReviewRepository:
+        """Study Pack-owned questions, answers, and publication state."""
+        return ReviewRepository(self)
+
+    @property
+    def rewards(self) -> RewardRepository:
+        """Atomic reward-point redemption into real processing credits."""
+        return RewardRepository(self)
 
 
 __all__ = [

@@ -670,6 +670,16 @@ class Settings:
     subscription_timeout_seconds: float = 20.0
     #: Bot API base URL (overridable for a mirror or an offline test).
     telegram_api_base_url: str = "https://api.telegram.org"
+    #: Public HTTPS base URL of this deployment (no trailing slash). The Mini
+    #: App is served from the same host at ``/app``, so the bot's only menu
+    #: button is ``{webapp_url}/app``. Empty means "not deployed behind a public
+    #: URL": the button is then omitted rather than pointing nowhere, and the
+    #: bot still works as a pure file interface.
+    webapp_url: str = ""
+    #: Bot username without ``@``. The Mini App builds its invite, share,
+    #: support and purchase deep links from this instead of hardcoding a name
+    #: that changes per deployment.
+    bot_username: str = "Gamas_bot"
 
     # --- Learning loop (quiz) ----------------------------------------------
     #: Credit (seconds) charged per generated quiz question, before generation.
@@ -1586,6 +1596,8 @@ def from_env(env_file: str | None = None) -> Settings:
         telegram_api_base_url=_env(
             "TELEGRAM_API_BASE_URL", "https://api.telegram.org"
         ).rstrip("/"),
+        webapp_url=_env("WEBAPP_URL").strip().rstrip("/"),
+        bot_username=_env("BOT_USERNAME", "Gamas_bot").strip().lstrip("@"),
         quiz_cost_seconds_per_question=_env_int(
             "QUIZ_COST_SECONDS_PER_QUESTION", 60, minimum=1, maximum=86_400
         ),

@@ -27,6 +27,14 @@ from .artifact_validation import validate_docx_artifact, validate_pdf_artifact
 from .bot_deps import deps_for
 from .bot_ui import ACTIVE_LIMIT_MESSAGE
 from .db import InsufficientBalanceError, TooManyActiveJobsError
+from .db_study_packs import (
+    ASSET_KIND_DOCX,
+    ASSET_KIND_PDF,
+    ASSET_KIND_REVIEW_HTML,
+    ASSET_KIND_TRANSCRIPT,
+    SOURCE_KIND_ARTIFACT,
+    SOURCE_KIND_TRANSCRIPTION,
+)
 from .docx_export import (
     DocumentMeta,
     build_notes_docx,
@@ -179,6 +187,184 @@ class JobPipelineMixin:
                 await self._abandon_admission(submission_id)
             raise
 
+    # ---------------------------------------------------- study pack lifecycle
+    #: Submission outcomes map onto pack outcomes: a finished job is ``ready``
+    #: unless an output (or its notification) was lost.
+    _PACK_STATUS = {
+        "done": "ready",
+        "partial": "partial",
+        "failed": "failed",
+        "rejected": "failed",
+    }
+
+    @staticmethod
+    def _pack_source_type(kind: str) -> str:
+        """Normalise a job kind to the pack's ``source_type`` vocabulary."""
+        return {"presentation": "pptx", "text": "txt"}.get(kind, kind or "upload")
+
+    def _pack_title(self, filename: str | None) -> str:
+        """The upload name is the only honest source of a pack title."""
+        return short_title(Path(str(filename or "")).stem, fallback=FALLBACK_BOOKLET)
+
+    async def _open_study_pack(
+        self, user_id: int, submission_id: int, *, kind: str, filename: str | None
+    ) -> int | None:
+        """Create the Study Pack of an accepted submission, exactly once.
+
+        Bookkeeping must never block admission, so a failure here is logged and
+        the job still runs: :meth:`_finalize_study_pack` recreates the pack at
+        delivery time, which also covers submissions admitted before this
+        feature existed.
+        """
+        try:
+            return await self.db.study_packs.study_pack_ensure(
+                int(user_id),
+                submission_id=int(submission_id),
+                title=self._pack_title(filename),
+                source_type=self._pack_source_type(kind),
+                source_filename=filename or "",
+                status="processing",
+            )
+        except Exception:
+            logger.warning(
+                "could not open study pack submission=%s", submission_id, exc_info=True
+            )
+            return None
+
+    async def _close_study_pack(
+        self, user_id: int, submission_id: int, *, error: str, error_kind: str
+    ) -> None:
+        """Fail a pack whose submission never reached delivery."""
+        try:
+            await self.db.study_packs.study_pack_close_after_job(
+                int(user_id), int(submission_id), error=error, error_kind=error_kind
+            )
+        except Exception:
+            logger.warning(
+                "could not close study pack submission=%s", submission_id, exc_info=True
+            )
+
+    async def _attach_study_assets(
+        self, job: Job, pack_id: int, kinds: set[str]
+    ) -> None:
+        """Attach the pipeline's outputs to the pack without copying bytes.
+
+        Every asset is a reference into storage that already exists: the raw
+        transcript is the ``transcriptions`` row and the files are the persisted
+        ``submission_binary_artifacts`` the bot's own delivery buttons serve.
+        """
+        from .artifacts import KIND_BOOKLET, KIND_DOCX, KIND_REVIEW_HTML
+
+        packs = self.db.study_packs
+        uid = int(job.user_id)
+        transcription = await self.db.transcription(int(job.submission_id))
+        text = str((transcription or {}).get("text") or "")
+        if text.strip():
+            await packs.study_asset_add(
+                pack_id,
+                uid,
+                kind=ASSET_KIND_TRANSCRIPT,
+                title="متن خام درس",
+                storage_path="",
+                mime_type="text/plain; charset=utf-8",
+                byte_size=len(text.encode("utf-8")),
+                source_kind=SOURCE_KIND_TRANSCRIPTION,
+                source_ref=str(int(job.submission_id)),
+            )
+        for kind, asset_kind, title in (
+            (KIND_BOOKLET, ASSET_KIND_PDF, "جزوهٔ PDF"),
+            (KIND_DOCX, ASSET_KIND_DOCX, "جزوهٔ Word"),
+            (KIND_REVIEW_HTML, ASSET_KIND_REVIEW_HTML, "جزوهٔ مرور تعاملی"),
+        ):
+            if kind not in kinds:
+                continue
+            meta = await self.db.binary_artifact_meta(
+                int(job.submission_id), uid, kind
+            )
+            if meta is None:
+                continue
+            await packs.study_asset_add(
+                pack_id,
+                uid,
+                kind=asset_kind,
+                title=title,
+                storage_path="",
+                mime_type=str(meta.get("content_type") or "application/octet-stream"),
+                byte_size=int(meta.get("byte_size") or 0),
+                sha256=str(meta.get("sha256") or ""),
+                source_kind=SOURCE_KIND_ARTIFACT,
+                source_ref=f"{int(job.submission_id)}:{kind}",
+            )
+
+    async def _finalize_study_pack(
+        self,
+        job: Job,
+        *,
+        kinds: set[str],
+        status: str,
+        error: str = "",
+        error_kind: str | None = None,
+    ) -> None:
+        """Attach the outputs and record the pack's terminal outcome."""
+        try:
+            packs = self.db.study_packs
+            uid = int(job.user_id)
+            submission_id = int(job.submission_id)
+            pack = await packs.study_pack_get_for_submission(uid, submission_id)
+            if pack is None:
+                await packs.study_pack_ensure(
+                    uid,
+                    submission_id=submission_id,
+                    title=self._pack_title(job.filename),
+                    source_type=self._pack_source_type(job.kind),
+                    source_filename=job.filename or "",
+                    status="processing",
+                )
+                pack = await packs.study_pack_get_for_submission(uid, submission_id)
+            if pack is None:
+                logger.warning(
+                    "study pack missing at delivery submission=%s", submission_id
+                )
+                return
+            pack_id = int(pack["pack_id"])
+            source = await self.db.library_submission_source_item(uid, submission_id)
+            if source is not None:
+                await packs.study_pack_set_source_item(
+                    uid, pack_id, int(source["item_id"])
+                )
+            await self._attach_study_assets(job, pack_id, kinds)
+            await packs.study_pack_finalize(
+                uid,
+                pack_id,
+                status=self._PACK_STATUS.get(status, "partial"),
+                error=error,
+                error_kind=error_kind,
+            )
+        except Exception:
+            logger.warning(
+                "could not finalize study pack submission=%s",
+                job.submission_id,
+                exc_info=True,
+            )
+
+    async def _close_pack_after_job(self, job: Job) -> None:
+        """A pack still ``processing`` when its job ends never completed."""
+        error = ""
+        if job.state in {"failed", "cancelled"}:
+            try:
+                submission = await self.db.submission(int(job.submission_id))
+            except Exception:
+                submission = None
+                logger.warning(
+                    "could not read failed submission=%s", job.submission_id,
+                    exc_info=True,
+                )
+            if submission is not None and submission.error:
+                error = str(submission.error)
+        await self._close_study_pack(
+            job.user_id, job.submission_id, error=error, error_kind="processing"
+        )
+
     async def _queue_admitted_submission(
         self,
         event: Any,
@@ -198,7 +384,15 @@ class JobPipelineMixin:
             progress = await self.deps.create_job_progress(
                 event, submission_id=submission_id
             )
+            # The Study Pack is the source object of this upload: it exists
+            # before processing starts, so a failure can still be recorded
+            # against it, and a retried delivery cannot create a second one.
+            pack_id = await self._open_study_pack(
+                user_id, submission_id, kind=kind, filename=filename
+            )
             meta: dict[str, Any] = {"progress": progress}
+            if pack_id is not None:
+                meta["pack_id"] = pack_id
             if presentation_kind is not None:
                 meta["presentation_kind"] = presentation_kind
             if raw_text is not None:
@@ -220,6 +414,9 @@ class JobPipelineMixin:
             except QueueFullError as exc:
                 await self.db.set_submission_status(
                     submission_id, "rejected", error=str(exc), error_kind="capacity"
+                )
+                await self._close_study_pack(
+                    user_id, submission_id, error=str(exc), error_kind="capacity"
                 )
                 await progress.fail(str(submission_id))
                 await event.reply(f"⏸ {exc}")
@@ -667,7 +864,12 @@ class JobPipelineMixin:
                 except OSError:
                     logger.warning("could not remove job work directory")
                 finally:
-                    log_job_id.reset(log_token)
+                    # A pack still ``processing`` here means the job did not
+                    # reach its delivery, so it must never look ready.
+                    try:
+                        await self._close_pack_after_job(job)
+                    finally:
+                        log_job_id.reset(log_token)
 
     async def _release(self, job: Job, reason: str) -> bool:
         return await self.db.release_hold(job.submission_id, reason)
@@ -1753,6 +1955,16 @@ class JobPipelineMixin:
                 "could not persist final submission outcome submission=%s",
                 job.submission_id,
             )
+        # The pack owns exactly what this submission produced. Attaching the
+        # assets here (after every artifact already exists) is idempotent, so a
+        # re-delivered submission updates the same pack instead of duplicating.
+        await self._finalize_study_pack(
+            job,
+            kinds=kinds,
+            status=status,
+            error=status_error or "",
+            error_kind=status_kind,
+        )
         job.meta["outcome"] = status
         if progress is not None:
             if notified and not render_incomplete:

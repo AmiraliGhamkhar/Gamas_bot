@@ -75,6 +75,14 @@ APPLICATION_TABLES: frozenset[str] = frozenset(
         "library_file_blobs",
         # Cumulative runtime/provider counters that survive restarts (036)
         "runtime_metric_totals",
+        # Public Explore bank, engagement impressions and preferences (038).
+        # Declared here or the fresh-database schema check fails, because the
+        # migration creates them but this set is the expected table inventory.
+        "explore_questions",
+        "explore_impressions",
+        "user_topic_preferences",
+        # Reward redemptions: one row per successful point→credit conversion (041).
+        "reward_redemptions",
     }
 )
 
