@@ -671,22 +671,13 @@ class Settings:
     #: Bot API base URL (overridable for a mirror or an offline test).
     telegram_api_base_url: str = "https://api.telegram.org"
 
-    # --- Learning loop (quiz / flashcards) -----------------------------------
+    # --- Learning loop (quiz) ----------------------------------------------
     #: Credit (seconds) charged per generated quiz question, before generation.
     quiz_cost_seconds_per_question: int = 60
     #: An active quiz untouched for longer is lazily expired on the next start.
     quiz_max_active_hours: int = 6
     #: Per-user cap on quiz sessions created in any rolling hour.
     quiz_max_sessions_per_hour: int = 3
-    #: Credit (seconds) charged for one AI flashcard deck, before generation.
-    flashcard_ai_cost_seconds: int = 300
-    #: Number of Q/A pairs requested for an AI deck (minimum 5: the validation
-    #: gate refunds a generation that cannot produce at least five cards).
-    flashcard_ai_deck_size: int = 10
-    #: Per-user cap on stored flashcard decks (AI and manual counted together).
-    flashcard_max_decks_per_user: int = 30
-    #: Upper bound on cards added to a manual deck.
-    flashcard_max_cards_per_deck: int = 200
     #: Parallel per-chunk model calls used by one generation (3–5 is the useful
     #: range; higher starts tripping provider per-minute limits).
     learning_chunk_concurrency: int = 1
@@ -1603,18 +1594,6 @@ def from_env(env_file: str | None = None) -> Settings:
         ),
         quiz_max_sessions_per_hour=_env_int(
             "QUIZ_MAX_SESSIONS_PER_HOUR", 3, minimum=1, maximum=100
-        ),
-        flashcard_ai_cost_seconds=_env_int(
-            "FLASHCARD_AI_COST_SECONDS", 300, minimum=1, maximum=86_400
-        ),
-        flashcard_ai_deck_size=_env_int(
-            "FLASHCARD_AI_DECK_SIZE", 10, minimum=5, maximum=50
-        ),
-        flashcard_max_decks_per_user=_env_int(
-            "FLASHCARD_MAX_DECKS_PER_USER", 30, minimum=1, maximum=500
-        ),
-        flashcard_max_cards_per_deck=_env_int(
-            "FLASHCARD_MAX_CARDS_PER_DECK", 200, minimum=1, maximum=5000
         ),
         learning_chunk_concurrency=_env_int(
             "LEARNING_CHUNK_CONCURRENCY", 1, minimum=1, maximum=8

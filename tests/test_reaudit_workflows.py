@@ -13,7 +13,7 @@ from unittest import mock
 from gamas_bot.bot import GamasBot
 from gamas_bot.db import Database
 from tests.support import FakeCallbackEvent, FakeTelegramClient, make_settings
-from tests.test_free_uses import cards_payload, quiz_payload
+from tests.test_free_uses import quiz_payload
 
 OWNER = 9101
 OTHER = 9102
@@ -73,13 +73,13 @@ class LearningChargeRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_artifact_and_paid_finalization_commit_or_rollback_together(self):
         await self.db.spend_seconds(OWNER, 300, "fc-pending:1", operation_id="deck")
         with self.assertRaises(ValueError):
-            await self.db.deck_create_with_cards(
+            await self.db.quiz_create_session(
                 OWNER, self.item_id, "بدون پاسخ", [{"front": "پرسش"}], paid_charge_id="deck"
             )
         self.assertEqual(await self.db.deck_count(OWNER), 0)
         self.assertEqual(await self.db.recover_pending_learning_charges(), 1)
         with self.assertRaises(ValueError):
-            await self.db.deck_create_with_cards(
+            await self.db.quiz_create_session(
                 OWNER, self.item_id, "بازپرداخت‌شده", [{"front": "پ", "back": "ج"}],
                 paid_charge_id="deck",
             )
@@ -87,7 +87,7 @@ class LearningChargeRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.available_seconds(OWNER), 2_000)
 
     async def test_prorata_refund_failure_rolls_back_artifact_and_credit(self):
-        for kind in ("deck", "quiz"):
+        for kind in ("quiz",):
             with self.subTest(kind=kind):
                 prior_refunds = (await self.db.db.execute_fetchall(
                     "SELECT COUNT(*) FROM ledger WHERE note LIKE 'refund:%'"
@@ -104,7 +104,7 @@ class LearningChargeRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 with mock.patch.object(self.db, "_refund_debit_locked", side_effect=fail_after_credit):
                     with self.assertRaises(sqlite3.OperationalError):
                         if kind == "deck":
-                            await self.db.deck_create_with_cards(
+                            await self.db.quiz_create_session(
                                 OWNER, self.item_id, "deck", [{"front": "q", "back": "a"}],
                                 paid_charge_id=kind, refund_seconds_value=100,
                             )
@@ -156,7 +156,7 @@ class CurationFixture(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         self.settings = make_settings(
-            db_path=root / "bot.sqlite3", temp_dir=root / "tmp", flashcard_ai_deck_size=6,
+            db_path=root / "bot.sqlite3", temp_dir=root / "tmp",
             # Generation flows run against a scripted complete_json behind a
             # fake avalai route (see other workflow fixtures).
             avalai_api_key="avalai-test-key",
@@ -217,7 +217,7 @@ class PaidCurationTests(CurationFixture):
         self.assertFalse(any("هدیه" in f for f in frames), frames)
 
     async def test_saved_paid_deck_and_quiz_are_not_refunded_on_restart(self):
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(6))):
             await self.bot._handle_callback(self.press(f"fc:go:{self.item}".encode()))
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(5))):
             await self.bot._handle_callback(self.press(f"quiz:go:{self.item}:5".encode()))
@@ -230,7 +230,7 @@ class PaidCurationTests(CurationFixture):
 
     async def test_cancel_during_committed_save_never_refunds_paid_artifact(self):
         committed = asyncio.Event()
-        original = self.db.deck_create_with_cards
+        original = self.db.quiz_create_session
 
         async def save_then_wait(*args, **kwargs):
             result = await original(*args, **kwargs)
@@ -239,8 +239,8 @@ class PaidCurationTests(CurationFixture):
             return result
 
         with (
-            mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))),
-            mock.patch.object(self.db, "deck_create_with_cards", side_effect=save_then_wait),
+            mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(6))),
+            mock.patch.object(self.db, "quiz_create_session", side_effect=save_then_wait),
         ):
             task = asyncio.create_task(self.bot._handle_callback(self.press(f"fc:go:{self.item}".encode())))
             await asyncio.wait_for(committed.wait(), 2)
@@ -268,7 +268,7 @@ class OneShotCallback(FakeCallbackEvent):
 
 class CallbackAnswerTests(CurationFixture):
     async def test_specific_stale_and_invalid_alerts_are_not_eaten_by_early_ack(self):
-        for payload in (b"doc:show:999999", b"lib:it:999999", b"quiz:bad", b"fc:cur:save", b"sup:bad"):
+        for payload in (b"doc:show:999999", b"lib:it:999999", b"quiz:bad", b"sup:bad"):
             with self.subTest(payload=payload):
                 event = OneShotCallback(self.client, data=payload, chat_id=OWNER)
                 await self.bot._handle_callback(event)
@@ -283,7 +283,7 @@ class CallbackAnswerTests(CurationFixture):
         async def provider(*args, **kwargs):
             entered.set()
             await unblock.wait()
-            return cards_payload(6)
+            return quiz_payload(6)
 
         event = OneShotCallback(self.client, data=f"fc:go:{self.item}".encode(), chat_id=OWNER)
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
@@ -587,39 +587,11 @@ class LearningProgressTests(CurationFixture):
             with mock.patch.object(self.bot, "_progress_edit", new=mock.AsyncMock()), \
                  mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
                 items, failed = await self.bot._generate_chunks(
-                    kind="quiz", chunks=chunks, counts=[3] * 8, placeholder=object()
+                    chunks=chunks, counts=[3] * 8, placeholder=object()
                 )
             self.assertEqual(len(items), 24)
             self.assertEqual(failed, 0)
             self.assertEqual(peak, limit)
-
-    async def test_deck_chunk_calls_are_serialized(self):
-        """Decks never run two provider chunk calls at once — the design goal
-        of ``concurrency = 1 for kind == "deck"`` is one request in flight."""
-        from gamas_bot.doc_extract import DocChunk
-
-        chunks = [DocChunk(i, f"صفحه {i}", (f"صفحه {i}",), f"بخش {i}") for i in range(8)]
-        active = peak = 0
-
-        async def provider(*args, **kwargs):
-            nonlocal active, peak
-            active += 1
-            peak = max(peak, active)
-            try:
-                await asyncio.sleep(0.01)
-                chunk = next(item for item in chunks if item.text in kwargs["user"])
-                return {"cards": [{"front": f"پرسش {chunk.index}", "back": "پاسخ", "source": chunk.locator}]}
-            finally:
-                active -= 1
-
-        with mock.patch.object(self.bot, "_progress_edit", new=mock.AsyncMock()), \
-             mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
-            items, failed = await self.bot._generate_chunks(
-                kind="deck", chunks=chunks, counts=[1] * 8, placeholder=object()
-            )
-        self.assertEqual(len(items), 8)
-        self.assertEqual(failed, 0)
-        self.assertEqual(peak, 1)
 
     async def test_stalled_telegram_progress_does_not_hold_model_slots(self):
         from gamas_bot.doc_extract import DocChunk
@@ -646,7 +618,7 @@ class LearningProgressTests(CurationFixture):
              mock.patch.object(self.bot, "_progress_edit", side_effect=progress), \
              mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
             items, failed = await asyncio.wait_for(
-                self.bot._generate_chunks(kind="deck", chunks=chunks, counts=[1] * 8, placeholder=object()),
+                self.bot._generate_chunks(chunks=chunks, counts=[1] * 8, placeholder=object()),
                 timeout=1,
             )
         self.assertTrue(entered.is_set())

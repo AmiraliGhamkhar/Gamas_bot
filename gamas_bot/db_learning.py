@@ -1,4 +1,8 @@
-"""Quiz sessions and flashcard decks repository (SRP)."""
+"""Quiz sessions repository (SRP).
+
+Historical flashcard decks/cards stay in the database untouched; the feature
+was removed from the product and the tables are kept for data preservation.
+"""
 
 from __future__ import annotations
 
@@ -13,12 +17,8 @@ from .db_users import UsersRepositoryMixin
 from .metrics import METRICS
 
 
-class FlashcardLimitError(ValueError):
-    """A deck has reached its configured card ceiling."""
-
-
 class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
-    """Single-responsibility persistence slice for quizzes and flashcard decks."""
+    """Single-responsibility persistence slice for quizzes."""
 
     async def quiz_admission(
         self,
@@ -231,148 +231,3 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
             "WHERE session_id = ? AND status = 'active'",
             (status, iso(self._now()), int(session_id)),
         )
-
-    async def deck_count(self, user_id: int) -> int:
-        rows = await _rows(
-            self.read_db,
-            "SELECT COUNT(*) FROM flashcard_decks WHERE user_id = ?",
-            (int(user_id),),
-        )
-        return int(rows[0][0]) if rows else 0
-
-    async def deck_create(
-        self,
-        user_id: int,
-        item_id: int | None,
-        title: str,
-        source: str,
-    ) -> int:
-        if source not in ("ai", "manual"):
-            raise ValueError(f"invalid deck source {source!r}")
-        async with self._transaction():
-            cursor = await self.db.execute(
-                "INSERT INTO flashcard_decks(user_id, item_id, title, source, "
-                "study_cursor, created_at) VALUES (?, ?, ?, ?, 0, ?)",
-                (int(user_id), item_id, str(title), source, iso(self._now())),
-            )
-            return int(cursor.lastrowid or 0)
-
-    async def deck_create_with_cards(
-        self,
-        user_id: int,
-        item_id: int,
-        title: str,
-        cards: list[dict[str, str]],
-        *,
-        free_claim_id: str | None = None,
-        paid_charge_id: str | None = None,
-        refund_seconds_value: int = 0,
-    ) -> int:
-        if not cards:
-            raise ValueError("a deck needs at least one card")
-        for card in cards:
-            if (not isinstance(card, dict) or not isinstance(card.get("front"), str)
-                    or not isinstance(card.get("back"), str)):
-                METRICS.record_learning_validation_failure()
-                raise ValueError("invalid flashcard shape")
-        now = iso(self._now())
-        async with self._transaction():
-            cursor = await self.db.execute(
-                "INSERT INTO flashcard_decks(user_id, item_id, title, source, "
-                "study_cursor, created_at) VALUES (?, ?, ?, 'ai', 0, ?)",
-                (int(user_id), int(item_id), str(title), now),
-            )
-            deck_id = int(cursor.lastrowid or 0)
-            await self.db.executemany(
-                "INSERT INTO flashcards(deck_id, idx, front, back, source) VALUES (?, ?, ?, ?, ?)",
-                ((deck_id, idx, str(card["front"]), str(card["back"]),
-                  str(card.get("source", ""))[:120]) for idx, card in enumerate(cards)),
-            )
-            await self._finalize_free_use_locked(user_id, "deck", free_claim_id)
-            await self._finalize_learning_charge_locked(user_id, paid_charge_id, refund_seconds_value)
-            return deck_id
-
-    async def manual_deck_get_or_create(self, user_id: int) -> int:
-        rows = await _rows(
-            self.read_db,
-            "SELECT deck_id FROM flashcard_decks WHERE user_id = ? "
-            "AND source = 'manual' ORDER BY deck_id LIMIT 1",
-            (int(user_id),),
-        )
-        if rows:
-            return int(rows[0][0])
-        return await self.deck_create(
-            user_id, None, "فلش‌کارت‌های دستی من", "manual"
-        )
-
-    async def deck_add_card(self, deck_id: int, front: str, back: str, *, max_cards: int = 200) -> int:
-        async with self._transaction():
-            count_rows = await _rows(
-                self.db,
-                "SELECT COUNT(*) FROM flashcards WHERE deck_id = ?",
-                (int(deck_id),),
-            )
-            idx = int(count_rows[0][0]) if count_rows else 0
-            if idx >= max(1, int(max_cards)):
-                METRICS.record_learning_validation_failure()
-                raise FlashcardLimitError("deck card limit reached")
-            await self.db.executemany(
-                "INSERT INTO flashcards(deck_id, idx, front, back) "
-                "VALUES (?, ?, ?, ?)",
-                [(int(deck_id), idx, str(front), str(back))],
-            )
-            return idx + 1
-
-    async def deck_get(self, deck_id: int, user_id: int) -> dict[str, Any] | None:
-        rows = await _rows(
-            self.read_db,
-            "SELECT deck_id, user_id, item_id, title, source, study_cursor, "
-            "created_at FROM flashcard_decks WHERE deck_id = ? AND user_id = ?",
-            (int(deck_id), int(user_id)),
-        )
-        return dict(rows[0]) if rows else None
-
-    async def deck_cards(self, deck_id: int) -> list[dict[str, Any]]:
-        rows = await _rows(
-            self.read_db,
-            "SELECT card_id, deck_id, idx, front, back, source FROM flashcards "
-            "WHERE deck_id = ? ORDER BY idx",
-            (int(deck_id),),
-        )
-        return [dict(row) for row in rows]
-
-    async def deck_card(self, deck_id: int, card_id: int) -> dict[str, Any] | None:
-        rows = await _rows(
-            self.read_db,
-            "SELECT card_id, idx, front, back, source FROM flashcards "
-            "WHERE deck_id = ? AND card_id = ?",
-            (int(deck_id), int(card_id)),
-        )
-        return dict(rows[0]) if rows else None
-
-    async def deck_set_cursor(self, deck_id: int, cursor: int) -> None:
-        await self._write(
-            "UPDATE flashcard_decks SET study_cursor = ? WHERE deck_id = ?",
-            (max(0, int(cursor)), int(deck_id)),
-        )
-
-    async def deck_delete(self, deck_id: int, user_id: int) -> bool:
-        async with self._transaction():
-            cursor = await self.db.execute(
-                "DELETE FROM flashcard_decks WHERE deck_id = ? AND user_id = ?",
-                (int(deck_id), int(user_id)),
-            )
-            return cursor.rowcount == 1
-
-    async def decks_list(
-        self, user_id: int, *, limit: int = 6, offset: int = 0
-    ) -> list[dict[str, Any]]:
-        rows = await _rows(
-            self.read_db,
-            "SELECT d.deck_id, d.item_id, d.title, d.source, d.study_cursor, "
-            "d.created_at, (SELECT COUNT(*) FROM flashcards c WHERE c.deck_id = d.deck_id) "
-            "AS card_count FROM flashcard_decks d WHERE d.user_id = ? "
-            "ORDER BY d.deck_id DESC LIMIT ? OFFSET ?",
-            (int(user_id), max(1, int(limit)), max(0, int(offset))),
-        )
-        return [dict(row) for row in rows]

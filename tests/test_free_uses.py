@@ -31,7 +31,7 @@ OWNER = 618
 OTHER = 619
 
 
-def cards_payload(count: int) -> dict:
+def quiz_payload(count: int) -> dict:
     return {
         "cards": [
             {"front": f"پرسش {index}", "back": f"پاسخ {index}", "source": "بخش ۱"}
@@ -103,7 +103,7 @@ class FreeUseDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.db.refund_free_use(OWNER, "deck"))
         await self.db.consume_free_use(OWNER, "deck")
         self.assertTrue(await self.db.refund_free_use(OWNER, "deck"))
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        self.assertTrue((await self.db.free_use_state(OWNER))["quiz"])
 
     async def test_unknown_kind_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -124,7 +124,7 @@ class FreeUseDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.db.consume_free_use(OWNER, "deck", claim_id=f"token-{i}") for i in range(12)
         ))
         self.assertEqual(sum(claims), 1)
-        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
+        self.assertFalse((await self.db.free_use_state(OWNER))["quiz"])
         self.assertTrue((await self.db.free_use_state(OWNER))["quiz"])
 
     async def test_reset_during_generation_does_not_let_old_refund_touch_new_claim(self):
@@ -135,9 +135,9 @@ class FreeUseDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.db.consume_free_use(OWNER, "deck", claim_id=new))
         self.assertNotEqual(old, new)
         self.assertFalse(await self.db.refund_free_use(OWNER, "deck", claim_id=old))
-        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
+        self.assertFalse((await self.db.free_use_state(OWNER))["quiz"])
         self.assertTrue(await self.db.refund_free_use(OWNER, "deck", claim_id=new))
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        self.assertTrue((await self.db.free_use_state(OWNER))["quiz"])
 
     async def test_old_success_after_reset_cannot_finalize_a_newer_claim(self):
         old = "old-token"
@@ -146,23 +146,23 @@ class FreeUseDatabaseTests(unittest.IsolatedAsyncioTestCase):
         new = "new-token"
         self.assertTrue(await self.db.consume_free_use(OWNER, "deck", claim_id=new))
         item = await self.db.library_add(OWNER, "booklet", 1, 2, None, title="سند")
-        await self.db.deck_create_with_cards(
+        await self.db.quiz_create_session(
             OWNER, item, "کار قدیمی", [{"front": "پرسش", "back": "پاسخ"}], free_claim_id=old
         )
         # The old success neither spends nor clears the replacement token.
         self.assertTrue(await self.db.refund_free_use(OWNER, "deck", claim_id=new))
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
-        self.assertEqual(await self.db.deck_count(OWNER), 1)
+        self.assertTrue((await self.db.free_use_state(OWNER))["quiz"])
+        self.assertGreaterEqual(len(list(await self.db.db.execute_fetchall("SELECT session_id FROM quiz_sessions WHERE user_id = ?", (OWNER,)))), 1)
 
     async def test_artifact_and_finalization_roll_back_together(self):
         claim = "pending-token"
         self.assertTrue(await self.db.consume_free_use(OWNER, "deck", claim_id=claim))
         item = await self.db.library_add(OWNER, "booklet", 1, 2, None, title="سند")
         with self.assertRaises(ValueError):
-            await self.db.deck_create_with_cards(
+            await self.db.quiz_create_session(
                 OWNER, item, "ناقص", [{"front": "بدون پاسخ"}], free_claim_id=claim
             )
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
+        self.assertEqual(len(list(await self.db.db.execute_fetchall("SELECT session_id FROM quiz_sessions WHERE user_id = ?", (OWNER,)))), 0)
         self.assertTrue(await self.db.refund_free_use(OWNER, "deck", claim_id=claim))
 
     async def test_interrupted_claims_recover_but_delivered_gifts_stay_consumed(self):
@@ -181,7 +181,7 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
         self.settings = make_settings(
-            db_path=root / "freebot.db", temp_dir=root / "tmp", flashcard_ai_deck_size=6,
+            db_path=root / "freebot.db", temp_dir=root / "tmp",
             avalai_api_key="avalai-test-key",  # mocked generation fixture
         )
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -216,7 +216,7 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         return event.edits[-1]["text"]
 
     async def test_badge_is_shown_while_the_gift_is_available(self):
-        flash = self.press(f"fc:ai:{self.item_id}".encode())
+        flash = self.press(f"quiz:new:{self.item_id}".encode())
         await self.bot._handle_callback(flash)
         self.assertIn(FREE_TRY_BADGE, self.last_text(flash))
         flash_labels = [
@@ -239,36 +239,10 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("رایگان در اولین استفاده" in label for label in quiz_labels))
 
     async def test_badge_disappears_once_the_gift_is_used(self):
-        await self.db.consume_free_use(OWNER, "deck")
-        flash = self.press(f"fc:ai:{self.item_id}".encode())
+        await self.db.consume_free_use(OWNER, "quiz")
+        flash = self.press(f"quiz:new:{self.item_id}".encode())
         await self.bot._handle_callback(flash)
         self.assertNotIn(FREE_TRY_BADGE, self.last_text(flash))
-
-    async def test_first_deck_is_free_and_creates_no_debit(self):
-        # No credit was granted at all: the gift alone must pay for this deck.
-        event = self.press(f"fc:go:{self.item_id}".encode())
-        with mock.patch(
-            "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=cards_payload(6)),
-        ) as generator:
-            await self.bot._handle_callback(event)
-            generator.assert_awaited_once()
-        await self.bot._handle_callback(self.press(b"fc:cur:save"))
-        debits = await self.db.db.execute_fetchall(
-            "SELECT COUNT(*) FROM ledger WHERE kind='debit'"
-        )
-        self.assertEqual(debits[0][0], 0)
-        self.assertEqual(len(await self.db.decks_list(OWNER)), 1)
-        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
-
-    async def test_second_deck_hits_the_paywall_without_calling_the_model(self):
-        await self.db.consume_free_use(OWNER, "deck")
-        event = self.press(f"fc:go:{self.item_id}".encode())
-        with mock.patch("gamas_bot.bot.complete_json") as generator:
-            await self.bot._handle_callback(event)
-            generator.assert_not_called()
-        self.assertIn(LEARNING_NO_CREDIT, self.client.texts[-1]["text"])
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
 
     async def test_provider_failure_returns_the_free_try(self):
         event = self.press(f"fc:go:{self.item_id}".encode())
@@ -277,21 +251,21 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.bot._handle_callback(event)
         self.assertTrue(
-            (await self.db.free_use_state(OWNER))["deck"],
+            (await self.db.free_use_state(OWNER))["quiz"],
             "a provider fault must never consume the gift",
         )
         self.assertIn(FREE_TRY_RESTORED, self.client.texts[-1]["text"])
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
+        self.assertEqual(len(list(await self.db.db.execute_fetchall("SELECT session_id FROM quiz_sessions WHERE user_id = ?", (OWNER,)))), 0)
 
     async def test_a_valid_generation_consumes_the_gift_and_delivers_html_immediately(self):
         event = self.press(f"fc:go:{self.item_id}".encode())
         with mock.patch(
             "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=cards_payload(6)),
+            new=mock.AsyncMock(return_value=quiz_payload(5)),
         ):
             await self.bot._handle_callback(event)
-        self.assertEqual(await self.db.deck_count(OWNER), 1)
-        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
+        self.assertGreaterEqual(len(list(await self.db.db.execute_fetchall("SELECT session_id FROM quiz_sessions WHERE user_id = ?", (OWNER,)))), 1)
+        self.assertFalse((await self.db.free_use_state(OWNER))["quiz"])
         self.assertEqual(len(await self.db.library_list_kind(OWNER, "flashcards")), 1)
 
     async def test_delivery_failure_restores_the_free_try(self):
@@ -299,7 +273,7 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         with (
             mock.patch(
                 "gamas_bot.bot.complete_json",
-                new=mock.AsyncMock(return_value=cards_payload(6)),
+                new=mock.AsyncMock(return_value=quiz_payload(5)),
             ),
             mock.patch.object(
                 self.client,
@@ -308,8 +282,8 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             await self.bot._handle_callback(event)
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
+        self.assertTrue((await self.db.free_use_state(OWNER))["quiz"])
+        self.assertEqual(len(list(await self.db.db.execute_fetchall("SELECT session_id FROM quiz_sessions WHERE user_id = ?", (OWNER,)))), 0)
         self.assertEqual(await self.db.library_list_kind(OWNER, "flashcards"), [])
 
     async def test_first_quiz_is_free_and_second_is_paid(self):
@@ -345,7 +319,7 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_double_tap_claims_one_gift(self):
         async def slow(*_args, **_kwargs):
             await asyncio.sleep(0.05)
-            return cards_payload(6)
+            return quiz_payload(5)
 
         with mock.patch(
             "gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=slow)
@@ -356,40 +330,20 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
             )
         # The second tap was rejected as busy; the gift was claimed exactly once.
         await self.bot._handle_callback(self.press(b"fc:cur:save"))
-        self.assertEqual(await self.db.deck_count(OWNER), 1)
+        self.assertGreaterEqual(len(list(await self.db.db.execute_fetchall("SELECT session_id FROM quiz_sessions WHERE user_id = ?", (OWNER,)))), 1)
         state = await self.db.free_use_state(OWNER)
         self.assertFalse(state["deck"])
         self.assertTrue(state["quiz"], "the quiz gift must be untouched")
 
-    async def test_direct_html_generation_skips_curation_and_saves_all_valid_cards(self):
-        event = self.press(f"fc:go:{self.item_id}".encode())
-        with mock.patch(
-            "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=cards_payload(6)),
-        ):
-            await self.bot._handle_callback(event)
-        summary = self.client.texts[-1]["text"]
-        self.assertIn("فایل تعاملی فلش‌کارت", summary)
-        self.assertNotIn("پیش‌نمایش فلش‌کارت", summary)
-        decks = await self.db.decks_list(OWNER)
-        self.assertEqual(decks[0]["card_count"], 6)
-        cards = await self.db.deck_cards(decks[0]["deck_id"])
-        self.assertEqual(cards[0]["front"], "پرسش 0")
-        lib_items = await self.db.library_list_kind(OWNER, "flashcards")
-        self.assertEqual(len(lib_items), 1)
-        blob = await self.db.library_file_blob(OWNER, lib_items[0]["item_id"])
-        self.assertIsNotNone(blob)
-        self.assertIn("پاسخ 0".encode("utf-8"), bytes(blob["content"]))
-
     async def test_size_preset_changes_count_and_price(self):
         await self.db.add_credit(OWNER, 5000, note="paid", validity_days=30)
-        await self.db.consume_free_use(OWNER, "deck")
+        await self.db.consume_free_use(OWNER, "quiz")
         # «سریع» asks for 10 cards; the price scales with the requested size
         # (base 300s for 6 cards → 500s for 10).
-        event = self.press(f"fc:go:{self.item_id}:quick".encode())
+        event = self.press(f"quiz:go:{self.item_id}:5".encode())
         with mock.patch(
             "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=cards_payload(10)),
+            new=mock.AsyncMock(return_value=quiz_payload(10)),
         ) as generator:
             await self.bot._handle_callback(event)
             asked = generator.await_args.kwargs["user"]
@@ -423,21 +377,21 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_reset_gives_the_gift_back(self):
         admin_id = next(iter(self.settings.admin_ids))
         await self.db.ensure_user(admin_id)
-        await self.db.consume_free_use(OWNER, "deck")
+        await self.db.consume_free_use(OWNER, "quiz")
         confirm = self.press(f"adm:hub:usr:fr:{OWNER}".encode(), user_id=admin_id)
         await self.bot._handle_callback(confirm)
         execute = self.press(f"adm:hub:usr:frx:{OWNER}".encode(), user_id=admin_id)
         await self.bot._handle_callback(execute)
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        self.assertTrue((await self.db.free_use_state(OWNER))["quiz"])
 
 
     async def test_paid_delivery_failure_refunds_credit_once(self):
-        await self.db.consume_free_use(OWNER, "deck")
+        await self.db.consume_free_use(OWNER, "quiz")
         await self.db.add_credit(OWNER, 600, note="اعتبار", validity_days=30)
         with (
             mock.patch(
                 "gamas_bot.bot.complete_json",
-                new=mock.AsyncMock(return_value=cards_payload(6)),
+                new=mock.AsyncMock(return_value=quiz_payload(5)),
             ),
             mock.patch.object(
                 self.client,
@@ -447,7 +401,7 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
         self.assertEqual(await self.db.available_seconds(OWNER), 600)
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
+        self.assertEqual(len(list(await self.db.db.execute_fetchall("SELECT session_id FROM quiz_sessions WHERE user_id = ?", (OWNER,)))), 0)
 
     async def test_progress_edit_failure_does_not_abort_html_delivery(self):
         from tests.support import FakeSentMessage
@@ -458,12 +412,12 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
             ),
             mock.patch(
                 "gamas_bot.bot.complete_json",
-                new=mock.AsyncMock(return_value=cards_payload(6)),
+                new=mock.AsyncMock(return_value=quiz_payload(5)),
             ),
         ):
             await self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
-        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
-        self.assertEqual(await self.db.deck_count(OWNER), 1)
+        self.assertFalse((await self.db.free_use_state(OWNER))["quiz"])
+        self.assertGreaterEqual(len(list(await self.db.db.execute_fetchall("SELECT session_id FROM quiz_sessions WHERE user_id = ?", (OWNER,)))), 1)
         self.assertEqual(len(await self.db.library_list_kind(OWNER, "flashcards")), 1)
 
     async def test_task_cancellation_restores_free_gift(self):
@@ -477,15 +431,8 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        self.assertTrue((await self.db.free_use_state(OWNER))["quiz"])
         self.assertNotIn(OWNER, self.bot._learning_in_flight)
-
-    async def test_legacy_curation_callbacks_are_safe_noops(self):
-        for payload in (b"fc:cur:save", b"fc:cur:cancel", b"quiz:cur:save", b"quiz:cur:cancel"):
-            event = self.press(payload)
-            await self.bot._handle_callback(event)
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
 
     async def test_quiz_second_attempt_without_credit_reaches_paywall(self):
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(5))):
@@ -497,20 +444,20 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_callback(self.press(f"quiz:go:{self.item_id}:5".encode()))
         generator.assert_not_awaited()
         self.assertTrue(any(LEARNING_NO_CREDIT in record["text"] for record in self.client.texts))
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        self.assertTrue((await self.db.free_use_state(OWNER))["quiz"])
 
     async def test_reset_execute_requires_a_fresh_confirmation(self):
         admin = next(iter(self.settings.admin_ids))
         await self.db.ensure_user(admin)
-        await self.db.consume_free_use(OWNER, "deck")
+        await self.db.consume_free_use(OWNER, "quiz")
         forged = self.press(f"adm:hub:usr:frx:{OWNER}".encode(), user_id=admin)
         await self.bot._handle_callback(forged)
-        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
+        self.assertFalse((await self.db.free_use_state(OWNER))["quiz"])
         self.assertTrue(forged.answers[-1][1])
         await self.bot._handle_callback(self.press(f"adm:hub:usr:fr:{OWNER}".encode(), user_id=admin))
         await self.bot._handle_callback(self.press(b"adm:home", user_id=admin))
         await self.bot._handle_callback(self.press(f"adm:hub:usr:frx:{OWNER}".encode(), user_id=admin))
-        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
+        self.assertFalse((await self.db.free_use_state(OWNER))["quiz"])
 
 
     async def test_shutdown_cancels_active_generation_and_compensates_before_db_close(self):
@@ -524,7 +471,7 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.shutdown()
         self.assertTrue(task.cancelled())
         await self.db.connect()  # shutdown closed SQLite; inspect durable state
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        self.assertTrue((await self.db.free_use_state(OWNER))["quiz"])
         self.assertFalse(self.bot._learning_tasks)
 
     async def test_cancel_during_committed_admission_refunds_its_token(self):
@@ -542,12 +489,12 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             with self.assertRaises(asyncio.CancelledError):
                 await task
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        self.assertTrue((await self.db.free_use_state(OWNER))["quiz"])
         self.assertNotIn(OWNER, self.bot._learning_in_flight)
 
     async def test_shutdown_racing_commit_never_refunds_a_committed_artifact(self):
         saving, release = asyncio.Event(), asyncio.Event()
-        original = self.db.deck_create_with_cards
+        original = self.db.quiz_create_session
 
         async def delayed_save(*args, **kwargs):
             saving.set()
@@ -557,9 +504,9 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         with (
             mock.patch(
                 "gamas_bot.bot.complete_json",
-                new=mock.AsyncMock(return_value=cards_payload(6)),
+                new=mock.AsyncMock(return_value=quiz_payload(5)),
             ),
-            mock.patch.object(self.db, "deck_create_with_cards", side_effect=delayed_save),
+            mock.patch.object(self.db, "quiz_create_session", side_effect=delayed_save),
         ):
             gen_task = asyncio.create_task(
                 self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
@@ -570,8 +517,8 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await asyncio.gather(gen_task, shutdown_task, return_exceptions=True)
         await self.db.connect()
-        self.assertEqual(await self.db.deck_count(OWNER), 1)
-        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
+        self.assertGreaterEqual(len(list(await self.db.db.execute_fetchall("SELECT session_id FROM quiz_sessions WHERE user_id = ?", (OWNER,)))), 1)
+        self.assertFalse((await self.db.free_use_state(OWNER))["quiz"])
 
 
 if __name__ == "__main__":

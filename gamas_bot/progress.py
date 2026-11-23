@@ -48,8 +48,7 @@ STAGE_EMOJI: tuple[tuple[int, str], ...] = (
 BAR_WIDTH = 12
 PERSIAN_DIGIT_TABLE = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 
-#: First line of the bar.  File jobs and short user actions (quiz, flashcards,
-#: document extraction, Free Office) are different products, so each one gets
+#: First line of the bar.  File jobs and short user actions (quiz, document extraction, Free Office) are different products, so each one gets
 #: its own headline instead of telling a user that a «فایل» is being processed
 #: while a quiz is being generated.
 DEFAULT_PROGRESS_HEADLINE = texts.PROGRESS_DEFAULT_HEADLINE
@@ -124,7 +123,7 @@ def completed_progress_text(
     """The finished frame: a full bar plus the outcome line.
 
     Shared by the file pipeline and the short actions that show the same bar
-    (quiz/flashcard generation, document extraction, Free Office builds), so a
+    (quiz generation, document extraction, Free Office builds), so a
     screen can keep its own buttons instead of being overwritten by a bar.
     """
     text = f"{headline}\n\n{progress_bar(100)}  ۱۰۰٪  ✅"
@@ -368,7 +367,7 @@ class JobProgress:
 class WorkProgress:
     """A single-message progress bar for one short, user-initiated action.
 
-    Quiz/flashcard generation, document extraction and Free Office builds are
+    Quiz generation, document extraction and Free Office builds are
     seconds-to-minutes operations on **one** screen. They deserve the same bar
     the file pipeline shows, but not its animation ticker: the operation
     publishes a frame per step, and only one edit can be in flight, so the

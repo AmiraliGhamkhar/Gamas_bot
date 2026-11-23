@@ -427,8 +427,9 @@ class LibraryRepositoryMixin(DatabaseCore):
         mapping: dict[str, tuple[str, ...]] = {
             "booklet": ("booklet",),
             "quiz": ("quiz",),
-            "flashcards": ("flashcards",),
-            "other": ("office", "transcript"),
+            # Historical flashcard files (feature removed) remain reachable as
+            # generic delivered files; the data is never deleted.
+            "other": ("office", "transcript", "flashcards"),
         }
         kinds = mapping.get(category)
         if kinds is None:
@@ -446,14 +447,18 @@ class LibraryRepositoryMixin(DatabaseCore):
         by_kind = {str(row[0]): int(row[1]) for row in rows}
         booklet = by_kind.get("booklet", 0)
         quiz = by_kind.get("quiz", 0)
-        flashcards = by_kind.get("flashcards", 0)
-        other = by_kind.get("office", 0) + by_kind.get("transcript", 0)
+        # Historical flashcard deliveries count towards "other" so they stay
+        # visible and downloadable without a Flashcards category.
+        other = (
+            by_kind.get("office", 0)
+            + by_kind.get("transcript", 0)
+            + by_kind.get("flashcards", 0)
+        )
         return {
             "booklet": booklet,
             "quiz": quiz,
-            "flashcards": flashcards,
             "other": other,
-            "total": booklet + quiz + flashcards + other,
+            "total": booklet + quiz + other,
         }
 
     async def library_list_category(
@@ -485,7 +490,7 @@ class LibraryRepositoryMixin(DatabaseCore):
     async def library_source_booklets(
         self, user_id: int, *, limit: int = 6, offset: int = 0
     ) -> list[dict[str, Any]]:
-        """Delivered booklets that carry cached text for quiz/flashcard generation."""
+        """Delivered booklets that carry cached text for quiz generation."""
         rows = await _rows(
             self.read_db,
             "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "

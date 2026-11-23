@@ -30,16 +30,11 @@ SUPPORT_CATEGORY_BUTTONS: dict[str, str] = {
 
 LEARNING_LEGACY_NOTICE = (
     "متن این جزوهٔ قدیمی ذخیره نشده است.\n"
-    "🧪 آزمون و 🃏 فلش‌کارت فقط برای جزوه‌های تازه کار می‌کند."
+    "🧪 آزمون فقط برای جزوه‌های تازه کار می‌کند."
 )
 QUIZ_START_GUIDANCE = (
     "سؤال‌های متوسط تا سخت با پاسخ تشریحی در قالب فایل تعاملی HTML آفلاین.\n"
     "تعداد سؤال را انتخاب کنید تا فایل مستقیم برایتان ارسال شود."
-)
-FLASHCARD_EMPTY = (
-    "🃏 فلش‌کارت‌ها\n\n"
-    "هنوز مجموعه‌ای نساخته‌اید.\n"
-    "از یک جزوه بسازید یا کارت‌های دستی خودتان را اضافه کنید."
 )
 LEARNING_NO_CREDIT = (
     "💳 اعتبار شما کافی نیست.\n"
@@ -51,10 +46,8 @@ LEARNING_CREDIT_RESTORED = "💳 اعتبار شما کامل برگشت داد�
 DOC_EXTRACTION_STOPPED = "📄 استخراج متن سند متوقف شد."
 OFFICE_UPLOAD_STOPPED = "🗂 آفیس رایگان متوقف شد."
 LEARNING_DELIVERY_CTA = (
-    "\n🧪 از همین جزوه آزمون بده یا 🃏 فلش‌کارت بساز: «📚 کتابخانه من»"
+    "\n🧪 از همین جزوه آزمون بده: «📚 کتابخانه من»"
 )
-FLASHCARD_ASK_FRONT = "پرسش کارت را بفرستید:"
-FLASHCARD_ASK_BACK = "پاسخ کارت را بفرستید:"
 LEARNING_STALE_ALERT = "این آزمون دیگر معتبر نیست."
 LEARNING_BUSY_ALERT = "درخواست قبلی شما در حال پردازش است؛ کمی صبر کنید."
 QUIZ_COUNTS = (5, 10, 15, 20)
@@ -73,7 +66,6 @@ DOC_UNSUPPORTED_HINT = (
     "⚠️ فقط PDF، Word (docx) یا PowerPoint (pptx) به‌عنوان سند پذیرفته می‌شود."
 )
 DOC_PHOTO_HINT = texts.DOCUMENT_PHOTO_UNSUPPORTED
-DOC_GENERATE_CARDS = "🃏 ساخت فلش‌کارت"
 DOC_GENERATE_QUESTIONS = "❓ ساخت سؤالات"
 
 SUPPORT_STATUS_LABELS: dict[str, str] = {

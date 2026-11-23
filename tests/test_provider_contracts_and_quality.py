@@ -17,9 +17,7 @@ from gamas_bot.config import NoteRoute, note_routes
 from gamas_bot.db import Database
 from gamas_bot.doc_extract import DocChunk
 from gamas_bot.learning import (
-    FLASHCARD_SCHEMA,
     QUIZ_SCHEMA,
-    parse_flashcard_payload,
     parse_quiz_payload,
 )
 from gamas_bot.llm import extract_json_object
@@ -177,7 +175,7 @@ class ApprovedRoutingEntryPointTests(unittest.IsolatedAsyncioTestCase):
         families = (
             (("BOOKLET_GENERATION", "BOOKLET_REPAIR", "BOOKLET_VERIFY", "BOOKLET_COMPILE", "BOOKLET_REVIEW_PLAN", "QUIZ_20", "QUIZ_DIFFICULT"),
              ("avalai", "gemini", "openrouter"), "gemini"),
-            (("KEY_POINTS", "COMPACT_NOTES", "QUIZ_GENERATION", "FLASHCARD_GENERATION", "OFFICE_TABLE_GENERATION",
+            (("KEY_POINTS", "COMPACT_NOTES", "QUIZ_GENERATION", "OFFICE_TABLE_GENERATION",
               "OFFICE_SLIDE_PLANNING", "OFFICE_DOCUMENT_GENERATION"),
              ("gemini", "avalai", "openrouter"), "avalai"),
         )
@@ -317,7 +315,7 @@ class ProviderDialectContractTests(unittest.TestCase):
         self.assertNotIn("additionalProperties", converted)
 
     def test_shared_schema_transform_keeps_required_tags_and_does_not_mutate_input(self) -> None:
-        for schema in (QUIZ_SCHEMA, FLASHCARD_SCHEMA):
+        for schema in (QUIZ_SCHEMA,):
             original = copy.deepcopy(schema)
             transformed = to_strict_openai_json_schema(schema)["schema"]
             key = "questions" if schema is QUIZ_SCHEMA else "cards"
@@ -721,76 +719,6 @@ class LearningRobustnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(q["difficulty"], "hard")
         self.assertEqual(q["source"], "صفحهٔ ۴")
 
-    def test_parse_flashcard_payload_keeps_comparative_aya_ya_and_drops_yes_no(self) -> None:
-        payload = {
-            "flashcards": [
-                {
-                    "پرسش": "آیا آنتروپی در فرآیند برگشت‌ناپذیر افزایشی است یا کاهشی؟",
-                    "پاسخ": "افزایشی است.",
-                    "منبع": "بخش ۲",
-                },
-                {
-                    "پرسش": "آیا آنتروپی کمیت حالت است؟",
-                    "پاسخ": "بله",
-                    "منبع": "بخش ۲",
-                },
-            ]
-        }
-        cards = parse_flashcard_payload(payload, 5, require_source=True)
-        self.assertEqual(len(cards), 1)
-        self.assertIn("افزایشی", cards[0]["back"])
-
-    async def test_single_chunk_40_card_preset_batches_requests_and_passes_prior_stems(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            settings = make_settings(
-                db_path=root / "learn.db",
-                temp_dir=root / "tmp",
-                note_context_tokens=16_384,
-                note_max_output_tokens=4_096,
-            )
-            settings.temp_dir.mkdir(parents=True, exist_ok=True)
-            db = Database(settings.db_path)
-            await db.connect()
-            client = FakeTelegramClient()
-            bot = GamasBot(settings, db=db, client=client)
-            try:
-                self.assertLess(bot._learning_max_chars(), 56_000)
-                calls: list[dict] = []
-
-                async def fake_complete_json(_session, _settings, *, system, user, schema=None, max_output_tokens=None, wait_for_capacity=True, task=""):
-                    batch_no = len(calls)
-                    calls.append({"system": system, "user": user, "schema": schema, "task": task})
-                    start = batch_no * 10
-                    return {
-                        "cards": [
-                            {
-                                "front": f"مفهوم شماره {i} چیست؟",
-                                "back": f"توضیح مفهوم {i}",
-                                "source": "صفحهٔ ۱",
-                            }
-                            for i in range(start, start + 10)
-                        ]
-                    }
-
-                bot.deps = bot.deps.__class__(complete_json_fn=fake_complete_json)
-                chunk = DocChunk(0, "صفحهٔ ۱", ("صفحهٔ ۱",), "متن علمی کافی " * 80)
-                items, failed = await bot._generate_chunks(
-                    kind="deck",
-                    chunks=[chunk],
-                    counts=[40],
-                    placeholder=mock.AsyncMock(),
-                )
-                self.assertEqual(failed, 0)
-                self.assertEqual(len(items), 40)
-                self.assertEqual(len(calls), 4)
-                self.assertTrue(all(call["schema"] is not None for call in calls))
-                self.assertTrue(all(call["task"] == "FLASHCARD_GENERATION" for call in calls))
-                self.assertEqual(len({call["system"] for call in calls}), 1)
-                self.assertIn("مفهوم شماره 0 چیست؟", calls[1]["user"])
-            finally:
-                await bot.shutdown()
-
     async def test_learning_html_delivery_failure_refunds_credit_and_stores_no_library_item(self) -> None:
         from tests.support import FakeCallbackEvent
 
@@ -818,7 +746,6 @@ class LearningRobustnessTests(unittest.IsolatedAsyncioTestCase):
                 with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards)):
                     await bot._handle_callback(ev)
                 self.assertEqual(await db.available_seconds(77), 1000)
-                self.assertEqual(await db.library_count_kind(77, "flashcards"), 0)
             finally:
                 await bot.shutdown()
                 await db.close()

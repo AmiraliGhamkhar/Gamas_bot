@@ -1,8 +1,8 @@
-"""Interactive HTML quizzes and flashcards (SRP / DIP).
+"""Interactive HTML quizzes (SRP / DIP).
 
 Encapsulates parallel chunk generation, source-grounded item anchoring,
-deterministic offline HTML rendering, direct Telegram delivery + SQLite
-library persistence, and manual flashcard deck building.
+deterministic offline HTML rendering, direct Telegram delivery and SQLite
+library persistence.
 """
 
 from __future__ import annotations
@@ -23,8 +23,6 @@ from . import texts
 from .artifact_validation import validate_learning_html_artifact
 from .billing import format_seconds_as_credits
 from .bot_ui import (
-    FLASHCARD_ASK_BACK,
-    FLASHCARD_ASK_FRONT,
     FREE_TRY_BADGE,
     FREE_TRY_RESTORED,
     LEARNING_BUSY_ALERT,
@@ -40,7 +38,6 @@ from .bot_ui import (
     TELEGRAM_CAPTION_LIMIT,
 )
 from .db import InsufficientBalanceError
-from .db_learning import FlashcardLimitError
 from .doc_extract import (
     DocChunk,
     chunk_text,
@@ -49,31 +46,22 @@ from .doc_extract import (
 from .fileio import run_file_io
 from .intake import _to_int
 from .learning import (
-    FLASHCARD_SCHEMA,
-    MAX_MANUAL_BACK_CHARS,
-    MAX_MANUAL_FRONT_CHARS,
     MAX_MODEL_INPUT_CHARS,
-    MIN_VALID_CARDS,
     MIN_VALID_QUESTIONS,
     QUIZ_SCHEMA,
     SIZE_PRESETS,
     GenerationShortfallError,
     anchor_items,
-    dedupe_cards,
     dedupe_questions,
     distribute_counts,
-    flashcard_system_prompt,
     learning_user_prompt,
-    parse_flashcard_payload,
     parse_quiz_payload,
-    preset_cards,
     quiz_system_prompt,
     source_key,
     topic_importance_weight,
 )
 from .learning_html import (
     LearningHtmlArtifact,
-    render_flashcards_html,
     render_quiz_html,
 )
 from .llm import LLMContextOverflowError, LLMOutputBudgetError
@@ -119,7 +107,7 @@ def _log_quiz_dedupe_diagnostics(
 
 
 class LearningWorkflowMixin:
-    """Direct interactive HTML generation for quizzes & flashcards plus manual card entry."""
+    """Direct interactive HTML generation for quizzes."""
 
     db: Any
     settings: Any
@@ -134,8 +122,6 @@ class LearningWorkflowMixin:
     _learning_in_flight: set[int]
     _learning_tasks: dict[int, asyncio.Task[Any]]
     _learning_commit_tasks: set[asyncio.Task[Any]]
-    _pending_flashcard: dict[int, tuple[int, str]]
-    _pending_flashcard_front: dict[int, str]
 
     CHUNK_PROGRESS_START = 6
     CHUNK_PROGRESS_END = 86
@@ -348,7 +334,6 @@ class LearningWorkflowMixin:
     async def _generate_chunks(
         self,
         *,
-        kind: str,
         chunks: list[DocChunk],
         counts: list[int],
         placeholder: Any,
@@ -360,17 +345,10 @@ class LearningWorkflowMixin:
             int(requested_count if requested_count is not None else sum(counts)),
         )
         job_task = (
-            "FLASHCARD_GENERATION"
-            if kind == "deck"
-            else "QUIZ_20" if job_requested_count >= 20 else "QUIZ_GENERATION"
+            "QUIZ_20" if job_requested_count >= 20 else "QUIZ_GENERATION"
         )
-        schema = FLASHCARD_SCHEMA if kind == "deck" else QUIZ_SCHEMA
-        concurrency = (
-            1
-            if kind == "deck"
-            else min(8, max(1, int(self.settings.learning_chunk_concurrency)))
-        )
-        prior_job_items: list[dict[str, Any]] = []
+        schema = QUIZ_SCHEMA
+        concurrency = min(8, max(1, int(self.settings.learning_chunk_concurrency)))
         active = [index for index, count in enumerate(counts) if count > 0]
         total = len(active)
         state = {"done": 0, "failed": 0}
@@ -397,8 +375,8 @@ class LearningWorkflowMixin:
                     return
                 await progress_changed.wait()
 
-        dedupe = dedupe_cards if kind == "deck" else dedupe_questions
-        stem_key = "front" if kind == "deck" else "question"
+        dedupe = dedupe_questions
+        stem_key = "question"
 
         async def _generate_piece(
             target_chunk: DocChunk,
@@ -417,11 +395,7 @@ class LearningWorkflowMixin:
             fallback_locator = allowed[0] if allowed else ""
             text_key = await run_file_io(source_key, target_chunk.text)
             items: list[dict[str, Any]] = []
-            batch_cap = (
-                10
-                if kind == "deck" and int(target_count) >= 40
-                else self.MAX_ITEMS_PER_CALL
-            )
+            batch_cap = self.MAX_ITEMS_PER_CALL
             planned_batches = max(1, math.ceil(int(target_count) / batch_cap))
             max_attempts = planned_batches + 1
             had_shortfall = False
@@ -431,17 +405,13 @@ class LearningWorkflowMixin:
                 if missing <= 0:
                     break
                 batch = min(missing, batch_cap)
-                system = (
-                    flashcard_system_prompt(batch, sources=allowed)
-                    if kind == "deck"
-                    else quiz_system_prompt(batch, sources=allowed)
-                )
+                system = quiz_system_prompt(batch, sources=allowed)
                 # ``target_chunk`` is already semantically bounded by the
                 # learning chunker. Never slice source text here: if an unusual
                 # caller supplies an oversized chunk, the provider's actual
                 # overflow signal triggers the split-and-process recovery below.
                 user_prompt = learning_user_prompt(
-                    kind, batch, allowed, target_chunk.text
+                    batch, allowed, target_chunk.text
                 )
                 if had_shortfall:
                     user_prompt += (
@@ -470,13 +440,7 @@ class LearningWorkflowMixin:
                         task=job_task,
                         max_output_tokens=min(
                             int(self.settings.learning_max_output_tokens),
-                            (2000 if batch <= 10 else 4000)
-                            if kind == "deck"
-                            else (
-                                2500
-                                if batch <= 5
-                                else 5000 if batch <= 10 else 10000
-                            ),
+                            2500 if batch <= 5 else 5000 if batch <= 10 else 10000,
                         ),
                         wait_for_capacity=False,
                     )
@@ -486,17 +450,12 @@ class LearningWorkflowMixin:
                         batch: int = batch,
                         items: list[dict[str, Any]] = items,
                     ) -> list[dict[str, Any]]:
-                        if kind == "deck":
-                            parsed = parse_flashcard_payload(
-                                payload, batch, require_source=True
-                            )
-                        else:
-                            parsed = parse_quiz_payload(
-                                payload,
-                                batch,
-                                require_difficulty=True,
-                                require_source=True,
-                            )
+                        parsed = parse_quiz_payload(
+                            payload,
+                            batch,
+                            require_difficulty=True,
+                            require_source=True,
+                        )
                         anchored = anchor_items(
                             parsed,
                             allowed,
@@ -506,10 +465,9 @@ class LearningWorkflowMixin:
                         )
                         candidates = [*items, *anchored]
                         merged_items = dedupe(candidates)
-                        if kind != "deck":
-                            _log_quiz_dedupe_diagnostics(
-                                len(candidates), len(merged_items), "chunk_batch"
-                            )
+                        _log_quiz_dedupe_diagnostics(
+                            len(candidates), len(merged_items), "chunk_batch"
+                        )
                         return merged_items
 
                     prev_count = len(items)
@@ -579,8 +537,7 @@ class LearningWorkflowMixin:
                             break
                     had_shortfall = True
                     logger.warning(
-                        "chunk budget exceeded kind=%s chunk=%s attempt=%s",
-                        kind,
+                        "chunk budget exceeded kind=quiz chunk=%s attempt=%s",
                         chunk_idx,
                         attempt + 1,
                         exc_info=True,
@@ -588,8 +545,7 @@ class LearningWorkflowMixin:
                 except Exception:
                     had_shortfall = True
                     logger.warning(
-                        "chunk generation failed kind=%s chunk=%s attempt=%s",
-                        kind,
+                        "chunk generation failed kind=quiz chunk=%s attempt=%s",
                         chunk_idx,
                         attempt + 1,
                         exc_info=True,
@@ -609,10 +565,8 @@ class LearningWorkflowMixin:
                 chunk,
                 count,
                 chunk_idx=index,
-                prior_items=prior_job_items if kind == "deck" else None,
+                prior_items=None,
             )
-            if kind == "deck":
-                prior_job_items.extend(items)
             if len(items) < count:
                 state["failed"] += 1
             fractions[index] = 0.0
@@ -655,18 +609,18 @@ class LearningWorkflowMixin:
         event: Any,
         *,
         user_id: int,
-        kind: str,
         source: dict[str, Any],
         wanted: int,
         cost: int,
         note: str,
         title: str,
     ) -> None:
-        """Generate quiz or flashcards directly as an interactive HTML file (no curation)."""
+        """Generate a quiz directly as an interactive HTML file (no curation)."""
         chunks = [chunk for chunk in source["chunks"] if chunk.text.strip()]
         if not chunks:
             await event.respond("متنی برای ساخت محتوا پیدا نشد. فایل دیگری بفرستید.")
             return
+        kind = "quiz"
         requested_count = max(1, int(wanted))
         await self._ack(event)
         budget_task = asyncio.create_task(
@@ -698,7 +652,7 @@ class LearningWorkflowMixin:
         free, charged, claim_id = budget
         committed = False
         placeholder = None
-        label = "فلش‌کارت" if kind == "deck" else "سؤال"
+        label = "سؤال"
         stage = f"آماده‌سازی {label}"
         try:
             counts = distribute_counts(
@@ -719,7 +673,6 @@ class LearningWorkflowMixin:
             placeholder = progress
             async with self._learning_global_semaphore:
                 items, failures = await self._generate_chunks(
-                    kind=kind,
                     chunks=chunks,
                     counts=counts,
                     placeholder=progress,
@@ -727,18 +680,14 @@ class LearningWorkflowMixin:
                     requested_count=requested_count,
                 )
             generated_count = len(items)
-            items = await run_file_io(
-                dedupe_cards if kind == "deck" else dedupe_questions, items
-            )
-            if kind != "deck":
-                _log_quiz_dedupe_diagnostics(generated_count, len(items), "job_merge")
+            items = await run_file_io(dedupe_questions, items)
+            _log_quiz_dedupe_diagnostics(generated_count, len(items), "job_merge")
 
-            minimum = MIN_VALID_CARDS if kind == "deck" else MIN_VALID_QUESTIONS
-            if len(items) < minimum:
+            if len(items) < MIN_VALID_QUESTIONS:
                 raise GenerationShortfallError(
                     kind=kind,
                     produced=len(items),
-                    required=minimum,
+                    required=MIN_VALID_QUESTIONS,
                     requested=requested_count,
                     failures=failures,
                     chunks=len(chunks),
@@ -752,40 +701,22 @@ class LearningWorkflowMixin:
                 "ساخت فایل تعاملی HTML",
                 f"{to_persian_digits(len(final_items))} {label} در حال بسته‌بندی در فایل آفلاین است…",
             )
-            if kind == "deck":
-                artifact = await run_file_io(
-                    render_flashcards_html,
-                    clean_title,
-                    final_items,
-                    source_title=source_title,
-                )
-                await run_file_io(
-                    validate_learning_html_artifact,
-                    artifact.content,
-                    expected_kind="flashcards",
-                )
-                caption = (
-                    f"🃏 {clean_title}\n"
-                    f"{to_persian_digits(len(final_items))} فلش‌کارت تعاملی آفلاین "
-                    "(روی فایل بزنید تا در مرورگر باز شود)"
-                )
-            else:
-                artifact = await run_file_io(
-                    render_quiz_html,
-                    clean_title,
-                    final_items,
-                    source_title=source_title,
-                )
-                await run_file_io(
-                    validate_learning_html_artifact,
-                    artifact.content,
-                    expected_kind="quiz",
-                )
-                caption = (
-                    f"🧪 {clean_title}\n"
-                    f"{to_persian_digits(len(final_items))} سؤال چهارگزینه‌ای تعاملی آفلاین "
-                    "(روی فایل بزنید تا در مرورگر باز شود)"
-                )
+            artifact = await run_file_io(
+                render_quiz_html,
+                clean_title,
+                final_items,
+                source_title=source_title,
+            )
+            await run_file_io(
+                validate_learning_html_artifact,
+                artifact.content,
+                expected_kind="quiz",
+            )
+            caption = (
+                f"🧪 {clean_title}\n"
+                f"{to_persian_digits(len(final_items))} سؤال چهارگزینه‌ای تعاملی آفلاین "
+                "(روی فایل بزنید تا در مرورگر باز شود)"
+            )
 
             await progress.update(
                 95,
@@ -814,8 +745,8 @@ class LearningWorkflowMixin:
                 source_item_id = int(source["item_id"])
                 if await self.db.library_item(user_id, source_item_id) is None:
                     # Source item disappeared mid-run; persist a lightweight internal
-                    # anchor so FK-backed quiz_sessions / flashcard_decks never fail
-                    # after the user already received the HTML file.
+                    # anchor so FK-backed quiz_sessions never fail after the user
+                    # already received the HTML file.
                     source_item_id = await self.db.library_add(
                         user_id,
                         "booklet",
@@ -826,56 +757,30 @@ class LearningWorkflowMixin:
                         artifact_kind="learning_source",
                     )
 
-                if kind == "deck":
-                    await self.db.deck_create_with_cards(
-                        user_id,
-                        source_item_id,
-                        clean_title,
-                        final_items,
-                        free_claim_id=claim_id if free else None,
-                        paid_charge_id=claim_id if charged else None,
-                        refund_seconds_value=refund,
-                    )
-                    library_title = (
-                        f"{short_title(source_title or clean_title, fallback=FALLBACK_BOOKLET)} "
-                        f"({to_persian_digits(len(final_items))} کارت)"
-                    )
-                    await self.db.library_record_delivered_file(
-                        user_id,
-                        "flashcards",
-                        title=library_title,
-                        chat_id=sent_chat_id,
-                        message_id=sent_message_id,
-                        artifact_kind="flashcards_html",
-                        filename=artifact.filename,
-                        content_type="text/html; charset=utf-8",
-                        content=artifact.content,
-                    )
-                else:
-                    await self.db.quiz_create_session(
-                        user_id,
-                        source_item_id,
-                        final_items,
-                        status="done",
-                        free_claim_id=claim_id if free else None,
-                        paid_charge_id=claim_id if charged else None,
-                        refund_seconds_value=refund,
-                    )
-                    library_title = (
-                        f"{short_title(source_title or clean_title, fallback=FALLBACK_BOOKLET)} "
-                        f"({to_persian_digits(len(final_items))} سؤال)"
-                    )
-                    await self.db.library_record_delivered_file(
-                        user_id,
-                        "quiz",
-                        title=library_title,
-                        chat_id=sent_chat_id,
-                        message_id=sent_message_id,
-                        artifact_kind="quiz_html",
-                        filename=artifact.filename,
-                        content_type="text/html; charset=utf-8",
-                        content=artifact.content,
-                    )
+                await self.db.quiz_create_session(
+                    user_id,
+                    source_item_id,
+                    final_items,
+                    status="done",
+                    free_claim_id=claim_id if free else None,
+                    paid_charge_id=claim_id if charged else None,
+                    refund_seconds_value=refund,
+                )
+                library_title = (
+                    f"{short_title(source_title or clean_title, fallback=FALLBACK_BOOKLET)} "
+                    f"({to_persian_digits(len(final_items))} سؤال)"
+                )
+                await self.db.library_record_delivered_file(
+                    user_id,
+                    "quiz",
+                    title=library_title,
+                    chat_id=sent_chat_id,
+                    message_id=sent_message_id,
+                    artifact_kind="quiz_html",
+                    filename=artifact.filename,
+                    content_type="text/html; charset=utf-8",
+                    content=artifact.content,
+                )
                 committed = True
                 await self.db.library_prune(user_id, self.settings.library_max_items)
             finally:
@@ -883,11 +788,7 @@ class LearningWorkflowMixin:
                     self._learning_commit_tasks.discard(current_task)
 
             lines = [
-                texts.LEARNING_HTML_SENT_DECK.format(
-                    count=to_persian_digits(len(final_items))
-                )
-                if kind == "deck"
-                else texts.LEARNING_HTML_SENT_QUIZ.format(
+                texts.LEARNING_HTML_SENT_QUIZ.format(
                     count=to_persian_digits(len(final_items))
                 )
             ]
@@ -914,14 +815,7 @@ class LearningWorkflowMixin:
                 )
             done_buttons = [
                 [
-                    Button.inline(
-                        texts.BTN_LIB_FLASHCARDS_SHORT
-                        if kind == "deck"
-                        else texts.BTN_LIB_QUIZZES_SHORT,
-                        b"lib:cat:flashcards:0"
-                        if kind == "deck"
-                        else b"lib:cat:quiz:0",
-                    ),
+                    Button.inline(texts.BTN_LIB_QUIZZES_SHORT, b"lib:cat:quiz:0"),
                     Button.inline(texts.BTN_LIBRARY, b"library"),
                 ],
                 [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
@@ -1130,7 +1024,6 @@ class LearningWorkflowMixin:
         await self._generate_learning(
             event,
             user_id=user_id,
-            kind="quiz",
             source={
                 "item_id": int(item_id),
                 "doc_id": None,
@@ -1147,15 +1040,10 @@ class LearningWorkflowMixin:
         )
 
     @staticmethod
-    def _deck_stale_alert() -> str:
-        return "این فلش‌کارت دیگر معتبر نیست."
-
-    @staticmethod
     def _library_icon(kind: str) -> str:
         return {
             "booklet": "📖",
             "quiz": "🧪",
-            "flashcards": "🃏",
             "transcript": "📝",
             "office": "🗂",
             "document": "📄",
@@ -1166,188 +1054,18 @@ class LearningWorkflowMixin:
         fallback = {
             "booklet": FALLBACK_BOOKLET,
             "quiz": "آزمون تعاملی",
-            "flashcards": "فلش‌کارت تعاملی",
             "office": FALLBACK_OFFICE,
             "transcript": "متن گفتار",
         }.get(kind, FALLBACK_DOCUMENT)
         raw = " ".join(str(item.get("title") or "").split())
-        raw = raw.lstrip("📖📝🗂📄🧪🃏✅ ").strip()
+        raw = raw.lstrip("📖📝🗂📄🧪✅ ").strip()
         return short_title(raw, fallback=fallback)
 
-    async def _flashcard_start_screen(
-        self, event: Any, user_id: int, item_id: int
-    ) -> None:
-        item = await self.db.library_item_detail(user_id, item_id)
-        if item is None or item.get("kind") != "booklet":
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
-            return
-        document = await self.db.document_by_library_item(user_id, item_id)
-        if document:
-            await self._show_document_generate_screen(  # type: ignore[attr-defined]
-                event, user_id, int(document["id"]), "deck"
-            )
-            return
-        if not item.get("content_text"):
-            await self._edit(
-                event,
-                "🃏 فلش‌کارت تعاملی HTML\n\n" + LEARNING_LEGACY_NOTICE,
-                [[Button.inline("↩️ بازگشت", b"library")]],
-            )
-            return
-        if not self.settings.note_configured:
-            await self._edit(
-                event,
-                texts.LEARNING_GENERATION_UNAVAILABLE,
-                [[await self._learning_back_button_for_item(user_id, item_id)]],
-            )
-            return
-        size = self.settings.flashcard_ai_deck_size
-        cost = self.settings.flashcard_ai_cost_seconds
-        free = await self._free_try_available(user_id, "deck")
-        regular_cost = format_seconds_as_credits(cost)
-        text = (
-            "🃏 ساخت فلش‌کارت تعاملی HTML از این جزوه\n\n"
-            "فایل HTML آفلاین شامل کارت‌گردان، حالت بلدم/مرور و جستجو به‌صورت مستقیم برایتان ارسال می‌شود.\n"
-            + (
-                f"هزینهٔ معمول: {regular_cost}؛ نخستین مجموعه رایگان است."
-                if free
-                else f"هزینهٔ پایه: {regular_cost}"
-            )
-        )
-        badge = ""
-        if free:
-            badge = f"\n\n{FREE_TRY_BADGE} — این بار بدون کسر اعتبار ساخته می‌شود."
-        buttons: list[list] = []
-        for code, label, cards, _questions in SIZE_PRESETS:
-            buttons.append(
-                [
-                    Button.inline(
-                        button_label(
-                            f"{label} — {to_persian_digits(cards)} کارت — "
-                            + (
-                                texts.LEARNING_FREE_CHOICE_LABEL
-                                if free
-                                else format_seconds_as_credits(
-                                    self._preset_cost(cost, cards, size)
-                                )
-                            )
-                        ),
-                        f"fc:go:{item_id}:{code}".encode("ascii"),
-                    )
-                ]
-            )
-        buttons.append([await self._learning_back_button_for_item(user_id, item_id)])
-        await self._edit(
-            event,
-            text + badge + "\n\nاندازهٔ مجموعه را انتخاب کنید:",
-            buttons,
-        )
-
-    async def _flashcard_generate(
-        self, event: Any, user_id: int, item_id: int, preset: str | None = None
-    ) -> None:
-        document = await self.db.document_by_library_item(user_id, item_id)
-        if document:
-            await self._generate_from_document(  # type: ignore[attr-defined]
-                event, user_id, int(document["id"]), "deck", preset or ""
-            )
-            return
-        item = await self.db.library_item_detail(user_id, item_id)
-        if item is None or item.get("kind") != "booklet":
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
-            return
-        content = item.get("content_text")
-        if not content:
-            await self._ack(event, LEARNING_LEGACY_NOTICE, alert=True)
-            return
-        if not self.settings.note_configured:
-            await event.respond(texts.LEARNING_GENERATION_UNAVAILABLE)
-            return
-        if (
-            await self.db.deck_count(user_id)
-            >= self.settings.flashcard_max_decks_per_user
-        ):
-            await event.respond(
-                "به حداکثر تعداد مجموعه‌های فلش‌کارت رسیده‌اید؛ برای ساخت مجموعهٔ جدید "
-                "یک مجموعهٔ قدیمی را حذف کنید."
-            )
-            return
-        if user_id in self._learning_in_flight:
-            await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
-            return
-        if self._shutting_down:
-            await self._ack(
-                event,
-                "ربات در حال راه‌اندازی مجدد است؛ دوباره تلاش کنید.",
-                alert=True,
-            )
-            return
-        self._learning_in_flight.add(user_id)
-        task = asyncio.current_task()
-        if task is not None:
-            self._learning_tasks[user_id] = task
-        try:
-            async with self._learning_lock(user_id):
-                await self._flashcard_generate_locked(
-                    event,
-                    user_id,
-                    item_id,
-                    content,
-                    self._item_display_title(item),
-                    preset,
-                )
-        finally:
-            self._learning_in_flight.discard(user_id)
-            if self._learning_tasks.get(user_id) is task:
-                self._learning_tasks.pop(user_id, None)
-
-    def _deck_size_and_cost(self, preset: str | None) -> tuple[int, int]:
-        base_size = int(self.settings.flashcard_ai_deck_size)
-        base_cost = int(self.settings.flashcard_ai_cost_seconds)
-        if preset is None:
-            return base_size, base_cost
-        cards = preset_cards(str(preset))
-        if cards is None:
-            raise ValueError("invalid flashcard preset")
-        return cards, self._preset_cost(base_cost, cards, base_size)
-
-    async def _flashcard_generate_locked(
-        self,
-        event: Any,
-        user_id: int,
-        item_id: int,
-        content: str,
-        item_title: str,
-        preset: str | None = None,
-    ) -> None:
-        size, cost = self._deck_size_and_cost(preset)
-        await self._generate_learning(
-            event,
-            user_id=user_id,
-            kind="deck",
-            source={
-                "item_id": int(item_id),
-                "doc_id": None,
-                "title": item_title,
-                "chunks": await run_file_io(self._learning_chunks, content),
-            },
-            wanted=size,
-            cost=cost,
-            note=f"fc-pending:{item_id}",
-            title=short_title(item_title, fallback=FALLBACK_BOOKLET) + " — فلش‌کارت",
-        )
-
-    async def _show_flashcard_hub(self, event: Any, *, page: int = 0) -> None:
-        """Route legacy flashcard-hub buttons straight to the categorized Flashcards tab."""
-        await self._show_library_category(event, "flashcards", page=page)  # type: ignore[attr-defined]
-
-    async def _show_booklet_picker(
-        self, event: Any, *, kind: str = "deck", page: int = 0
-    ) -> None:
+    async def _show_booklet_picker(self, event: Any, *, page: int = 0) -> None:
         user_id = event.sender_id
         if user_id is None:
             return
-        back_cb = b"lib:cat:flashcards:0" if kind == "deck" else b"lib:cat:quiz:0"
+        back_cb = b"lib:cat:quiz:0"
         if not self.settings.note_configured:
             await self._edit(
                 event,
@@ -1361,28 +1079,21 @@ class LearningWorkflowMixin:
         items = await self.db.library_source_booklets(
             user_id, limit=page_size, offset=page * page_size
         )
-        action_prefix = "fc:ai" if kind == "deck" else "quiz:new"
-        pick_prefix = "fc:pick" if kind == "deck" else "quiz:pick"
         buttons: list[list] = []
         if not items:
             text = (
-                "🤖 ساخت فلش‌کارت از جزوه\n\n"
-                if kind == "deck"
-                else "🤖 ساخت آزمون از جزوه\n\n"
-            ) + "هنوز جزوه‌ای از ربات دریافت نکرده‌اید که متن آن برای تولید موجود باشد."
-        else:
-            text = (
-                "یک جزوه را برای ساخت فلش‌کارت تعاملی HTML انتخاب کنید:"
-                if kind == "deck"
-                else "یک جزوه را برای ساخت آزمون تعاملی HTML انتخاب کنید:"
+                "🤖 ساخت آزمون از جزوه\n\n"
+                "هنوز جزوه‌ای از ربات دریافت نکرده‌اید که متن آن برای تولید موجود باشد."
             )
+        else:
+            text = "یک جزوه را برای ساخت آزمون تعاملی HTML انتخاب کنید:"
             for item in items:
                 title = self._item_display_title(item)
                 buttons.append(
                     [
                         Button.inline(
                             button_label(f"📖 {title}"),
-                            f"{action_prefix}:{item['item_id']}".encode("ascii"),
+                            f"quiz:new:{item['item_id']}".encode("ascii"),
                         )
                     ]
                 )
@@ -1390,201 +1101,19 @@ class LearningWorkflowMixin:
             if page > 0:
                 nav.append(
                     Button.inline(
-                        "◀️ قبلی", f"{pick_prefix}:{page - 1}".encode("ascii")
+                        "◀️ قبلی", f"quiz:pick:{page - 1}".encode("ascii")
                     )
                 )
             if (page + 1) * page_size < count:
                 nav.append(
                     Button.inline(
-                        "بعدی ▶️", f"{pick_prefix}:{page + 1}".encode("ascii")
+                        "بعدی ▶️", f"quiz:pick:{page + 1}".encode("ascii")
                     )
                 )
             if nav:
                 buttons.append(nav)
         buttons.append([Button.inline("↩️ بازگشت", back_cb)])
         await self._edit(event, text, buttons)
-
-    async def _start_manual_deck(self, event: Any, user_id: int) -> None:
-        if (
-            await self.db.deck_count(user_id)
-            >= self.settings.flashcard_max_decks_per_user
-        ):
-            await event.respond(
-                "به حداکثر تعداد مجموعه‌های فلش‌کارت رسیده‌اید؛ یک مجموعهٔ قدیمی را حذف کنید."
-            )
-            return
-        deck_id = await self.db.deck_create(
-            user_id, None, "فلش‌کارت دستی من", "manual"
-        )
-        self._pending_flashcard[user_id] = (deck_id, "front")
-        self._pending_flashcard_front.pop(user_id, None)
-        await event.respond(
-            FLASHCARD_ASK_FRONT,
-            buttons=[[Button.inline("✅ پایان و ساخت فایل HTML", b"fc:man:done")]],
-        )
-
-    async def _handle_flashcard_text(
-        self, event: Any, user_id: int, text: str
-    ) -> None:
-        deck_id, phase = self._pending_flashcard[user_id]
-        deck = await self.db.deck_get(deck_id, user_id)
-        if deck is None:
-            self._pending_flashcard.pop(user_id, None)
-            self._pending_flashcard_front.pop(user_id, None)
-            await event.reply("این مجموعه دیگر در دسترس نیست.")
-            return
-        end_button = [[Button.inline("✅ پایان و ساخت فایل HTML", b"fc:man:done")]]
-        if not text:
-            await event.reply("لطفاً متن را در یک پیام متنی بفرستید.")
-            return
-        if phase == "front":
-            self._pending_flashcard_front[user_id] = text[:MAX_MANUAL_FRONT_CHARS]
-            self._pending_flashcard[user_id] = (deck_id, "back")
-            await event.reply(FLASHCARD_ASK_BACK, buttons=end_button)
-            return
-        front = self._pending_flashcard_front.pop(user_id, "")
-        if not front:
-            self._pending_flashcard[user_id] = (deck_id, "front")
-            await event.reply(FLASHCARD_ASK_FRONT, buttons=end_button)
-            return
-        try:
-            count = await self.db.deck_add_card(
-                deck_id,
-                front,
-                text[:MAX_MANUAL_BACK_CHARS],
-                max_cards=self.settings.flashcard_max_cards_per_deck,
-            )
-        except FlashcardLimitError:
-            self._pending_flashcard.pop(user_id, None)
-            await event.reply(texts.FLASHCARD_CARD_LIMIT)
-            return
-        self._pending_flashcard[user_id] = (deck_id, "front")
-        await event.reply(
-            f"کارت اضافه شد ({to_persian_digits(count)} کارت). "
-            "پرسش کارت بعدی را بفرستید یا «پایان و ساخت فایل HTML» را بزنید.",
-            buttons=end_button,
-        )
-
-    async def _finish_manual_deck(
-        self, event: Any, user_id: int, deck_id: int
-    ) -> None:
-        """Export a completed manual flashcard deck as an interactive HTML file."""
-        deck = await self.db.deck_get(deck_id, user_id)
-        if deck is None:
-            await self._show_flashcard_hub(event)
-            return
-        cards = await self.db.deck_cards(deck_id)
-        if not cards:
-            await self.db.deck_delete(deck_id, user_id)
-            await event.respond(
-                "کارتی اضافه نشد؛ ساخت فلش‌کارت دستی بسته شد.",
-                buttons=[[Button.inline(texts.BTN_LIB_FLASHCARDS_SHORT, b"lib:cat:flashcards:0")]],
-            )
-            return
-        first_front = str(cards[0].get("front") or "")
-        deck_title = short_title(first_front, fallback="فلش‌کارت دستی من", max_words=4)
-        try:
-            artifact = await run_file_io(
-                render_flashcards_html,
-                deck_title,
-                cards,
-                source_title="ساخته‌شده به‌صورت دستی",
-            )
-            await run_file_io(
-                validate_learning_html_artifact,
-                artifact.content,
-                expected_kind="flashcards",
-            )
-            caption = (
-                f"🃏 {deck_title}\n"
-                f"{to_persian_digits(len(cards))} فلش‌کارت دستی تعاملی آفلاین "
-                "(روی فایل بزنید تا در مرورگر باز شود)"
-            )
-            sent_chat_id, sent_message_id = await self._send_learning_html(
-                event, user_id, artifact, caption=caption
-            )
-            library_title = f"{deck_title} ({to_persian_digits(len(cards))} کارت دستی)"
-            await self.db.library_record_delivered_file(
-                user_id,
-                "flashcards",
-                title=library_title,
-                chat_id=sent_chat_id,
-                message_id=sent_message_id,
-                artifact_kind="flashcards_html",
-                filename=artifact.filename,
-                content_type="text/html; charset=utf-8",
-                content=artifact.content,
-            )
-            await self.db.library_prune(user_id, self.settings.library_max_items)
-        except Exception:
-            logger.exception("manual flashcard HTML export failed user=%s", user_id)
-            await event.respond(
-                "❌ ساخت یا ارسال فایل HTML فلش‌کارت دستی ناموفق بود؛ دوباره تلاش کنید.",
-                buttons=[[Button.inline(texts.BTN_LIB_FLASHCARDS_SHORT, b"lib:cat:flashcards:0")]],
-            )
-            return
-        await event.respond(
-            texts.LEARNING_MANUAL_HTML_SENT.format(
-                count=to_persian_digits(len(cards))
-            ),
-            buttons=[
-                [
-                    Button.inline(
-                        texts.BTN_LIB_FLASHCARDS_SHORT, b"lib:cat:flashcards:0"
-                    ),
-                    Button.inline(texts.BTN_LIBRARY, b"library"),
-                ]
-            ],
-        )
-
-    async def _route_flashcard_callback(
-        self, event: Any, user_id: int, data: str
-    ) -> None:
-        parts = data.split(":")
-        action = parts[1] if len(parts) > 1 else ""
-        if action == "hub":
-            page = _to_int(parts[2]) if len(parts) == 3 else 0
-            await self._show_flashcard_hub(event, page=max(0, page or 0))
-            return
-        if action == "pick":
-            page = _to_int(parts[2]) if len(parts) == 3 else 0
-            await self._show_booklet_picker(event, kind="deck", page=max(0, page or 0))
-            return
-        if action == "man" and len(parts) == 2:
-            await self._start_manual_deck(event, user_id)
-            return
-        if action == "man" and len(parts) == 3 and parts[2] == "done":
-            state = self._pending_flashcard.pop(user_id, None)
-            self._pending_flashcard_front.pop(user_id, None)
-            await self._ack(event)
-            if state is None:
-                await self._show_flashcard_hub(event)
-            else:
-                await self._finish_manual_deck(event, user_id, state[0])
-            return
-        if action == "ai" and len(parts) == 3:
-            item_id = _to_int(parts[2])
-            if item_id is None:
-                await self._ack(event, self._deck_stale_alert(), alert=True)
-                return
-            await self._flashcard_start_screen(event, user_id, item_id)
-            return
-        if action == "go" and len(parts) in (3, 4):
-            item_id = _to_int(parts[2])
-            if item_id is None:
-                await self._ack(event, self._deck_stale_alert(), alert=True)
-                return
-            preset = parts[3] if len(parts) == 4 else None
-            if preset is not None and preset_cards(preset) is None:
-                await self._ack(event, texts.INVALID_LEARNING_SIZE, alert=True)
-                return
-            if not await self._require_membership(
-                event, user_id, kind="callback", callback_data=data
-            ):
-                return
-            await self._flashcard_generate(event, user_id, item_id, preset)
-            return
-        await self._ack(event, self._deck_stale_alert(), alert=True)
 
     async def _route_quiz_callback(
         self, event: Any, user_id: int, data: str
@@ -1593,7 +1122,7 @@ class LearningWorkflowMixin:
         action = parts[1] if len(parts) > 1 else ""
         if action == "pick":
             page = _to_int(parts[2]) if len(parts) == 3 else 0
-            await self._show_booklet_picker(event, kind="quiz", page=max(0, page or 0))
+            await self._show_booklet_picker(event, page=max(0, page or 0))
             return
         if action == "new" and len(parts) == 3:
             item_id = _to_int(parts[2])

@@ -46,7 +46,6 @@ from telethon.tl.types import DocumentAttributeFilename
 from .artifacts import (
     KIND_BOOKLET,
     KIND_DOCX,
-    KIND_FLASHCARDS,
     KIND_KEYPOINTS,
     KIND_QUIZ,
     KIND_REVIEW_HTML,
@@ -67,13 +66,9 @@ from .bot_ui import (
     ACTIVE_LIMIT_MESSAGE,
     CATEGORY_FILTER_LABELS,
     DOC_EXTRACTION_STOPPED,
-    DOC_GENERATE_CARDS,
     DOC_GENERATE_QUESTIONS,
     DOC_PHOTO_HINT,
     DOC_UNSUPPORTED_HINT,
-    FLASHCARD_ASK_BACK,
-    FLASHCARD_ASK_FRONT,
-    FLASHCARD_EMPTY,
     FREE_TRY_BADGE,
     FREE_TRY_RESTORED,
     FREE_TRY_USED_NOTICE,
@@ -236,8 +231,6 @@ class GamasBot(
         self._support_states = self.conversations.support_states
         self._support_admin_states = self.conversations.support_admin_states
         self._pending_reject_reason = self.conversations.pending_reject_reason
-        self._pending_flashcard = self.conversations.pending_flashcard
-        self._pending_flashcard_front = self.conversations.pending_flashcard_front
         self._pending_user_search = self.conversations.pending_user_search
         self._pending_free_reset = self.conversations.pending_free_reset
         self._office_sessions: dict[int, OfficeSession] = self.conversations.office_sessions
@@ -934,8 +927,6 @@ class GamasBot(
             return "booklet"
         if kind == "quiz":
             return "quiz"
-        if kind == "flashcards":
-            return "flashcards"
         return "other"
 
     async def _show_library(self, event, *, page: int = 0) -> None:
@@ -951,7 +942,6 @@ class GamasBot(
                 event,
                 text,
                 [
-                    [Button.inline(texts.BTN_MANUAL_FLASHCARD, b"fc:man")],
                     [
                         Button.inline(texts.BTN_WALLET, b"wallet"),
                         Button.inline(texts.BTN_BACK_MAIN, b"menu:main"),
@@ -968,7 +958,6 @@ class GamasBot(
             texts.LIBRARY_HOME_SUMMARY.format(
                 booklet=to_persian_digits(counts["booklet"]),
                 quiz=to_persian_digits(counts["quiz"]),
-                flashcards=to_persian_digits(counts["flashcards"]),
                 other=to_persian_digits(counts["other"]),
             ),
         ]
@@ -989,19 +978,12 @@ class GamasBot(
             ],
             [
                 Button.inline(
-                    texts.BTN_LIB_FLASHCARDS_TAB.format(
-                        count=to_persian_digits(counts["flashcards"])
-                    ),
-                    b"lib:cat:flashcards:0",
-                ),
-                Button.inline(
                     texts.BTN_LIB_OTHER_TAB.format(
                         count=to_persian_digits(counts["other"])
                     ),
                     b"lib:cat:other:0",
                 ),
             ],
-            [Button.inline(texts.BTN_MANUAL_FLASHCARD, b"fc:man")],
             [
                 Button.inline(texts.BTN_WALLET, b"wallet"),
                 Button.inline(texts.BTN_BACK_MAIN, b"menu:main"),
@@ -1083,16 +1065,7 @@ class GamasBot(
             if nav:
                 buttons.append(nav)
 
-        if category == "flashcards":
-            action_row: list[Any] = [
-                Button.inline(texts.BTN_MANUAL_FLASHCARD, b"fc:man")
-            ]
-            if self.settings.note_configured:
-                action_row.append(
-                    Button.inline(texts.BTN_AI_FC_FROM_BOOKLET, b"fc:pick:0")
-                )
-            buttons.append(action_row)
-        elif category == "quiz" and self.settings.note_configured:
+        if category == "quiz" and self.settings.note_configured:
             buttons.append(
                 [Button.inline(texts.BTN_AI_QUIZ_FROM_BOOKLET, b"quiz:pick:0")]
             )
@@ -1105,7 +1078,7 @@ class GamasBot(
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
     async def _show_library_item(self, event, item_id: int) -> None:
-        """Delivered booklet detail: re-download, interactive quiz/flashcard HTML, delete."""
+        """Delivered booklet detail: re-download, interactive quiz HTML, delete."""
         user_id = event.sender_id
         if user_id is None:
             return
@@ -1134,10 +1107,6 @@ class GamasBot(
                             texts.BTN_QUIZ_FROM_BOOKLET,
                             f"quiz:new:{item_id}".encode("ascii"),
                         ),
-                        Button.inline(
-                            texts.BTN_CARDS_FROM_BOOKLET,
-                            f"fc:ai:{item_id}".encode("ascii"),
-                        ),
                     ]
                 )
             elif item.get("content_text"):
@@ -1160,7 +1129,7 @@ class GamasBot(
             return
         category = self._library_category_for_kind(str(item["kind"]))
 
-        # 1. SQLite-persisted file blob (interactive quiz/flashcard HTML, TXT,
+        # 1. SQLite-persisted file blob (interactive quiz HTML, TXT,
         #    document booklets, and Free Office outputs). Never breaks if the
         #    original Telegram message was deleted by the user.
         blob = await self.db.library_file_blob(user_id, item_id)
@@ -1280,7 +1249,6 @@ class GamasBot(
         r.register_exact("results", lambda e, _u, _d: self._show_results_hub(e))
         r.register_exact("library", lambda e, _u, _d: self._show_library(e))
         r.register_prefix("res:", self._cb_result_set)
-        r.register_exact("library:fc", lambda e, _u, _d: self._show_flashcard_hub(e))
         r.register_exact("wallet", lambda e, _u, _d: self._show_wallet(e))
         r.register_exact("wallet:exact", lambda e, u, _d: self._show_wallet_exact(e, u))
         r.register_exact("support", self._handle_support_callback)
@@ -1326,7 +1294,6 @@ class GamasBot(
         r.register_prefix("sup:", self._handle_support_callback)
         r.register_prefix("art:", self._route_artifact_callback)
         r.register_prefix("quiz:", self._route_quiz_callback)
-        r.register_prefix("fc:", self._route_flashcard_callback)
 
     async def _route_reply_menu(self, event, user_id: int, text: str) -> bool:
         """Run the screen behind a bottom-keyboard label; ``False`` if not one."""
@@ -1481,14 +1448,14 @@ class GamasBot(
             if source_booklet is not None and not source_booklet.get("unavailable"):
                 item_id = int(source_booklet["item_id"])
             # The booklet is forwardable even if the optional library lookup
-            # for learning buttons failed; only quiz/flashcards need item_id.
+            # for learning buttons failed; only quizzes need item_id.
             kinds.add(KIND_BOOKLET)
             if item_id is not None:
-                kinds.update({KIND_QUIZ, KIND_FLASHCARDS})
+                kinds.update({KIND_QUIZ})
             else:
-                kinds.difference_update({KIND_QUIZ, KIND_FLASHCARDS})
+                kinds.difference_update({KIND_QUIZ})
         else:
-            kinds.difference_update({KIND_BOOKLET, KIND_QUIZ, KIND_FLASHCARDS})
+            kinds.difference_update({KIND_BOOKLET, KIND_QUIZ})
         buttons = delivery_markup(
             reference=reference,
             speakers=0,
@@ -1932,14 +1899,6 @@ class GamasBot(
                 await self._accept_raw_text(event, user_id, text)
                 return
 
-        if user_id in self._pending_flashcard:
-            if command:
-                self._pending_flashcard.pop(user_id, None)
-                self._pending_flashcard_front.pop(user_id, None)
-            else:
-                await self._handle_flashcard_text(event, user_id, text)
-                return
-
         try:
             text_suffix, text_filename = _text_file_metadata(event.message)
         except OfficeError as exc:
@@ -2027,16 +1986,12 @@ __all__ = [
     "CallbackRouter",
     "ConversationStateStore",
     "DOC_EXTRACTION_STOPPED",
-    "DOC_GENERATE_CARDS",
     "DOC_GENERATE_QUESTIONS",
     "DOC_PHOTO_HINT",
     "DOC_UNSUPPORTED_HINT",
     "DiskSpaceError",
     "DownloadStalledError",
     "FAILURE_KIND_LABELS_FA",
-    "FLASHCARD_ASK_BACK",
-    "FLASHCARD_ASK_FRONT",
-    "FLASHCARD_EMPTY",
     "FREE_TRY_BADGE",
     "FREE_TRY_RESTORED",
     "FREE_TRY_USED_NOTICE",

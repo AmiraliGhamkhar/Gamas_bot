@@ -915,8 +915,7 @@ class AdminWorkflowMixin:
                 f"{format_duration(seconds)} ({to_persian_digits(seconds)} ثانیه)"
             )
         orders = await self.db.count_user_payments(int(target_id))
-        decks = await self.db.deck_count(int(target_id))
-        free = identity.get("free_uses", {"deck": True, "quiz": True})
+        free = identity.get("free_uses", {"quiz": True})
         status = (
             "🚫 مسدود"
             if identity["banned"]
@@ -934,14 +933,8 @@ class AdminWorkflowMixin:
             ),
             f"وضعیت: {status}",
             f"اعتبار: {balance}",
-            f"سفارش‌ها: {to_persian_digits(orders)} | مجموعهٔ فلش‌کارت: {to_persian_digits(decks)}",
+            f"سفارش‌ها: {to_persian_digits(orders)}",
             "هدیهٔ اولین بار: "
-            + (
-                "🎁 فلش‌کارت رایگان مانده"
-                if free.get("deck")
-                else "فلش‌کارت استفاده شده"
-            )
-            + " | "
             + (
                 "🎁 آزمون رایگان مانده"
                 if free.get("quiz")
@@ -1094,7 +1087,7 @@ class AdminWorkflowMixin:
             event,
             "🔄 بازنشانی هدیهٔ رایگان\n\n"
             f"{who}\n\n"
-            "با تأیید، هر دو هدیهٔ «اولین بار رایگان» (فلش‌کارت و آزمون) برای این "
+            "با تأیید، هدیهٔ «اولین بار رایگان» (آزمون) برای این "
             "کاربر برمی‌گردد.",
             [
                 [

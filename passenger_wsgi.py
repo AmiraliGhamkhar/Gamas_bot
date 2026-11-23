@@ -20,11 +20,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gamas_bot.launcher import FAILED, MISCONFIGURED, RUNNING, ensure_running  # noqa: E402
+from gamas_bot.webapp_api import make_wsgi_app  # noqa: E402
+
+_WEBAPP = make_wsgi_app()
 
 
 def application(environ, start_response):
     path = environ.get("PATH_INFO", "/") or "/"
     method = environ.get("REQUEST_METHOD", "GET").upper()
+    if path.startswith("/api/") or path == "/app" or path.startswith("/app/"):
+        return _WEBAPP(environ, start_response)
     if path not in {"/", "/health"} or method not in {"GET", "HEAD"}:
         body = b'{"error":"not found"}'
         start_response(

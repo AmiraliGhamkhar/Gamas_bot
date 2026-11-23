@@ -26,7 +26,6 @@ from . import texts
 from .billing import format_seconds_as_credits
 from .bot_ui import (
     DOC_EXTRACTION_STOPPED,
-    DOC_GENERATE_CARDS,
     DOC_GENERATE_QUESTIONS,
     FREE_TRY_BADGE,
     LEARNING_BUSY_ALERT,
@@ -63,7 +62,7 @@ from .docx_export import (
 from .fileio import run_file_io, run_file_io_resource
 from .intake import _presentation_metadata, _to_int
 from .jobs import Job
-from .learning import MAX_MODEL_INPUT_CHARS, SIZE_PRESETS, normalize_content_text, preset_cards
+from .learning import MAX_MODEL_INPUT_CHARS, SIZE_PRESETS, normalize_content_text
 from .media import MediaToolError, convert_to_pptx
 from .notes import StructuringError
 from .notes_pdf import build_notes_pdf, notes_pdf_filename
@@ -319,9 +318,6 @@ class DocumentOfficeWorkflowMixin:
         if self.settings.note_configured:
             buttons.append(
                 [
-                    Button.inline(
-                        DOC_GENERATE_CARDS, f"doc:fc:{document_id}".encode("ascii")
-                    ),
                     Button.inline(
                         DOC_GENERATE_QUESTIONS,
                         f"doc:quiz:{document_id}".encode("ascii"),
@@ -1752,57 +1748,32 @@ class DocumentOfficeWorkflowMixin:
                 [[Button.inline("↩️ سند", f"doc:show:{document_id}".encode("ascii"))]],
             )
             return
-        deck_label = "مجموعهٔ فلش‌کارت" if kind == "deck" else "آزمون"
+        if kind != "quiz":
+            await self._ack(event, "درخواست نامعتبر است.", alert=True)  # type: ignore[attr-defined]
+            return
+        free = await self._free_try_available(user_id, "quiz")  # type: ignore[attr-defined]
         buttons: list[list] = []
-        free_kind = "deck" if kind == "deck" else "quiz"
-        free = await self._free_try_available(user_id, free_kind)  # type: ignore[attr-defined]
-        if kind == "deck":
-            base_size = int(self.settings.flashcard_ai_deck_size)
-            base_cost = int(self.settings.flashcard_ai_cost_seconds)
-            for code, label, cards, _questions in SIZE_PRESETS:
-                buttons.append(
-                    [
-                        Button.inline(
-                            button_label(
-                                f"{label} — {to_persian_digits(cards)} کارت — "
-                                + (
-                                    texts.LEARNING_FREE_CHOICE_LABEL
-                                    if free
-                                    else format_seconds_as_credits(
-                                        self._preset_cost(base_cost, cards, base_size)  # type: ignore[attr-defined]
-                                    )
-                                )
-                            ),
-                            f"doc:gen:fc:{document_id}:{code}".encode("ascii"),
-                        )
-                    ]
-                )
-        else:
-            per_question = int(self.settings.quiz_cost_seconds_per_question)
-            for _code, label, _cards, questions in SIZE_PRESETS:
-                buttons.append(
-                    [
-                        Button.inline(
-                            button_label(
-                                f"{label} — {to_persian_digits(questions)} سؤال — "
-                                + (
-                                    texts.LEARNING_FREE_CHOICE_LABEL
-                                    if free
-                                    else format_seconds_as_credits(questions * per_question)
-                                )
-                            ),
-                            f"doc:gen:quiz:{document_id}:{questions}".encode("ascii"),
-                        )
-                    ]
-                )
-        header = (
-            f"🃏 ساخت فلش‌کارت از «{document.get('title') or 'سند'}»"
-            if kind == "deck"
-            else f"❓ ساخت سؤال از «{document.get('title') or 'سند'}»"
-        )
+        per_question = int(self.settings.quiz_cost_seconds_per_question)
+        for _code, label, _cards, questions in SIZE_PRESETS:
+            buttons.append(
+                [
+                    Button.inline(
+                        button_label(
+                            f"{label} — {to_persian_digits(questions)} سؤال — "
+                            + (
+                                texts.LEARNING_FREE_CHOICE_LABEL
+                                if free
+                                else format_seconds_as_credits(questions * per_question)
+                            )
+                        ),
+                        f"doc:gen:quiz:{document_id}:{questions}".encode("ascii"),
+                    )
+                ]
+            )
+        header = f"❓ ساخت سؤال از «{document.get('title') or 'سند'}»"
         lines = [header, "", "اندازهٔ مجموعه را انتخاب کنید."]
         if free:
-            lines.append(f"\n{FREE_TRY_BADGE} — اولین {deck_label} شما رایگان است.")
+            lines.append(f"\n{FREE_TRY_BADGE} — اولین آزمون شما رایگان است.")
         buttons.append(
             [Button.inline("↩️ سند", f"doc:show:{document_id}".encode("ascii"))]
         )
@@ -1823,30 +1794,15 @@ class DocumentOfficeWorkflowMixin:
         if source is None:
             await self._ack(event, "این سند پیدا نشد.", alert=True)  # type: ignore[attr-defined]
             return
-        if kind == "deck":
-            if choice and preset_cards(choice) is None:
-                await self._ack(  # type: ignore[attr-defined]
-                    event, texts.INVALID_LEARNING_SIZE, alert=True
-                )
-                return
-            if (
-                await self.db.deck_count(user_id)
-                >= self.settings.flashcard_max_decks_per_user
-            ):
-                await event.respond(
-                    "به حداکثر تعداد مجموعه‌های فلش‌کارت رسیده‌اید؛ یک مجموعهٔ قدیمی را "
-                    "حذف کنید."
-                )
-                return
-            wanted, cost = self._deck_size_and_cost(choice or None)  # type: ignore[attr-defined]
-            note = f"fc-pending:doc:{document_id}"
-        else:
-            wanted = _to_int(choice) or 5
-            if wanted not in QUIZ_COUNTS:
-                await self._ack(event, "تعداد سؤال نامعتبر است.", alert=True)  # type: ignore[attr-defined]
-                return
-            cost = wanted * int(self.settings.quiz_cost_seconds_per_question)
-            note = f"quiz-pending:doc:{document_id}"
+        if kind != "quiz":
+            await self._ack(event, "درخواست نامعتبر است.", alert=True)  # type: ignore[attr-defined]
+            return
+        wanted = _to_int(choice) or 5
+        if wanted not in QUIZ_COUNTS:
+            await self._ack(event, "تعداد سؤال نامعتبر است.", alert=True)  # type: ignore[attr-defined]
+            return
+        cost = wanted * int(self.settings.quiz_cost_seconds_per_question)
+        note = f"quiz-pending:doc:{document_id}"
         if user_id in self._learning_in_flight:
             await self._ack(event, LEARNING_BUSY_ALERT, alert=True)  # type: ignore[attr-defined]
             return
@@ -1863,29 +1819,25 @@ class DocumentOfficeWorkflowMixin:
             self._learning_tasks[user_id] = task
         try:
             async with self._learning_lock(user_id):  # type: ignore[attr-defined]
-                if kind != "deck":
-                    reason = await self.db.quiz_admission(
-                        user_id,
-                        max_active_hours=self.settings.quiz_max_active_hours,
-                        max_sessions_per_hour=self.settings.quiz_max_sessions_per_hour,
+                reason = await self.db.quiz_admission(
+                    user_id,
+                    max_active_hours=self.settings.quiz_max_active_hours,
+                    max_sessions_per_hour=self.settings.quiz_max_sessions_per_hour,
+                )
+                if reason == "rate":
+                    await event.respond(
+                        "تعداد آزمون‌های شما در یک ساعت اخیر به حداکثر مجاز رسیده است."
                     )
-                    if reason == "rate":
-                        await event.respond(
-                            "تعداد آزمون‌های شما در یک ساعت اخیر به حداکثر مجاز رسیده است."
-                        )
-                        return
+                    return
                 await self._generate_learning(  # type: ignore[attr-defined]
                     event,
                     user_id=user_id,
-                    kind="deck" if kind == "deck" else "quiz",
                     source=source,
                     wanted=wanted,
                     cost=cost,
                     note=note,
                     title=(
-                        f"{short_title(source['title'], fallback=FALLBACK_BOOKLET)} — فلش‌کارت"
-                        if kind == "deck"
-                        else f"{short_title(source['title'], fallback=FALLBACK_BOOKLET)} — آزمون"
+                        f"{short_title(source['title'], fallback=FALLBACK_BOOKLET)} — آزمون"
                     ),
                 )
         finally:
@@ -2165,20 +2117,20 @@ class DocumentOfficeWorkflowMixin:
                 event, user_id, user_id, message_id
             )
             return
-        if action in ("fc", "quiz") and len(parts) == 3:
+        if action == "quiz" and len(parts) == 3:
             document_id = _to_int(parts[2])
             if document_id is None:
                 await self._ack(event, "این سند پیدا نشد.", alert=True)  # type: ignore[attr-defined]
                 return
             await self._show_document_generate_screen(
-                event, user_id, document_id, "deck" if action == "fc" else "quiz"
+                event, user_id, document_id, "quiz"
             )
             return
         if action == "gen" and len(parts) == 5:
-            if parts[2] not in {"fc", "quiz"}:
+            if parts[2] != "quiz":
                 await self._ack(event, "درخواست نامعتبر است.", alert=True)  # type: ignore[attr-defined]
                 return
-            kind = "deck" if parts[2] == "fc" else "quiz"
+            kind = "quiz"
             document_id = _to_int(parts[3])
             if document_id is None:
                 await self._ack(event, "این سند پیدا نشد.", alert=True)  # type: ignore[attr-defined]

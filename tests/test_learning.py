@@ -28,7 +28,6 @@ from gamas_bot.learning import (
     MAX_QUESTION_CHARS,
     QUIZ_SCHEMA,
     normalize_content_text,
-    parse_flashcard_payload,
     parse_quiz_payload,
     quiz_system_prompt,
 )
@@ -176,21 +175,6 @@ class LearningHelperTests(unittest.TestCase):
     def test_quiz_payload_respects_requested_count(self):
         parsed = parse_quiz_payload(quiz_payload(10), 3, rng=random.Random(1))
         self.assertEqual(len(parsed), 3)
-
-    def test_flashcard_payload_validation(self):
-        payload = {
-            "cards": [
-                {"front": "پرسش یک", "back": "پاسخ یک"},
-                {"front": "", "back": "پاسخ بدون پرسش"},  # dropped
-                {"front": "پرسش دو", "back": "پاسخ دو"},
-            ]
-        }
-        cards = parse_flashcard_payload(payload, 10, require_source=False)
-        self.assertEqual(cards, [
-            {"front": "پرسش یک", "back": "پاسخ یک"},
-            {"front": "پرسش دو", "back": "پاسخ دو"},
-        ])
-
 
 class NameCaptureTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -387,554 +371,6 @@ class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["score"], 10)
 
 
-class FlashcardDatabaseTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.db = Database(Path(self._tmp.name) / "fc.db")
-        await self.db.connect()
-        await self.db.ensure_user(OWNER)
-        await self.db.ensure_user(OTHER)
-        self.item_id = await self.db.library_add(
-            OWNER, "booklet", 10, 20, None, title="جزوه"
-        )
-
-    async def asyncTearDown(self):
-        await self.db.close()
-        self._tmp.cleanup()
-
-    async def test_batched_cards_preserve_order_and_roll_back_on_bad_item(self):
-        cards = [{"front": f"front {i}", "back": f"back {i}"} for i in range(500)]
-        broken = cards[:250] + [{"front": "missing back"}] + cards[251:]
-        with self.assertRaises(ValueError):
-            await self.db.deck_create_with_cards(OWNER, self.item_id, "broken", broken)
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
-        self.assertEqual((await self.db.db.execute_fetchall("SELECT COUNT(*) FROM flashcards"))[0][0], 0)
-        deck_id = await self.db.deck_create_with_cards(OWNER, self.item_id, "complete", cards)
-        rows = await self.db.deck_cards(deck_id)
-        self.assertEqual([row["front"] for row in rows], [card["front"] for card in cards])
-
-    async def test_manual_card_limit_is_atomic(self):
-        from gamas_bot.db_learning import FlashcardLimitError
-        deck = await self.db.manual_deck_get_or_create(OWNER)
-        results = await asyncio.gather(
-            self.db.deck_add_card(deck, "a", "a", max_cards=1),
-            self.db.deck_add_card(deck, "b", "b", max_cards=1),
-            return_exceptions=True,
-        )
-        self.assertEqual(sum(isinstance(result, FlashcardLimitError) for result in results), 1)
-        self.assertEqual(len(await self.db.deck_cards(deck)), 1)
-
-    async def test_deck_lifecycle_and_cascade(self):
-        deck_id = await self.db.deck_create(OWNER, self.item_id, "دسته", "ai")
-        for index in range(3):
-            count = await self.db.deck_add_card(deck_id, f"پرسش {index}", f"پاسخ {index}")
-        self.assertEqual(count, 3)
-        self.assertEqual(len(await self.db.deck_cards(deck_id)), 3)
-        await self.db.deck_set_cursor(deck_id, 2)
-        decks = await self.db.decks_list(OWNER)
-        self.assertEqual(decks[0]["card_count"], 3)
-        self.assertEqual(decks[0]["study_cursor"], 2)
-        self.assertIsNone(await self.db.deck_get(deck_id, OTHER))
-        self.assertTrue(await self.db.deck_delete(deck_id, OWNER))
-        cards = await self.db.db.execute_fetchall(
-            "SELECT COUNT(*) FROM flashcards WHERE deck_id=?", (deck_id,)
-        )
-        self.assertEqual(cards[0][0], 0)
-
-    async def test_manual_deck_is_singular_and_itemless(self):
-        first = await self.db.manual_deck_get_or_create(OWNER)
-        second = await self.db.manual_deck_get_or_create(OWNER)
-        self.assertEqual(first, second)
-        deck = await self.db.deck_get(first, OWNER)
-        self.assertEqual(deck["source"], "manual")
-        self.assertIsNone(deck["item_id"])
-
-    async def test_library_prune_preserves_active_quiz_then_retains_deck(self):
-        deck_id = await self.db.deck_create(OWNER, self.item_id, "دسته", "ai")
-        await self.db.deck_add_card(deck_id, "پ", "پا")
-        questions = [{
-            "question": "سؤال", "options": ["الف", "ب", "ج", "د"],
-            "correct_index": 0, "explanation": "چرا",
-        }]
-        session_id = await self.db.quiz_create_session(OWNER, self.item_id, questions)
-        await self.db.library_prune(OWNER, keep=0)
-        self.assertIsNotNone(await self.db.quiz_get_session(session_id, OWNER))
-        self.assertIsNotNone(await self.db.quiz_current_question(session_id))
-        await self.db.quiz_finish(session_id, "quit")
-        await self.db.library_prune(OWNER, keep=0)
-        deck = await self.db.deck_get(deck_id, OWNER)
-        self.assertIsNotNone(deck)
-        self.assertIsNone(deck["item_id"])  # SET NULL, deck retained
-        self.assertIsNone(await self.db.quiz_get_session(session_id, OWNER))  # terminal session cascades
-
-
-class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        root = Path(self._tmp.name)
-        self.settings = make_settings(
-            db_path=root / "fc.db",
-            temp_dir=root / "tmp",
-            # Generation flow tests build a fake avalai route: the mocked
-            # complete_json never performs any I/O, and an unconfigured route
-            # would short-circuit the flow before the assertions run.
-            avalai_api_key="avalai-test-key",
-            flashcard_ai_cost_seconds=300,
-            flashcard_ai_deck_size=6,
-            flashcard_max_decks_per_user=2,
-        )
-        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
-        self.db = Database(self.settings.db_path)
-        await self.db.connect()
-        self.bot = GamasBot(self.settings)
-        self.bot.db = self.db
-        self.recorder = SimpleNamespace(files=[], file_payloads=[], replies=[], edits=[])
-        self.client = FakeTelegramClient(self.recorder)
-        self.bot.client = self.client
-        await self.db.ensure_user(OWNER)
-        await self.db.add_credit(OWNER, 3600, note="test", validity_days=30)
-        self.item_id = await self.db.library_add(
-            OWNER, "booklet", 10, 20, None, title="📖 جزوهٔ Word — GMS-9"
-        )
-        await self.db.library_set_content(self.item_id, "متن جزوه برای فلش‌کارت")
-        # A transcript that must never appear in the booklet picker.
-        await self.db.library_add(OWNER, "transcript", 11, 21, None, title="متن خام")
-
-    async def asyncTearDown(self):
-        await self.bot.shutdown()
-        await self.db.close()
-        self._tmp.cleanup()
-
-    def _event(self, data: bytes, user_id: int = OWNER) -> FakeCallbackEvent:
-        event = FakeCallbackEvent(self.client, data=data, chat_id=user_id)
-        event.client = self.client
-        return event
-
-    @staticmethod
-    def _cards_payload(count: int) -> dict:
-        return {
-            "cards": [
-                {"front": f"پرسش {index}", "back": f"پاسخ {index}", "source": "بخش ۱"}
-                for index in range(count)
-            ]
-        }
-
-    async def spend_free_try(self, kind: str = "deck") -> None:
-        """Claim the gift up-front, so a test can exercise the paid path."""
-        self.assertTrue(await self.db.consume_free_use(OWNER, kind))
-
-    def _assert_failure_frame(self, text: str) -> None:
-        """A failed generation ends on the bar: fail headline, 🛑 and the hint."""
-        self.assertIn("ساخت فایل تعاملی ناموفق بود", text)
-        self.assertIn("🛑", text)
-        self.assertIn("کمی بعد دوباره امتحان کنید", text)
-
-    async def test_booklet_cards_with_a_retyped_locator_are_not_discarded(self):
-        """The production failure: «بخش 1» was not byte-identical to «بخش ۱»."""
-        payload = {
-            "cards": [
-                {"front": f"پرسش {index}", "back": f"پاسخ {index}", "source": "بخش 1"}
-                for index in range(10)
-            ]
-        }
-        with mock.patch(
-            "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=payload)
-        ) as generator:
-            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}:quick".encode()))
-        self.assertEqual(generator.await_count, 1)
-        decks = await self.db.decks_list(OWNER)
-        self.assertEqual(len(decks), 1)
-        cards = await self.db.deck_cards(decks[0]["deck_id"])
-        self.assertEqual(len(cards), 10)
-        self.assertEqual(len(await self.db.library_list_kind(OWNER, "flashcards")), 1)
-
-    async def test_a_fabricated_locator_is_never_stored_and_never_fails_the_deck(self):
-        """The chunk the model read *is* the source; the invented place is not."""
-        payload = {
-            "cards": [
-                {"front": f"پرسش {index}", "back": f"پاسخ {index}", "source": "صفحهٔ ۹۹"}
-                for index in range(6)
-            ]
-        }
-        with mock.patch(
-            "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=payload)
-        ) as generator:
-            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}:quick".encode()))
-        # The second call is the top-up for the four cards still missing, not a
-        # rejection of the first answer.
-        self.assertEqual(generator.await_count, 2)
-        cards = await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])
-        self.assertEqual(len(cards), 6)
-        self.assertTrue(all(card["source"] == "بخش ۱" for card in cards))
-        self.assertNotIn("صفحهٔ ۹۹", " ".join(card["source"] for card in cards))
-
-    async def test_chunk_progress_has_one_reporter_and_starts_before_completion(self):
-        from gamas_bot.doc_extract import DocChunk
-
-        chunks = [DocChunk(i, f"بخش {i}", (f"بخش {i}",), f"متن {i}") for i in range(4)]
-        edits = []
-        active_edits = 0
-        peak_edits = 0
-        completed = 0
-
-        async def edit(_placeholder, done, _total, *, stage):
-            nonlocal active_edits, peak_edits
-            active_edits += 1
-            peak_edits = max(peak_edits, active_edits)
-            edits.append((done, completed))
-            await asyncio.sleep(0.005)
-            active_edits -= 1
-
-        async def provider(*_args, **_kwargs):
-            nonlocal completed
-            await asyncio.sleep(0.02 + completed * 0.002)
-            completed += 1
-            return self._cards_payload(1)
-
-        with mock.patch.object(self.bot, "_progress_edit", side_effect=edit), \
-             mock.patch("gamas_bot.bot.complete_json", side_effect=provider):
-            await self.bot._generate_chunks(
-                kind="deck", chunks=chunks, counts=[1] * 4, placeholder=object(), stage="test"
-            )
-        self.assertEqual(peak_edits, 1)
-        self.assertEqual(edits[0], (0, 0))
-        self.assertEqual(edits[-1][0], 4)
-
-    async def test_manual_card_ceiling_shows_persian_notice(self):
-        self.bot.settings = replace(self.bot.settings, flashcard_max_cards_per_deck=1)
-        deck = await self.db.manual_deck_get_or_create(OWNER)
-        await self.db.deck_add_card(deck, "first", "answer", max_cards=1)
-        self.bot._pending_flashcard[OWNER] = (deck, "back")
-        self.bot._pending_flashcard_front[OWNER] = "second"
-        event = FakeMessageEvent(OWNER, "answer")
-        await self.bot._handle_flashcard_text(event, OWNER, "answer")
-        self.assertTrue(any("حداکثر تعداد کارت" in reply for reply in event.replies))
-        self.assertEqual(len(await self.db.deck_cards(deck)), 1)
-
-    def test_preset_cost_uses_exact_integer_rounding(self):
-        self.assertEqual(self.bot._preset_cost(5, 1, 2), 2)
-        self.assertEqual(self.bot._preset_cost(7, 1, 2), 4)
-        self.assertEqual(self.bot._preset_cost(10**20 + 1, 2, 2), 10**20 + 1)
-
-    async def test_global_learning_generation_concurrency_is_bounded(self):
-        from gamas_bot.doc_extract import DocChunk
-
-        active = 0
-        peak = 0
-        cards = [{"front": f"question {i}", "back": "answer", "source": "بخش ۱"} for i in range(5)]
-
-        async def generate(**_kwargs):
-            nonlocal active, peak
-            active += 1
-            peak = max(peak, active)
-            await asyncio.sleep(0.03)
-            active -= 1
-            return cards, 0
-
-        source = {"item_id": self.item_id, "doc_id": None, "title": "test", "chunks": [
-            DocChunk(0, "بخش ۱", ("بخش ۱",), "text")
-        ]}
-        with mock.patch.object(self.bot, "_claim_generation_budget", new=mock.AsyncMock(return_value=(False, False, None))), \
-             mock.patch.object(self.bot, "_generate_chunks", side_effect=generate):
-            await asyncio.gather(*(self.bot._generate_learning(
-                self._event(b"fc:hub", user_id=uid), user_id=uid, kind="deck",
-                source=source, wanted=5, cost=0, note="test", title="test"
-            ) for uid in (OWNER, OTHER, 777)))
-        self.assertEqual(peak, 2)
-
-    async def test_paid_deck_shortfall_refunds_pro_rata_automatically(self):
-        from gamas_bot.doc_extract import DocChunk
-
-        await self.spend_free_try("deck")
-        source = {"item_id": self.item_id, "doc_id": None, "title": "test", "chunks": [
-            DocChunk(0, "بخش ۱", ("بخش ۱",), "متن درس")
-        ]}
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(5))):
-            await self.bot._generate_learning(self._event(b"fc:hub"), user_id=OWNER, kind="deck",
-                                               source=source, wanted=20, cost=401, note="test", title="test")
-        # 5 of 20 cards delivered -> pro-rata refund of 15/20 of 401 = 301s.
-        self.assertEqual(await self.db.available_seconds(OWNER), 3600 - 401 + 301)
-        self.assertEqual((await self.db.db.execute_fetchall("SELECT status FROM learning_charges"))[0][0], "finalized")
-        refund = (await self.db.db.execute_fetchall(
-            "SELECT seconds, expires_at, note FROM ledger WHERE note LIKE 'refund: pro-rata%'"
-        ))[0]
-        self.assertEqual(refund[0], 301)
-        self.assertIsNotNone(refund[1])
-        self.assertEqual(len(await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])), 5)
-
-    async def test_source_pruned_mid_generation_still_persists_delivered_html(self):
-        await self.spend_free_try("deck")
-
-        async def prune_during_llm(*_args, **_kwargs):
-            await self.db.library_prune(OWNER, 0)
-            return self._cards_payload(6)
-
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=prune_during_llm)):
-            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
-        self.assertEqual(await self.db.deck_count(OWNER), 1)
-        self.assertEqual(len(await self.db.library_list_kind(OWNER, "flashcards")), 1)
-        charges = await self.db.db.execute_fetchall("SELECT status FROM learning_charges")
-        self.assertEqual(charges[0][0], "finalized")
-
-    async def test_progress_edit_failure_still_delivers_html_and_finalizes(self):
-        await self.spend_free_try("deck")
-        with mock.patch.object(FakeSentMessage, "edit", new=mock.AsyncMock(side_effect=RuntimeError("edit unavailable"))), mock.patch(
-            "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))
-        ):
-            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
-        charges = await self.db.db.execute_fetchall("SELECT status FROM learning_charges")
-        self.assertEqual(charges[0][0], "finalized")
-        self.assertEqual(await self.db.available_seconds(OWNER), 3300)
-        self.assertEqual(len(await self.db.library_list_kind(OWNER, "flashcards")), 1)
-
-    async def test_undelivered_html_refunds_paid_charge(self):
-        await self.spend_free_try("deck")
-        with (
-            mock.patch.object(
-                self.client, "send_file", new=mock.AsyncMock(side_effect=RuntimeError("send unavailable"))
-            ),
-            mock.patch(
-                "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))
-            ),
-        ):
-            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
-        charges = await self.db.db.execute_fetchall("SELECT status FROM learning_charges")
-        self.assertEqual(charges[0][0], "refunded")
-        self.assertEqual(await self.db.available_seconds(OWNER), 3600)
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
-
-    async def test_ai_generation_debits_and_builds_deck_and_html(self):
-        await self.spend_free_try("deck")
-        event = self._event(f"fc:go:{self.item_id}".encode())
-        with mock.patch(
-            "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=self._cards_payload(6)),
-        ) as generator:
-            await self.bot._handle_callback(event)
-            generator.assert_awaited_once()
-        self.assertEqual(await self.db.available_seconds(OWNER), 3300)
-        decks = await self.db.decks_list(OWNER)
-        self.assertEqual(len(decks), 1)
-        self.assertEqual(decks[0]["card_count"], 6)
-        self.assertTrue(decks[0]["title"].endswith("— فلش‌کارت"))
-        cards = await self.db.deck_cards(decks[0]["deck_id"])
-        self.assertEqual(cards[0]["front"], "پرسش 0")
-        html_items = await self.db.library_list_kind(OWNER, "flashcards")
-        self.assertEqual(len(html_items), 1)
-        blob = await self.db.library_file_blob(OWNER, html_items[0]["item_id"])
-        self.assertIsNotNone(blob)
-        self.assertIn("پرسش 0".encode("utf-8"), bytes(blob["content"]))
-
-    async def test_unlimited_user_generates_decks_for_free(self):
-        await self.db.set_unlimited(OWNER, True, admin_id=1, reason="vip")
-        event = self._event(f"fc:go:{self.item_id}".encode())
-        with mock.patch(
-            "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=self._cards_payload(6)),
-        ):
-            await self.bot._handle_callback(event)
-        debits = await self.db.db.execute_fetchall(
-            "SELECT COUNT(*) FROM ledger WHERE kind='debit'"
-        )
-        self.assertEqual(debits[0][0], 0)
-        self.assertEqual(len(await self.db.decks_list(OWNER)), 1)
-
-    async def test_start_screen_shows_cost_and_size(self):
-        event = self._event(f"fc:ai:{self.item_id}".encode())
-        await self.bot._handle_callback(event)
-        text = event.edits[-1]["text"]
-        self.assertIn("هزینهٔ معمول: ۲٬۷۷۸ اعتبار", text)
-        self.assertIn("نخستین مجموعه رایگان است", text)
-        self.assertIn("HTML آفلاین", text)
-
-    async def test_failure_refunds_and_short_output_refunds(self):
-        event = self._event(f"fc:go:{self.item_id}".encode())
-        with mock.patch(
-            "gamas_bot.bot.complete_json",
-            new=mock.AsyncMock(return_value=self._cards_payload(2)),  # < 5 valid
-        ):
-            await self.bot._handle_callback(event)
-        self.assertEqual(await self.db.available_seconds(OWNER), 3600)
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
-        self._assert_failure_frame(self.client.texts[-1]["text"])
-
-    async def test_insufficient_balance_denies_without_generation(self):
-        await self.spend_free_try("deck")
-        await self.db.db.execute("DELETE FROM ledger WHERE user_id=?", (OWNER,))
-        await self.db.db.commit()
-        event = self._event(f"fc:go:{self.item_id}".encode())
-        with mock.patch("gamas_bot.bot.complete_json") as generator:
-            await self.bot._handle_callback(event)
-            generator.assert_not_called()
-        self.assertIn(LEARNING_NO_CREDIT, self.client.texts[-1]["text"])
-
-    async def test_batch_insert_500_questions_preserves_order(self):
-        questions = [{"question": f"Question {i}", "options": ["a", "b", "c", "d"],
-                      "correct_index": 0, "explanation": ""} for i in range(500)]
-        session = await self.db.quiz_create_session(OWNER, self.item_id, questions)
-        rows = await self.db.db.execute_fetchall(
-            "SELECT idx, question FROM quiz_questions WHERE session_id=? ORDER BY idx", (session,)
-        )
-        self.assertEqual([(row[0], row[1]) for row in rows],
-                         [(i, f"Question {i}") for i in range(500)])
-
-    async def test_invalid_flashcard_preset_is_rejected_before_generation(self):
-        event = self._event(b"fc:go:1:bogus")
-        before = await self.db.available_seconds(OWNER)
-        await self.bot._handle_callback(event)
-        self.assertTrue(any(alert and "نامعتبر" in (message or "")
-                            for message, alert in event.answers))
-        self.assertEqual(await self.db.available_seconds(OWNER), before)
-        self.assertEqual(await self.db.decks_list(OWNER), [])
-
-    async def test_hub_empty_state_and_manual_guided_flow_with_disarm(self):
-        hub = self._event(b"fc:hub")
-        await self.bot._handle_callback(hub)
-        self.assertIn("هنوز فلش‌کارت تعاملی نساخته‌اید", hub.edits[-1]["text"])
-        # Arm the manual conversation.
-        await self.bot._handle_callback(self._event(b"fc:man"))
-        self.assertEqual(self.bot._pending_flashcard[OWNER][1], "front")
-        front = FakeMessageEvent(OWNER, "پرسش دستی یکم؟")
-        await self.bot._handle_message(front)
-        self.assertEqual(self.bot._pending_flashcard[OWNER][1], "back")
-        self.assertIn("پاسخ کارت", front.replies[-1])
-        back = FakeMessageEvent(OWNER, "پاسخ دستی یکم.")
-        await self.bot._handle_message(back)
-        self.assertIn("کارت اضافه شد (۱ کارت)", back.replies[-1])
-        deck_id = self.bot._pending_flashcard[OWNER][0]
-        # Finishing disarms and exports interactive HTML into Library.
-        done = self._event(b"fc:man:done")
-        await self.bot._handle_callback(done)
-        self.assertNotIn(OWNER, self.bot._pending_flashcard)
-        cards = await self.db.deck_cards(deck_id)
-        self.assertEqual(len(cards), 1)
-        self.assertEqual(cards[0]["front"], "پرسش دستی یکم؟")
-        lib_items = await self.db.library_list_kind(OWNER, "flashcards")
-        self.assertEqual(len(lib_items), 1)
-        blob = await self.db.library_file_blob(OWNER, lib_items[0]["item_id"])
-        self.assertIsNotNone(blob)
-        self.assertIn("پرسش دستی یکم؟".encode("utf-8"), bytes(blob["content"]))
-        # A stray text after a navigation tap never becomes a card.
-        await self.bot._handle_callback(self._event(b"fc:man"))
-        await self.bot._handle_callback(self._event(b"library"))
-        stray = FakeMessageEvent(OWNER, "این متن نباید کارت شود")
-        await self.bot._handle_message(stray)
-        self.assertEqual(len(await self.db.deck_cards(deck_id)), 1)
-
-    async def test_admin_command_disarms_an_armed_manual_flashcard_prompt(self):
-        admin_id = next(iter(self.settings.admin_ids))
-        await self.db.ensure_user(admin_id)
-        await self.bot._handle_callback(self._event(b"fc:man", user_id=admin_id))
-        self.assertEqual(self.bot._pending_flashcard[admin_id][1], "front")
-        # The admin command branches return before the generic disarm block;
-        # a malformed /grant (usage reply, no writes) must still disarm first.
-        await self.bot._handle_message(FakeMessageEvent(admin_id, "/grant"))
-        self.assertNotIn(admin_id, self.bot._pending_flashcard)
-        # The admin's next plain message must not be swallowed as a card.
-        follow_up = FakeMessageEvent(admin_id, "پیام مدیریتی معمولی")
-        await self.bot._handle_message(follow_up)
-        self.assertNotIn(admin_id, self.bot._pending_flashcard)
-        decks = await self.db.decks_list(admin_id)
-        self.assertEqual(len(decks), 1)  # the armed manual deck itself
-        self.assertEqual(await self.db.deck_cards(decks[0]["deck_id"]), [])
-
-    async def test_legacy_in_chat_study_callbacks_fail_closed_with_stale_alert(self):
-        deck_id = await self.db.deck_create(OWNER, None, "دسته دستی", "manual")
-        for index in range(3):
-            await self.db.deck_add_card(deck_id, f"پرسش {index}", f"پاسخ {index}")
-        for payload in (
-            f"fc:study:{deck_id}".encode(),
-            f"fc:flip:{deck_id}:1".encode(),
-            f"fc:next:{deck_id}".encode(),
-            f"fc:restart:{deck_id}".encode(),
-            f"fc:exp:{deck_id}".encode(),
-        ):
-            ev = self._event(payload)
-            await self.bot._handle_callback(ev)
-            self.assertEqual(ev.answers[-1][1], True)
-
-    async def test_flashcard_generation_requires_membership(self):
-        self.bot.subscription.settings = replace(self.bot.subscription.settings, subscription_required=True)
-        self.bot.subscription.db = self.db
-        async def nonmember(_user_id):
-            return "left"
-        self.bot.subscription._resolver = nonmember
-        event = self._event(f"fc:go:{self.item_id}".encode())
-        with mock.patch("gamas_bot.bot.complete_json") as generator:
-            await self.bot._handle_callback(event)
-            generator.assert_not_called()
-        self.assertFalse(self.client.deliveries)
-        self.assertTrue(
-            any("عضویت" in edit["text"] for edit in event.edits)
-            or any("عضویت" in record["text"] for record in self.client.texts)
-        )
-
-    async def test_manual_deck_export_delivers_interactive_html_and_stores_blob(self):
-        await self.bot._handle_callback(self._event(b"fc:man"))
-        await self.bot._handle_message(FakeMessageEvent(OWNER, "پرسش مهم؟"))
-        await self.bot._handle_message(FakeMessageEvent(OWNER, "پاسخ کامل"))
-        done = self._event(b"fc:man:done")
-        await self.bot._handle_callback(done)
-        html_paths = [
-            record["path"] for record in self.client.deliveries
-            if str(record["path"]).endswith(".html")
-        ]
-        self.assertTrue(html_paths)
-        # The temp file is removed after delivery.
-        self.assertFalse(Path(html_paths[-1]).exists())
-        payload = self.recorder.file_payloads[-1][1].decode("utf-8")
-        self.assertIn("پرسش مهم؟", payload)
-        self.assertIn("پاسخ کامل", payload)
-        self.assertIn('dir="rtl"', payload)
-        lib_items = await self.db.library_list_kind(OWNER, "flashcards")
-        self.assertEqual(len(lib_items), 1)
-        blob = await self.db.library_file_blob(OWNER, lib_items[0]["item_id"])
-        self.assertIsNotNone(blob)
-
-    async def test_library_delete_needs_confirmation_and_cascades_blob(self):
-        item_id = await self.db.library_record_delivered_file(
-            OWNER,
-            "flashcards",
-            title="دسته آزمون",
-            chat_id=OWNER,
-            message_id=99,
-            artifact_kind="flashcards_html",
-            filename="cards.html",
-            content_type="text/html; charset=utf-8",
-            content=b"<html></html>",
-        )
-        confirm = self._event(f"lib:del:{item_id}".encode())
-        await self.bot._handle_callback(confirm)
-        self.assertIn("مطمئن", confirm.edits[-1]["text"])
-        self.assertIsNotNone(await self.db.library_item(OWNER, item_id))
-        ok = self._event(f"lib:delok:{item_id}".encode())
-        await self.bot._handle_callback(ok)
-        self.assertIsNone(await self.db.library_item(OWNER, item_id))
-        self.assertIsNone(await self.db.library_file_blob(OWNER, item_id))
-
-    async def test_picker_lists_booklets_only(self):
-        picker = self._event(b"fc:pick:0")
-        await self.bot._handle_callback(picker)
-        payloads = menu_payloads(picker.edits[-1]["buttons"])
-        self.assertIn(f"fc:ai:{self.item_id}".encode(), payloads)
-        self.assertFalse(any(b"transcript" in payload for payload in payloads))
-
-    async def test_deck_cap_is_enforced(self):
-        await self.db.deck_create(OWNER, self.item_id, "یک", "ai")
-        await self.db.deck_create(OWNER, self.item_id, "دو", "ai")
-        event = self._event(f"fc:go:{self.item_id}".encode())
-        with mock.patch("gamas_bot.bot.complete_json") as generator:
-            await self.bot._handle_callback(event)
-            generator.assert_not_called()
-        self.assertTrue(any("حداکثر" in t["text"] for t in self.client.texts))
-
-    async def test_foreign_deck_callbacks_fail_closed(self):
-        deck_id = await self.db.deck_create(OWNER, None, "دسته", "manual")
-        event = self._event(f"fc:deck:{deck_id}".encode(), user_id=OTHER)
-        await self.bot._handle_callback(event)
-        self.assertEqual(event.answers[-1][1], True)
-
-
 class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -1002,8 +438,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("gamas_bot.bot.complete_json", new=provider):
             for count in (5, 10, 20):
                 await self.bot._generate_chunks(
-                    kind="quiz",
-                    chunks=[chunk],
+                                        chunks=[chunk],
                     counts=[1],
                     placeholder=mock.AsyncMock(),
                     requested_count=count,
@@ -1037,8 +472,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         self.bot.deps = deps.__class__(complete_json_fn=provider)
         try:
             items, failed = await self.bot._generate_chunks(
-                kind="quiz",
-                chunks=[DocChunk(0, "درس طولانی", ("درس طولانی",), source)],
+                                chunks=[DocChunk(0, "درس طولانی", ("درس طولانی",), source)],
                 counts=[1],
                 placeholder=mock.AsyncMock(),
                 requested_count=1,
@@ -1064,7 +498,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         ]}
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(5))):
             await self.bot._generate_learning(
-                self._event(b"quiz:hub"), user_id=OWNER, kind="quiz", source=source,
+                self._event(b"quiz:hub"), user_id=OWNER, source=source,
                 wanted=10, cost=401, note="test", title="test",
             )
         self.assertEqual(await self.db.available_seconds(OWNER), 3600 - 401 + 201)
@@ -1546,7 +980,7 @@ class QuizDifficultyPromptTests(unittest.TestCase):
         self.assertIn("سخت", prompt)
         # 40% of 10 = 4 medium, 6 hard (Persian digits).
         from gamas_bot.learning import learning_user_prompt
-        dynamic = learning_user_prompt("quiz", 10, (), "text")
+        dynamic = learning_user_prompt(10, (), "text")
         self.assertIn("۴ متوسط", dynamic)
         self.assertIn("۶ سخت", dynamic)
 
@@ -1587,8 +1021,8 @@ class QuizDifficultyPromptTests(unittest.TestCase):
         self.assertEqual(quiz_system_prompt(5), quiz_system_prompt(5))
         from gamas_bot.learning import learning_user_prompt
         self.assertEqual(quiz_system_prompt(5), quiz_system_prompt(15, sources=("other",)))
-        self.assertIn("۵ سؤال", learning_user_prompt("quiz", 5, (), ""))
-        self.assertIn("۱۵ سؤال", learning_user_prompt("quiz", 15, (), ""))
+        self.assertIn("۵ سؤال", learning_user_prompt(5, (), ""))
+        self.assertIn("۱۵ سؤال", learning_user_prompt(15, (), ""))
 
 
 class QuizDifficultyParserTests(unittest.TestCase):
@@ -1851,21 +1285,8 @@ class AnchoredQualityTests(unittest.TestCase):
         self.assertGreater(topic_importance_weight(short), topic_importance_weight("متن عادی کوتاه"))
         self.assertLess(topic_importance_weight(long_plain), topic_importance_weight(short))
 
-    def test_normalized_near_duplicates_drop_but_distinct_numbers_survive(self):
-        from gamas_bot.learning import dedupe_cards, dedupe_questions
-
-        cards = [
-            {"front": "کدام مولکول در مرحله ۱۲ تولید می‌شود؟", "back": "الف"},
-            {"front": "كدام مولكول در مرحله ۱۲ توليد مي شود؟", "back": "الف"},
-            {"front": "کدام مولکول در مرحله ۱۳ تولید می‌شود؟", "back": "ب"},
-        ]
-        self.assertEqual([card["back"] for card in dedupe_cards(cards)], ["الف", "ب"])
-        questions = [{"question": card["front"]} for card in cards]
-        self.assertEqual(len(dedupe_questions(questions)), 2)
-
     def test_new_generation_strictly_requires_sources_and_quiz_difficulty(self):
         card = {"cards": [{"front": "یک پرسش", "back": "یک پاسخ"}]}
-        self.assertEqual(parse_flashcard_payload(card, 1, require_source=True), [])
         legacy = quiz_payload(1)
         legacy["questions"][0].pop("difficulty")
         self.assertEqual(parse_quiz_payload(legacy, 1, require_difficulty=True, require_source=True), [])
@@ -1933,18 +1354,6 @@ class AnchoredQualityTests(unittest.TestCase):
         numeric = {**tagged, "source": 3}
         self.assertEqual(parse_quiz_payload({"questions": [numeric]}, 1)[0]["source"], "3")
 
-    def test_flashcard_source_is_required_by_default(self):
-        """Cards follow the same generation contract: no source, no card."""
-        card = {"cards": [{"front": "یک پرسش", "back": "یک پاسخ"}]}
-        self.assertEqual(parse_flashcard_payload(card, 1), [])
-        self.assertEqual(parse_flashcard_payload(card, 1, require_source=True), [])
-        self.assertEqual(
-            parse_flashcard_payload(card, 1, require_source=False),
-            [{"front": "یک پرسش", "back": "یک پاسخ"}],
-        )
-        anchored = {"cards": [{"front": "یک پرسش", "back": "یک پاسخ", "source": "بخش ۱"}]}
-        self.assertEqual(parse_flashcard_payload(anchored, 1)[0]["source"], "بخش ۱")
-
     def test_malformed_quiz_payload_shape_never_creates_questions(self):
         """Wrong container shapes and empty batches all parse to nothing."""
         for bad in ({}, {"questions": None}, {"questions": "x"}, {"questions": {}},
@@ -1952,18 +1361,6 @@ class AnchoredQualityTests(unittest.TestCase):
             self.assertEqual(parse_quiz_payload(bad, 3), [])
             if bad == []:
                 continue
-            self.assertEqual(parse_flashcard_payload(bad, 3), [])
-
-    def test_static_json_examples_and_dynamic_allowed_sources(self):
-        from gamas_bot.learning import flashcard_system_prompt, learning_user_prompt
-
-        for key, prompt, locator in (
-            ("cards", flashcard_system_prompt(10, sources=("اسلاید ۲",)), "اسلاید ۲"),
-            ("questions", quiz_system_prompt(5, sources=("بخش «مبحث»",)), "بخش «مبحث»"),
-        ):
-            example = json.loads(prompt[prompt.rindex('{"' + key + '"'):])
-            self.assertEqual(example[key][0]["source"], "نشانگر منبع")
-            self.assertIn(locator, learning_user_prompt("deck" if key == "cards" else "quiz", 5, (locator,), "text"))
 
     def test_difficulty_is_mapped_and_an_unknown_tag_drops_the_item(self):
         """A Persian label maps to its tag; an unrecognized tag is invalid."""
@@ -2020,17 +1417,6 @@ class AnchoredQualityTests(unittest.TestCase):
         # A chunk with no locator at all has nothing to verify against, so it
         # must not reject every item.
         self.assertTrue(source_matches("هرچیز", ()))
-
-    def test_a_numeric_source_is_read_instead_of_dropped(self):
-        card = {"cards": [{"front": "پرسش", "back": "پاسخ", "source": 3}]}
-        self.assertEqual(
-            parse_flashcard_payload(card, 1, require_source=True)[0]["source"], "3"
-        )
-        quiz = quiz_payload(1)
-        quiz["questions"][0]["source"] = 3
-        self.assertEqual(
-            parse_quiz_payload(quiz, 1, require_source=True)[0]["source"], "3"
-        )
 
     def test_anchor_items_never_stores_an_unverified_locator(self):
         """A mismatch is anchored to the chunk, a match keeps the chunk's name.
@@ -2094,27 +1480,6 @@ class AnchoredQualityTests(unittest.TestCase):
             [record["options"][record["correct_index"]] for record in parsed],
             ["سومی", "یکی"],
         )
-
-    def test_renamed_fields_are_read_instead_of_dropped(self):
-        """«explanation»/«question»/«answer» are the same fields by another name."""
-        quiz = {"questions": [{
-            "question": "کدام گزینه درست است؟",
-            "options": ["الف", "ب", "ج", "د"],
-            "correct": 1,
-            "explanation": "توضیح کوتاه.",
-            "source": "بخش ۱",
-            "difficulty": "medium",
-        }]}
-        parsed = parse_quiz_payload(quiz, 1, rng=random.Random(7))
-        self.assertEqual(len(parsed), 1)
-        self.assertEqual(parsed[0]["explanation"], "توضیح کوتاه.")
-        cards = {"cards": [
-            {"question": "پرسش یک", "answer": "پاسخ یک", "منبع": "بخش ۱"},
-        ]}
-        parsed_cards = parse_flashcard_payload(cards, 1)
-        self.assertEqual(parsed_cards, [
-            {"front": "پرسش یک", "back": "پاسخ یک", "source": "بخش ۱"},
-        ])
 
     def test_an_inner_page_marker_of_the_chunk_is_verifiable(self):
         """A booklet carries its own «[صفحهٔ ۲]» markers; citing one is grounded."""

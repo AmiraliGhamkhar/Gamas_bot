@@ -134,8 +134,6 @@ class _LearningFixture(unittest.IsolatedAsyncioTestCase):
             db_path=root / "learning.db",
             avalai_api_key="avalai-test-key",  # mocked generation fixture
             temp_dir=root / "tmp",
-            flashcard_ai_cost_seconds=300,
-            flashcard_ai_deck_size=6,
             quiz_cost_seconds_per_question=60,
         )
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -206,7 +204,7 @@ class LearningBarTests(_LearningFixture):
 
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
             await self.bot._generate_chunks(
-                kind="deck", chunks=chunks, counts=[1, 1], placeholder=progress
+                chunks=chunks, counts=[1, 1], placeholder=progress
             )
         self.assertTrue(recorder.frames)
         self.assertTrue(all("٪" in frame for frame in recorder.frames))
@@ -224,7 +222,7 @@ class LearningBarTests(_LearningFixture):
 
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
             await self.bot._generate_chunks(
-                kind="deck", chunks=chunks, counts=[1], placeholder=message
+                chunks=chunks, counts=[1], placeholder=message
             )
         self.assertTrue(message.frames)
         self.assertIn("٪", message.frames[0])

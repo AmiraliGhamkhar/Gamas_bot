@@ -50,6 +50,10 @@ APPLICATION_TABLES: frozenset[str] = frozenset(
         "quiz_sessions",
         "quiz_questions",
         "quiz_answers",
+        "study_packs",
+        "study_assets",
+        "reward_points_ledger",
+        # Historical flashcard tables (feature removed; data preserved).
         "flashcard_decks",
         "flashcards",
         "free_uses",

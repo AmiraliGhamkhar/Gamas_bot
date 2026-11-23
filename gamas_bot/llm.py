@@ -3374,7 +3374,6 @@ TASK_PROVIDER_ORDER = {
     "QUIZ_GENERATION": ("gemini", "avalai", "openrouter"),
     "QUIZ_20": ("avalai", "gemini", "openrouter"),
     "QUIZ_DIFFICULT": ("avalai", "gemini", "openrouter"),
-    "FLASHCARD_GENERATION": ("gemini", "avalai", "openrouter"),
     "OFFICE_TABLE_GENERATION": ("gemini", "avalai", "openrouter"),
     "OFFICE_SLIDE_PLANNING": ("gemini", "avalai", "openrouter"),
     "OFFICE_DOCUMENT_GENERATION": ("gemini", "avalai", "openrouter"),

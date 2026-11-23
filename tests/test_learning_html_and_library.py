@@ -18,7 +18,6 @@ from gamas_bot.bot import GamasBot
 from gamas_bot.db import MIGRATIONS_DIR, Database
 from gamas_bot.learning_html import (
     LearningHtmlRenderError,
-    render_flashcards_html,
     render_quiz_html,
 )
 from tests.support import FakeCallbackEvent, FakeTelegramClient, make_settings
@@ -143,50 +142,12 @@ class LearningHtmlRendererTests(unittest.TestCase):
                 )
                 self.assertEqual(proc.returncode, 0, proc.stderr)
 
-    def test_flashcards_html_is_offline_rtl_csp_validated_and_xss_safe(self) -> None:
-        artifact = render_flashcards_html(
-            "فلش‌کارت زیست‌شناسی",
-            self._sample_cards(),
-            source_title="جزوهٔ زیست",
-        )
-        self.assertTrue(artifact.filename.endswith(".html"))
-        validate_learning_html_artifact(artifact.content, expected_kind="flashcards")
-
-        html_text = artifact.content.decode("utf-8")
-        self.assertIn('lang="fa"', html_text)
-        self.assertIn('dir="rtl"', html_text)
-        self.assertNotIn("http://", html_text)
-        self.assertNotIn("https://", html_text)
-        self.assertNotIn("</script><b>test</b>", html_text)
-
-        payload = _extract_embedded_json(html_text)
-        self.assertEqual(payload["kind"], "flashcards")
-        self.assertEqual(len(payload["cards"]), 2)
-        self.assertEqual(payload["cards"][1]["source"], "فصل ۲")
-
-        if shutil.which("node"):
-            js_code = _extract_inline_script(html_text)
-            with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=True) as fh:
-                fh.write(js_code)
-                fh.flush()
-                proc = subprocess.run(
-                    ["node", "--check", fh.name],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-
     def test_empty_inputs_raise_render_error(self) -> None:
         with self.assertRaises(LearningHtmlRenderError):
             render_quiz_html("خالی", [])
-        with self.assertRaises(LearningHtmlRenderError):
-            render_flashcards_html("خالی", [])
 
     def test_validator_rejects_wrong_kind_external_url_and_tampered_script(self) -> None:
         quiz = render_quiz_html("آزمون", self._sample_questions())
-        with self.assertRaises(ValueError):
-            validate_learning_html_artifact(quiz.content, expected_kind="flashcards")
 
         tampered_url = quiz.content.replace(
             b"</body>", b'<img src="https://evil.example/tracker.png"></body>'
@@ -359,12 +320,7 @@ class CategorizedDeliveredLibraryTests(unittest.IsolatedAsyncioTestCase):
             content_type="text/html; charset=utf-8",
             content=quiz_html.content,
         )
-        # 3) Delivered interactive flashcards HTML with blob
-        fc_html = render_flashcards_html(
-            "فلش‌کارت فیزیولوژی",
-            LearningHtmlRendererTests._sample_cards(),
-            source_title="جزوهٔ فیزیولوژی",
-        )
+        # 3) Historical delivered flashcards HTML (counted in "other")
         fc_id = await self.db.library_record_delivered_file(
             OWNER,
             "flashcards",
@@ -372,9 +328,9 @@ class CategorizedDeliveredLibraryTests(unittest.IsolatedAsyncioTestCase):
             chat_id=OWNER,
             message_id=503,
             artifact_kind="flashcards_html",
-            filename=fc_html.filename,
+            filename="fc.html",
             content_type="text/html; charset=utf-8",
-            content=fc_html.content,
+            content=b"<html>historical flashcards</html>",
         )
         # 4) Delivered transcript ("other" tab)
         other_id = await self.db.library_record_delivered_file(
@@ -406,11 +362,10 @@ class CategorizedDeliveredLibraryTests(unittest.IsolatedAsyncioTestCase):
         payloads = menu_payloads(home_buttons)
         self.assertIn(b"lib:cat:booklet:0", payloads)
         self.assertIn(b"lib:cat:quiz:0", payloads)
-        self.assertIn(b"lib:cat:flashcards:0", payloads)
         self.assertIn(b"lib:cat:other:0", payloads)
         counts = await self.db.library_category_counts(OWNER)
         self.assertEqual(
-            counts, {"booklet": 1, "quiz": 1, "flashcards": 1, "other": 1, "total": 4}
+            counts, {"booklet": 1, "quiz": 1, "other": 2, "total": 4}
         )
 
         # Open Quizzes tab -> lists ONLY the quiz HTML item (1-click download + delete).
@@ -454,7 +409,7 @@ class CategorizedDeliveredLibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.db.library_file_blob(OWNER, quiz_id))
         self.assertEqual(
             await self.db.library_category_counts(OWNER),
-            {"booklet": 1, "quiz": 0, "flashcards": 1, "other": 1, "total": 3},
+            {"booklet": 1, "quiz": 0, "other": 2, "total": 3},
         )
 
 
