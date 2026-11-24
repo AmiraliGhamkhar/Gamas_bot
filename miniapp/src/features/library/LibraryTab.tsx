@@ -3,8 +3,16 @@ import { api, saveBlob, StudyAsset, StudyPack } from "../../api";
 import { formatDate, formatRelative, formatSize, toFa } from "../../lib/format";
 import { haptic } from "../../lib/telegram";
 import { useAsync } from "../../lib/useAsync";
+import { EcgLoader } from "../../ui/Ecg";
 import { Icon, IconName } from "../../ui/Icon";
-import { Button, Card, Chip, Progress, ScreenHeader, Segmented } from "../../ui/primitives";
+import {
+  Button,
+  Chip,
+  Group,
+  Row,
+  ScreenHeader,
+  Segmented,
+} from "../../ui/primitives";
 import { EmptyState, ErrorState, InlineNote, ListSkeleton } from "../../ui/states";
 
 const SOURCE_LABELS: Record<string, string> = {
@@ -76,11 +84,13 @@ function PackRow({
       type="button"
       onClick={onOpen}
       style={{ animationDelay: `${Math.min(index, 6) * 40}ms` }}
-      className="pressable card flex w-full items-center gap-3 p-4 text-right"
+      className="pressable flex w-full items-center gap-3 px-4 py-3.5 text-right"
     >
-      <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-field bg-surface2 text-muted">
-        <Icon name={pack.source_type === "audio" ? "audio" : pack.source_type === "video" ? "video" : "doc"} />
-      </span>
+      <Icon
+        name={pack.source_type === "audio" ? "audio" : pack.source_type === "video" ? "video" : "doc"}
+        size={20}
+        className="shrink-0 text-faint"
+      />
       <span className="min-w-0 flex-1">
         <span className="block truncate text-sm font-medium text-text">{pack.title}</span>
         <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-faint">
@@ -129,29 +139,23 @@ function AssetRow({
   };
 
   return (
-    <div className="flex items-center gap-3 py-3">
-      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-field bg-surface2 text-muted">
-        <Icon name={meta.icon} size={17} />
-      </span>
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-[13px] font-medium text-text">
-          {asset.title || meta.label}
-        </p>
-        <p className="mt-0.5 text-[11px] text-faint">
-          {meta.label} · {formatSize(asset.byte_size)}
-        </p>
-      </div>
-      <Button
-        variant="ghost"
-        icon={busy ? "refresh" : "download"}
-        onClick={download}
-        disabled={busy}
-        className="px-2.5 text-xs"
-        aria-label={`دانلود ${asset.title || meta.label}`}
-      >
-        {busy ? "…" : "دانلود"}
-      </Button>
-    </div>
+    <Row
+      icon={meta.icon}
+      title={asset.title || meta.label}
+      meta={`${meta.label} · ${formatSize(asset.byte_size)}`}
+      trailing={
+        <Button
+          variant="ghost"
+          icon={busy ? "refresh" : "download"}
+          onClick={download}
+          disabled={busy}
+          className="px-2.5 text-xs"
+          aria-label={`دانلود ${asset.title || meta.label}`}
+        >
+          {busy ? "…" : "دانلود"}
+        </Button>
+      }
+    />
   );
 }
 
@@ -232,48 +236,43 @@ function PackDetail({
       {pack && !detail.loading && !detail.error && (
         <>
           {pack.status === "processing" && (
-            <Card className="space-y-2">
-              <p className="text-xs text-muted">این بسته در حال پردازش است.</p>
-              <Progress value={1} total={3} label="در حال پردازش" />
+            <div className="space-y-3 rounded-card border border-line bg-surface p-4">
+              <p className="text-xs text-muted">
+                این بسته در حال آماده‌شدن است: بازکردن فایل، رونویسی و ساخت جزوه و
+                سؤال‌ها.
+              </p>
+              <EcgLoader label="در حال پردازش بسته" />
               <InlineNote>فایل‌ها به‌تدریج در همین صفحه ظاهر می‌شوند.</InlineNote>
-            </Card>
+            </div>
           )}
           {pack.status === "failed" && (
-            <Card className="border-bad/25 bg-badSoft/40">
+            <div className="rounded-card border border-bad/25 bg-badSoft/40 p-4">
               <p className="text-xs leading-6 text-bad">
                 پردازش این بسته کامل نشد. فایل اصلی را دوباره در ربات بفرستید تا نسخهٔ
                 سالم ساخته شود.
               </p>
-            </Card>
+            </div>
           )}
 
-          <section>
-            <h2 className="mb-2 px-1 text-[13px] font-medium text-muted">
-              فایل‌ها
-              {assets.length > 0 && (
-                <span className="nums mr-1.5 text-faint">({toFa(assets.length)})</span>
-              )}
-            </h2>
+          <Group title={`فایل‌ها${assets.length > 0 ? ` (${toFa(assets.length)})` : ""}`}>
             {assets.length === 0 ? (
-              <InlineNote>
-                هنوز فایلی برای این بسته آماده نشده است. پس از پایان پردازش، جزوه، متن
-                خام و سایر خروجی‌ها این‌جا فهرست می‌شوند.
-              </InlineNote>
+              <div className="px-4 py-3">
+                <InlineNote>
+                  هنوز فایلی برای این بسته آماده نشده است. پس از پایان پردازش، جزوه، متن
+                  خام و سایر خروجی‌ها این‌جا فهرست می‌شوند.
+                </InlineNote>
+              </div>
             ) : (
-              <Card className="divide-y divide-line2 p-0">
-                <div className="px-4">
-                  {assets.map((asset) => (
-                    <AssetRow
-                      key={asset.asset_id}
-                      asset={asset}
-                      packId={packId}
-                      onError={setActionError}
-                    />
-                  ))}
-                </div>
-              </Card>
+              assets.map((asset) => (
+                <AssetRow
+                  key={asset.asset_id}
+                  asset={asset}
+                  packId={packId}
+                  onError={setActionError}
+                />
+              ))
             )}
-          </section>
+          </Group>
 
           {questionCount > 0 && (
             <Button
@@ -387,7 +386,7 @@ export function LibraryTab({ onOpenReview }: { onOpenReview: (packId: number) =>
 
       {total === 0 ? (
         <EmptyState
-          icon="library"
+          emblem="book"
           title="کتابخانه خالی است"
           description="یک فایل صوتی، ویدیویی یا سند در ربات بفرستید تا بستهٔ مطالعاتی و خروجی‌هایش این‌جا ساخته شوند."
         />
@@ -426,12 +425,12 @@ export function LibraryTab({ onOpenReview }: { onOpenReview: (packId: number) =>
 
           {visible.length === 0 ? (
             <EmptyState
-              icon="search"
+              emblem="leaf"
               title="بسته‌ای با این عنوان پیدا نشد"
               description="عبارت دیگری را جستجو کنید."
             />
           ) : (
-            <div className="stagger space-y-2.5">
+            <Group listClassName="stagger">
               {visible.map((pack, index) => (
                 <PackRow
                   key={pack.pack_id}
@@ -443,7 +442,7 @@ export function LibraryTab({ onOpenReview }: { onOpenReview: (packId: number) =>
                   }}
                 />
               ))}
-            </div>
+            </Group>
           )}
         </>
       )}

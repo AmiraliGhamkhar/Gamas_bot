@@ -1,5 +1,20 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, PublicationStatus, ReviewQuestion } from "../../api";
+import { formatRelative, toFa } from "../../lib/format";
+import { haptic } from "../../lib/telegram";
+import { useAsync } from "../../lib/useAsync";
+import { Icon } from "../../ui/Icon";
+import {
+  Button,
+  Chip,
+  Group,
+  PaperCard,
+  PaperOption,
+  PaperOptionState,
+  Progress,
+  ScreenHeader,
+} from "../../ui/primitives";
+import { EmptyState, ErrorState, InlineNote, ListSkeleton } from "../../ui/states";
 
 /** The server's verdict plus the option this user actually picked. */
 interface ShownAnswer {
@@ -8,12 +23,6 @@ interface ShownAnswer {
   explanation: string;
   chosen_index: number;
 }
-import { formatRelative, toFa } from "../../lib/format";
-import { haptic } from "../../lib/telegram";
-import { useAsync } from "../../lib/useAsync";
-import { Icon } from "../../ui/Icon";
-import { Button, Card, Chip, Progress, ScreenHeader } from "../../ui/primitives";
-import { EmptyState, ErrorState, InlineNote, ListSkeleton } from "../../ui/states";
 
 const SOURCE_LABELS: Record<string, string> = {
   audio: "صوت",
@@ -39,55 +48,7 @@ function publicationMeta(status: PublicationStatus) {
   }
 }
 
-function OptionRow({
-  label,
-  index,
-  state,
-  disabled,
-  onPick,
-}: {
-  label: string;
-  index: number;
-  state: "idle" | "chosen" | "correct" | "wrong" | "muted";
-  disabled: boolean;
-  onPick: () => void;
-}) {
-  const styles: Record<typeof state, string> = {
-    idle: "border-line bg-surface2 text-text hover:bg-surface3",
-    chosen: "border-brand/60 bg-brandSoft text-text",
-    correct: "border-ok/50 bg-okSoft text-text",
-    wrong: "border-bad/50 bg-badSoft text-text",
-    muted: "border-line bg-surface text-muted opacity-70",
-  };
-  return (
-    <button
-      type="button"
-      onClick={onPick}
-      disabled={disabled}
-      className={`pressable flex w-full items-start gap-3 rounded-field border px-3.5 py-3 text-right text-[13px] leading-6 transition-colors ${styles[state]}`}
-    >
-      <span
-        className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border text-[10px] ${
-          state === "correct"
-            ? "border-ok bg-ok text-bg"
-            : state === "wrong"
-              ? "border-bad bg-bad text-bg"
-              : "border-line text-faint"
-        }`}
-        aria-hidden
-      >
-        {state === "correct" ? (
-          <Icon name="check" size={12} strokeWidth={3} />
-        ) : state === "wrong" ? (
-          <Icon name="close" size={12} strokeWidth={3} />
-        ) : (
-          toFa(index + 1)
-        )}
-      </span>
-      <span className="flex-1">{label}</span>
-    </button>
-  );
-}
+/* Options live on paper: ink borders, never the chrome's navy chips. */
 
 function QuestionView({
   question,
@@ -153,18 +114,21 @@ function QuestionView({
         <Progress value={position} total={total} label="پیشرفت مرور" />
       </div>
 
-      <Card className="space-y-4">
-        <p className="text-[14px] leading-7 text-text">{question.question}</p>
+      <PaperCard
+        tone={shown ? (shown.is_correct ? "ok" : "bad") : "brand"}
+        className="space-y-4"
+      >
+        <p className="text-[14px] leading-7 text-ink">{question.question}</p>
         <div className="space-y-2">
           {question.options.map((option, index) => {
-            let state: "idle" | "chosen" | "correct" | "wrong" | "muted" = "idle";
+            let state: PaperOptionState = "idle";
             if (shown) {
               if (index === shown.correct_index) state = "correct";
               else if (index === shown.chosen_index && !shown.is_correct) state = "wrong";
               else state = "muted";
             }
             return (
-              <OptionRow
+              <PaperOption
                 key={index}
                 label={option}
                 index={index}
@@ -179,31 +143,29 @@ function QuestionView({
         {shown && (
           <div
             className={`space-y-2 rounded-field px-3.5 py-3 ${
-              shown.is_correct ? "bg-okSoft" : "bg-badSoft"
+              shown.is_correct ? "bg-ok/12" : "bg-bad/12"
             }`}
             role="status"
           >
             <p
               className={`flex items-center gap-1.5 text-xs font-medium ${
-                shown.is_correct ? "text-ok" : "text-bad"
+                shown.is_correct ? "text-okInk" : "text-badInk"
               }`}
             >
               <Icon name={shown.is_correct ? "check" : "close"} size={15} />
               {shown.is_correct ? "پاسخ درست بود" : "پاسخ نادرست بود"}
               {!shown.is_correct && (
-                <span className="font-normal text-muted">
+                <span className="font-normal text-inkMuted">
                   · پاسخ درست: گزینهٔ {toFa(shown.correct_index + 1)}
                 </span>
               )}
             </p>
             {shown.explanation && (
-              <p className="text-[12px] leading-6 text-muted">{shown.explanation}</p>
+              <p className="text-[12px] leading-6 text-inkMuted">{shown.explanation}</p>
             )}
           </div>
         )}
-
-        {shareError && <InlineNote>{shareError}</InlineNote>}
-      </Card>
+      </PaperCard>
 
       <div className="flex items-center justify-between gap-2">
         {meta ? (
@@ -219,10 +181,12 @@ function QuestionView({
             onClick={share}
             className="mr-auto"
           >
-            {shareBusy ? "در حال ارسال…" : "ارسال به اکسپلور"}
+            {shareBusy ? "در حال ارسال…" : "ارسال به یک‌سؤال"}
           </Button>
         )}
       </div>
+
+      {shareError && <InlineNote>{shareError}</InlineNote>}
     </div>
   );
 }
@@ -280,7 +244,7 @@ function GroupView({
     return (
       <div className="space-y-4">
         <ScreenHeader title={title} onBack={onBack} />
-        <EmptyState icon="cards" title="سؤالی برای مرور نیست" />
+        <EmptyState emblem="flask" title="سؤالی برای مرور نیست" />
       </div>
     );
   }
@@ -422,7 +386,7 @@ export function ReviewTab({
 
       {groups.data && list.length === 0 && (
         <EmptyState
-          icon="review"
+          emblem="flask"
           title="هنوز سؤالی برای مرور ندارید"
           description="پس از پردازش فایل در ربات، سؤال‌ها به تفکیک بستهٔ مطالعاتی این‌جا گروه‌بندی می‌شوند."
         />
@@ -430,28 +394,28 @@ export function ReviewTab({
 
       {list.length > 0 && (
         <>
-          <Card className="grid grid-cols-3 gap-3">
-            <div>
+          <div className="grid grid-cols-3 divide-x divide-line2 rounded-card border border-line bg-surface">
+            <div className="px-4 py-3">
               <p className="text-[11px] text-faint">سؤال‌ها</p>
               <p className="nums mt-1 text-lg font-semibold text-text">
                 {toFa(totals.questions)}
               </p>
             </div>
-            <div>
+            <div className="px-4 py-3">
               <p className="text-[11px] text-faint">پاسخ‌داده</p>
               <p className="nums mt-1 text-lg font-semibold text-text">
                 {toFa(totals.answered)}
               </p>
             </div>
-            <div>
+            <div className="px-4 py-3">
               <p className="text-[11px] text-faint">درست</p>
               <p className="nums mt-1 text-lg font-semibold text-ok">
                 {toFa(totals.correct)}
               </p>
             </div>
-          </Card>
+          </div>
 
-          <div className="stagger space-y-2.5">
+          <Group listClassName="stagger">
             {list.map((group, index) => {
               const remaining = Math.max(0, group.question_count - group.answered_count);
               return (
@@ -464,7 +428,7 @@ export function ReviewTab({
                     setActiveKey(group.group_key);
                     setActiveTitle(group.title);
                   }}
-                  className="pressable card w-full space-y-2.5 p-4 text-right"
+                  className="pressable w-full space-y-2.5 px-4 py-3.5 text-right"
                 >
                   <span className="flex items-start justify-between gap-2">
                     <span className="min-w-0">
@@ -495,7 +459,7 @@ export function ReviewTab({
                 </button>
               );
             })}
-          </div>
+          </Group>
         </>
       )}
     </div>

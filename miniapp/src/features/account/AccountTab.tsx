@@ -4,7 +4,16 @@ import { formatDate, formatMoney, formatNumber, splitCredit, toFa } from "../../
 import { copyText, getTelegramUser, haptic, openTelegramLink, shareLink } from "../../lib/telegram";
 import { useAsync } from "../../lib/useAsync";
 import { Icon } from "../../ui/Icon";
-import { Button, Card, Chip, Divider, SectionTitle, Stat } from "../../ui/primitives";
+import {
+  Banner,
+  Button,
+  Chip,
+  Divider,
+  Group,
+  Row,
+  SectionTitle,
+  Sheet,
+} from "../../ui/primitives";
 import { EmptyState, ErrorState, InlineNote, ListSkeleton } from "../../ui/states";
 
 const PAYMENT_STATUS: Record<string, { label: string; tone: "neutral" | "brand" | "ok" | "bad" }> = {
@@ -18,7 +27,7 @@ const PAYMENT_STATUS: Record<string, { label: string; tone: "neutral" | "brand" 
 };
 
 function planLabel(plan: PlanOption): string {
-  return `${toFa(plan.hours)} ساعته`;
+  return `بستهٔ ${toFa(plan.hours)} ساعته`;
 }
 
 function validityLabel(days: number | null): string {
@@ -29,9 +38,13 @@ function validityLabel(days: number | null): string {
 export function AccountTab({
   me,
   onMeChanged,
+  onGoReview,
+  onGoLibrary,
 }: {
   me: MeResponse;
   onMeChanged: () => void;
+  onGoReview: () => void;
+  onGoLibrary: () => void;
 }) {
   const plan = useAsync(api.getPlan, []);
   const plans = useAsync(api.getPlans, []);
@@ -42,6 +55,7 @@ export function AccountTab({
 
   const [selectedPlan, setSelectedPlan] = useState<string | null>(null);
   const [copied, setCopied] = useState<"id" | "invite" | null>(null);
+  const [walletOpen, setWalletOpen] = useState(false);
   const [redeemState, setRedeemState] = useState<{
     code: string;
     message: string;
@@ -50,7 +64,7 @@ export function AccountTab({
 
   const tgUser = getTelegramUser();
   const displayName =
-    [tgUser.first_name, tgUser.last_name].filter(Boolean).join(" ") || "کاربر گاماس";
+    [tgUser.first_name, tgUser.last_name].filter(Boolean).join(" ") || "دانش‌آموز گاماس";
   const initial = displayName.trim().slice(0, 1) || "گ";
   const botUsername = me.bot_username || "Gamas_bot";
   const inviteLink = `https://t.me/${botUsername}?start=ref_${me.user_id}`;
@@ -106,8 +120,8 @@ export function AccountTab({
 
   return (
     <div className="space-y-5">
-      {/* Identity */}
-      <Card className="flex items-center gap-3.5">
+      {/* Identity — one flat row, hairline below. */}
+      <div className="flex items-center gap-3.5 border-b border-line2 pb-4">
         {tgUser.photo_url ? (
           <img
             src={tgUser.photo_url}
@@ -142,317 +156,375 @@ export function AccountTab({
             <span className="text-faint">{copied === "id" ? "کپی شد" : "شناسه"}</span>
           </button>
         </div>
-      </Card>
+      </div>
 
-      {/* Balance */}
-      <Card className="space-y-4">
+      {/* Balance — the screen's one navy banner. */}
+      <Banner>
         <div className="flex items-start justify-between gap-3">
           <div>
-            <p className="text-xs text-faint">اعتبار گاماس</p>
+            <p className="text-xs text-paper/70">اعتبار گاماس</p>
             <p className="mt-1.5 flex items-baseline gap-1.5">
-              <span className="nums text-[30px] font-semibold leading-none text-text">
+              <span className="nums text-[30px] font-semibold leading-none text-paper">
                 {unlimited ? "نامحدود" : credit.value}
               </span>
               {!unlimited && (
-                <span className="text-xs text-muted">
+                <span className="text-xs text-paper/70">
                   {credit.unit}
                   {credit.rest ? ` و ${credit.rest}` : ""}
                 </span>
               )}
             </p>
           </div>
-          <span className="flex h-9 w-9 items-center justify-center rounded-full bg-brandSoft text-brand">
-            <Icon name="clock" size={18} />
+          <button
+            type="button"
+            onClick={() => {
+              haptic("tap");
+              setWalletOpen(true);
+            }}
+            className="pressable -mt-1 inline-flex items-center gap-1.5 rounded-pill border border-brand/40 px-3 py-1.5 text-xs font-medium text-brand hover:bg-brandSoft"
+          >
+            <Icon name="wallet" size={15} />
+            خرید اشتراک
+          </button>
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-x-2.5 gap-y-1 pb-1.5 text-[11px] text-paper/70">
+          <span>
+            امتیاز پاداش: <span className="nums">{formatNumber(me.reward_points)}</span>
           </span>
+          <span aria-hidden>·</span>
+          <span>
+            {unlimited
+              ? "اعتبار نامحدود"
+              : plan.data?.expires_at
+                ? `فعال تا ${formatDate(plan.data.expires_at)}`
+                : "بدون انقضا"}
+          </span>
+          {currentPlan && !unlimited && (
+            <>
+              <span aria-hidden>·</span>
+              <span>
+                بستهٔ <span className="nums">{toFa(currentPlan.hours ?? 0)}</span> ساعته
+              </span>
+            </>
+          )}
         </div>
-        <Divider />
-        <div className="grid grid-cols-2 gap-3">
-          <Stat
-            label="امتیاز پاداش"
-            icon="spark"
-            value={formatNumber(me.reward_points)}
-            hint="جدا از اعتبار"
-          />
-          <Stat
-            label="اعتبار فعال تا"
-            icon="trend"
-            value={
-              unlimited
-                ? "بدون محدودیت"
-                : plan.data?.expires_at
-                  ? formatDate(plan.data.expires_at)
-                  : "بدون انقضا"
-            }
-            hint={currentPlan ? `پلن ${toFa(currentPlan.hours ?? 0)} ساعته` : undefined}
-          />
-        </div>
-      </Card>
+      </Banner>
 
-      {/* Subscription + purchase options */}
-      <section>
-        <SectionTitle
-          title="اشتراک"
-          hint="خرید و تأیید رسید در ربات گاماس انجام می‌شود."
+      {/* Study first: what to do here, before anything about money. */}
+      <Group title="ادامهٔ مطالعه">
+        <Row
+          icon="review"
+          title="ادامهٔ مرور"
+          meta="سؤال‌های ساخته‌شده از فایل‌های شما"
+          onClick={() => {
+            haptic("tap");
+            onGoReview();
+          }}
         />
-        {plans.loading && !plans.data && <ListSkeleton rows={1} />}
-        {plans.error && !plans.data && (
-          <ErrorState compact message={plans.error} onRetry={plans.reload} />
-        )}
-        {!plans.loading && !plans.error && options.length === 0 && (
-          <EmptyState
+        <Row
+          icon="library"
+          title="بسته‌های من"
+          meta="جزوه‌ها و خروجی‌ها"
+          onClick={() => {
+            haptic("tap");
+            onGoLibrary();
+          }}
+        />
+      </Group>
+
+      {/* Wallet and support — money lives in the sheet, not on the tab. */}
+      <Group title="گاماس">
+        <Row
+          icon="wallet"
+          title="کیف پول"
+          meta="اشتراک، امتیاز، پرداخت‌ها و دعوت"
+          onClick={() => {
+            haptic("tap");
+            setWalletOpen(true);
+          }}
+        />
+        <Row
+          icon="send"
+          title="پشتیبانی در ربات"
+          meta="پیگیری خرید و مشکلات"
+          onClick={() => {
+            haptic("tap");
+            openTelegramLink(`https://t.me/${botUsername}?start=support`);
+          }}
+        />
+        {sub.data?.channel_url && sub.data.required_channel && (
+          <Row
             icon="lock"
-            title="فروش اشتراک در حال حاضر فعال نیست"
-            description="به‌زودی بسته‌های اعتبار در همین بخش نمایش داده می‌شوند."
+            title={`عضویت در کانال ${sub.data.required_channel}`}
+            onClick={() => {
+              haptic("tap");
+              openTelegramLink(sub.data!.channel_url!);
+            }}
           />
         )}
-        {options.length > 0 && (
-          <Card className="space-y-3 p-3">
-            <div className="space-y-1.5" role="radiogroup" aria-label="بسته‌های اعتبار">
-              {options.map((option) => {
-                const active = chosenPlan?.code === option.code;
-                return (
-                  <button
-                    key={option.code}
-                    type="button"
-                    role="radio"
-                    aria-checked={active}
-                    onClick={() => {
-                      haptic("select");
-                      setSelectedPlan(option.code);
-                    }}
-                    className={`pressable flex w-full items-center gap-3 rounded-field border px-3 py-3 text-right transition-colors ${
-                      active
-                        ? "border-brand/60 bg-brandSoft"
-                        : "border-line bg-surface2 hover:bg-surface3"
-                    }`}
-                  >
-                    <span
-                      className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full border ${
-                        active ? "border-brand bg-brand text-brandInk" : "border-line"
+      </Group>
+
+      <p className="pt-1 text-center text-[10px] leading-5 text-faint">
+        اعتبار، پرداخت و امتیاز از سرور گاماس خوانده می‌شود.
+      </p>
+
+      <Sheet open={walletOpen} onClose={() => setWalletOpen(false)} title="کیف پول">
+        {/* Subscription */}
+        <section>
+          <SectionTitle
+            title="اشتراک"
+            hint="خرید و تأیید رسید در ربات گاماس انجام می‌شود."
+          />
+          {plans.loading && !plans.data && <ListSkeleton rows={1} />}
+          {plans.error && !plans.data && (
+            <ErrorState compact message={plans.error} onRetry={plans.reload} />
+          )}
+          {!plans.loading && !plans.error && options.length === 0 && (
+            <EmptyState
+              emblem="capsule"
+              title="فروش اشتراک در حال حاضر فعال نیست"
+              description="به‌زودی بسته‌های اعتبار در همین بخش نمایش داده می‌شوند."
+            />
+          )}
+          {options.length > 0 && (
+            <div className="space-y-3">
+              <div
+                className="divide-y divide-line2 overflow-hidden rounded-card border border-line bg-surface2"
+                role="radiogroup"
+                aria-label="بسته‌های اعتبار"
+              >
+                {options.map((option) => {
+                  const active = chosenPlan?.code === option.code;
+                  return (
+                    <button
+                      key={option.code}
+                      type="button"
+                      role="radio"
+                      aria-checked={active}
+                      onClick={() => {
+                        haptic("select");
+                        setSelectedPlan(option.code);
+                      }}
+                      className={`pressable flex w-full items-center gap-3 px-3 py-3 text-right transition-colors ${
+                        active ? "bg-brandSoft" : "hover:bg-surface3"
                       }`}
-                      aria-hidden
                     >
-                      {active && <Icon name="check" size={12} strokeWidth={3} />}
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="flex items-baseline justify-between gap-2">
-                        <span className="text-sm font-medium text-text">
-                          {planLabel(option)}
+                      <span
+                        className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full border ${
+                          active ? "border-brand bg-brand text-brandInk" : "border-line"
+                        }`}
+                        aria-hidden
+                      >
+                        {active && <Icon name="check" size={12} strokeWidth={3} />}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="flex items-baseline justify-between gap-2">
+                          <span className="text-sm font-medium text-text">
+                            {planLabel(option)}
+                          </span>
+                          <span className="nums text-sm font-semibold text-text">
+                            {formatMoney(option.price)}
+                          </span>
                         </span>
-                        <span className="nums text-sm font-semibold text-text">
-                          {formatMoney(option.price)}
+                        <span className="mt-0.5 flex items-center justify-between gap-2 text-[11px] text-faint">
+                          <span>{validityLabel(option.validity_days)}</span>
+                          {option.original_price && option.original_price > option.price && (
+                            <span className="nums line-through opacity-70">
+                              {formatMoney(option.original_price)}
+                            </span>
+                          )}
                         </span>
                       </span>
-                      <span className="mt-0.5 flex items-center justify-between gap-2 text-[11px] text-faint">
-                        <span>{validityLabel(option.validity_days)}</span>
-                        {option.original_price && option.original_price > option.price && (
-                          <span className="nums line-through opacity-70">
-                            {formatMoney(option.original_price)}
+                    </button>
+                  );
+                })}
+              </div>
+              {currentPlan && (
+                <p className="px-1 text-[11px] leading-5 text-faint">
+                  بستهٔ فعلی شما {toFa(currentPlan.hours ?? 0)} ساعته است؛ خرید جدید به
+                  اعتبار فعلی اضافه می‌شود.
+                </p>
+              )}
+              <Button
+                variant="primary"
+                block
+                icon="send"
+                disabled={!chosenPlan}
+                onClick={() => {
+                  haptic("tap");
+                  openTelegramLink(`https://t.me/${botUsername}?start=buy`);
+                }}
+              >
+                خرید در ربات
+              </Button>
+            </div>
+          )}
+        </section>
+
+        <Divider />
+
+        {/* Reward balance + redemption */}
+        <section>
+          <SectionTitle
+            title="امتیاز پاداش"
+            hint="امتیاز از پاسخ درست در یک‌سؤال به دست می‌آید."
+          />
+          <div className="divide-y divide-line2 overflow-hidden rounded-card border border-line bg-surface2">
+            <div className="flex items-center justify-between px-4 py-3">
+              <span className="text-sm text-muted">موجودی امتیاز</span>
+              <span className="nums text-xl font-semibold text-brand">
+                {formatNumber(me.reward_points)}
+              </span>
+            </div>
+            {catalog.loading && !catalog.data && (
+              <div className="px-4 py-3">
+                <div className="skeleton h-10 w-full" />
+              </div>
+            )}
+            {(catalog.data?.catalog ?? []).map((item) => {
+              const affordable = me.reward_points >= item.cost_points;
+              return (
+                <div key={item.code} className="space-y-1.5 px-4 py-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm text-text">{item.title}</p>
+                      <p className="nums text-[11px] text-faint">
+                        {formatNumber(item.cost_points)} امتیاز
+                        {!affordable && (
+                          <span className="mr-1 text-faint">
+                            · {formatNumber(item.cost_points - me.reward_points)} امتیاز کم
+                            دارید
                           </span>
                         )}
-                      </span>
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-            {currentPlan && (
-              <p className="px-1 text-[11px] leading-5 text-faint">
-                پلن فعلی شما {toFa(currentPlan.hours ?? 0)} ساعته است؛ خرید جدید به اعتبار
-                فعلی اضافه می‌شود.
-              </p>
-            )}
-            <Button
-              variant="primary"
-              block
-              icon="send"
-              disabled={!chosenPlan}
-              onClick={() => {
-                haptic("tap");
-                openTelegramLink(`https://t.me/${botUsername}?start=buy`);
-              }}
-            >
-              خرید در ربات
-            </Button>
-          </Card>
-        )}
-      </section>
-
-      {/* Referrals */}
-      <section>
-        <SectionTitle title="دعوت دوستان" hint="با هر دعوت موفق امتیاز هدیه بگیرید." />
-        {refs.error && !refs.data ? (
-          <ErrorState compact message={refs.error} onRetry={refs.reload} />
-        ) : (
-          <Card className="space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="flex items-center gap-2 text-sm text-text">
-                <Icon name="account" size={17} className="text-muted" />
-                دعوت موفق
-              </span>
-              <span className="nums text-lg font-semibold text-brand">
-                {refs.loading ? "…" : formatNumber(refs.data?.invited_count ?? 0)}
-              </span>
-            </div>
-            <Divider />
-            <div className="space-y-2">
-              <p
-                className="truncate rounded-field bg-surface2 px-3 py-2 text-[11px] text-faint"
-                dir="ltr"
-              >
-                {inviteLink}
-              </p>
-              <div className="flex gap-2">
-                <Button
-                  block
-                  icon="copy"
-                  onClick={() => copy(inviteLink, "invite")}
-                  aria-label="کپی لینک دعوت"
-                >
-                  {copied === "invite" ? "کپی شد" : "کپی لینک"}
-                </Button>
-                <Button
-                  block
-                  variant="primary"
-                  icon="share"
-                  onClick={() => {
-                    haptic("tap");
-                    shareLink(inviteLink, "به گاماس بپیوند؛ جزوه و مرور هوشمند درس‌ها");
-                  }}
-                >
-                  اشتراک‌گذاری
-                </Button>
-              </div>
-            </div>
-          </Card>
-        )}
-      </section>
-
-      {/* Reward balance + redemption */}
-      <section>
-        <SectionTitle title="امتیاز پاداش" hint="امتیاز از پاسخ درست در اکسپلور به دست می‌آید." />
-        <Card className="space-y-3">
-          <div className="flex items-center justify-between">
-            <span className="text-sm text-muted">موجودی</span>
-            <span className="nums text-xl font-semibold text-brand">
-              {formatNumber(me.reward_points)}
-            </span>
+                      </p>
+                    </div>
+                    <Button
+                      disabled={!affordable}
+                      onClick={() => redeem(item.code)}
+                      className="px-3 text-xs"
+                    >
+                      تبدیل
+                    </Button>
+                  </div>
+                  {redeemState?.code === item.code && (
+                    <p
+                      className={`text-[11px] leading-5 ${
+                        redeemState.ok ? "text-ok" : "text-bad"
+                      }`}
+                      role="status"
+                    >
+                      {redeemState.message}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
           </div>
           {catalog.error && !catalog.data && (
             <ErrorState compact message={catalog.error} onRetry={catalog.reload} />
           )}
-          {catalog.loading && !catalog.data && <div className="skeleton h-10 w-full" />}
           {!catalog.loading && !catalog.error && (catalog.data?.catalog.length ?? 0) === 0 && (
             <InlineNote>در حال حاضر جایزه‌ای برای تبدیل امتیاز تعریف نشده است.</InlineNote>
           )}
-          {(catalog.data?.catalog ?? []).map((item) => {
-            const affordable = me.reward_points >= item.cost_points;
-            return (
-              <div key={item.code} className="space-y-1.5">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="min-w-0">
-                    <p className="truncate text-sm text-text">{item.title}</p>
-                    <p className="nums text-[11px] text-faint">
-                      {formatNumber(item.cost_points)} امتیاز
-                      {!affordable && (
-                        <span className="mr-1 text-faint">
-                          · {formatNumber(item.cost_points - me.reward_points)} امتیاز کم
-                          دارید
-                        </span>
-                      )}
-                    </p>
-                  </div>
-                  <Button
-                    disabled={!affordable}
-                    onClick={() => redeem(item.code)}
-                    className="px-3 text-xs"
+        </section>
+
+        <Divider />
+
+        {/* Payment history */}
+        <section>
+          <SectionTitle title="تاریخچهٔ پرداخت" />
+          {pays.error && !pays.data ? (
+            <ErrorState compact message={pays.error} onRetry={pays.reload} />
+          ) : pays.loading && !pays.data ? (
+            <ListSkeleton rows={2} />
+          ) : (pays.data?.payments.length ?? 0) === 0 ? (
+            <EmptyState
+              emblem="chart"
+              title="پرداختی ثبت نشده است"
+              description="پس از خرید اشتراک، رسید و وضعیت آن در همین بخش دیده می‌شود."
+            />
+          ) : (
+            <div className="divide-y divide-line2 overflow-hidden rounded-card border border-line bg-surface2">
+              {(pays.data?.payments ?? []).map((payment) => {
+                const status =
+                  PAYMENT_STATUS[payment.status] ?? {
+                    label: payment.status,
+                    tone: "neutral" as const,
+                  };
+                return (
+                  <div
+                    key={payment.payment_id}
+                    className="flex items-center justify-between gap-3 px-4 py-3"
                   >
-                    تبدیل
+                    <div className="min-w-0">
+                      <p className="nums text-sm font-medium text-text">
+                        {formatMoney(payment.amount_toman)}
+                      </p>
+                      <p className="mt-0.5 text-[11px] text-faint">
+                        {formatDate(payment.created_at)}
+                      </p>
+                    </div>
+                    <Chip tone={status.tone} dot>
+                      {status.label}
+                    </Chip>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        <Divider />
+
+        {/* Referrals */}
+        <section>
+          <SectionTitle title="دعوت دوستان" hint="با هر دعوت موفق امتیاز هدیه بگیرید." />
+          {refs.error && !refs.data ? (
+            <ErrorState compact message={refs.error} onRetry={refs.reload} />
+          ) : (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between rounded-card border border-line bg-surface2 px-4 py-3">
+                <span className="flex items-center gap-2 text-sm text-text">
+                  <Icon name="account" size={17} className="text-muted" />
+                  دعوت موفق
+                </span>
+                <span className="nums text-lg font-semibold text-brand">
+                  {refs.loading ? "…" : formatNumber(refs.data?.invited_count ?? 0)}
+                </span>
+              </div>
+              <div className="space-y-2">
+                <p
+                  className="truncate rounded-field bg-surface2 px-3 py-2 text-[11px] text-faint"
+                  dir="ltr"
+                >
+                  {inviteLink}
+                </p>
+                <div className="flex gap-2">
+                  <Button
+                    block
+                    icon="copy"
+                    onClick={() => copy(inviteLink, "invite")}
+                    aria-label="کپی لینک دعوت"
+                  >
+                    {copied === "invite" ? "کپی شد" : "کپی لینک"}
+                  </Button>
+                  <Button
+                    block
+                    variant="primary"
+                    icon="share"
+                    onClick={() => {
+                      haptic("tap");
+                      shareLink(inviteLink, "به گاماس بپیوند؛ جزوه و مرور هوشمند درس‌ها");
+                    }}
+                  >
+                    اشتراک‌گذاری
                   </Button>
                 </div>
-                {redeemState?.code === item.code && (
-                  <p
-                    className={`text-[11px] leading-5 ${
-                      redeemState.ok ? "text-ok" : "text-bad"
-                    }`}
-                    role="status"
-                  >
-                    {redeemState.message}
-                  </p>
-                )}
               </div>
-            );
-          })}
-        </Card>
-      </section>
-
-      {/* Payment history */}
-      <section>
-        <SectionTitle title="تاریخچهٔ پرداخت" />
-        {pays.error && !pays.data ? (
-          <ErrorState compact message={pays.error} onRetry={pays.reload} />
-        ) : pays.loading && !pays.data ? (
-          <ListSkeleton rows={2} />
-        ) : (pays.data?.payments.length ?? 0) === 0 ? (
-          <EmptyState
-            icon="doc"
-            title="پرداختی ثبت نشده است"
-            description="پس از خرید اشتراک، رسید و وضعیت آن در همین بخش دیده می‌شود."
-          />
-        ) : (
-          <Card className="divide-y divide-line2 p-0">
-            {(pays.data?.payments ?? []).map((payment) => {
-              const status =
-                PAYMENT_STATUS[payment.status] ?? {
-                  label: payment.status,
-                  tone: "neutral" as const,
-                };
-              return (
-                <div
-                  key={payment.payment_id}
-                  className="flex items-center justify-between gap-3 px-4 py-3"
-                >
-                  <div className="min-w-0">
-                    <p className="nums text-sm font-medium text-text">
-                      {formatMoney(payment.amount_toman)}
-                    </p>
-                    <p className="mt-0.5 text-[11px] text-faint">
-                      {formatDate(payment.created_at)}
-                    </p>
-                  </div>
-                  <Chip tone={status.tone} dot>
-                    {status.label}
-                  </Chip>
-                </div>
-              );
-            })}
-          </Card>
-        )}
-      </section>
-
-      {/* Support + channel */}
-      <section className="space-y-2">
-        <Button
-          block
-          icon="send"
-          onClick={() => openTelegramLink(`https://t.me/${botUsername}?start=support`)}
-        >
-          پشتیبانی در ربات
-        </Button>
-        {sub.data?.channel_url && sub.data.required_channel && (
-          <Button
-            block
-            variant="ghost"
-            icon="lock"
-            onClick={() => openTelegramLink(sub.data!.channel_url!)}
-          >
-            عضویت در کانال {sub.data.required_channel}
-          </Button>
-        )}
-        <p className="pt-1 text-center text-[10px] leading-5 text-faint">
-          اعتبار، پرداخت و امتیاز از سرور گاماس خوانده می‌شود.
-        </p>
-      </section>
+            </div>
+          )}
+        </section>
+      </Sheet>
     </div>
   );
 }

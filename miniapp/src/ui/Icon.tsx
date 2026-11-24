@@ -29,6 +29,7 @@ export type IconName =
   | "cards"
   | "lock"
   | "clock"
+  | "wallet"
   | "search"
   | "trash"
   | "send";
@@ -165,6 +166,13 @@ const PATHS: Record<IconName, JSX.Element> = {
     <>
       <circle cx="12" cy="12" r="8.2" />
       <path d="M12 7.8V12l2.8 1.7" />
+    </>
+  ),
+  wallet: (
+    <>
+      <rect x="4.5" y="6.5" width="15" height="11.5" rx="2.6" />
+      <path d="M4.5 10.5h15" />
+      <path d="M15.4 14.2h4.1v3.1h-4.1a1.55 1.55 0 0 1 0-3.1z" />
     </>
   ),
   search: (

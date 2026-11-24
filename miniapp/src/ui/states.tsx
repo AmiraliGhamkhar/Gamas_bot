@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
-import { Icon, IconName } from "./Icon";
+import { Emblem, EmblemName } from "./Emblem";
+import { Icon } from "./Icon";
 import { Button } from "./primitives";
 
 /** A skeleton that mirrors the real card rhythm instead of a spinner blob. */
@@ -8,7 +9,7 @@ export function ListSkeleton({ rows = 3 }: { rows?: number }) {
     <div className="space-y-3" aria-busy="true" aria-live="polite">
       <span className="sr-only">در حال بارگذاری…</span>
       {Array.from({ length: rows }).map((_, index) => (
-        <div key={index} className="card space-y-3 p-4">
+        <div key={index} className="rounded-card border border-line bg-surface space-y-3 p-4">
           <div className="skeleton h-4 w-2/3" />
           <div className="skeleton h-3 w-1/3" />
         </div>
@@ -18,21 +19,20 @@ export function ListSkeleton({ rows = 3 }: { rows?: number }) {
 }
 
 export function EmptyState({
-  icon,
+  emblem,
   title,
   description,
   action,
 }: {
-  icon: IconName;
+  /** A booklet topic emblem — never a generic circle badge. */
+  emblem: EmblemName;
   title: string;
   description?: string;
   action?: ReactNode;
 }) {
   return (
-    <div className="card flex flex-col items-center gap-3 px-6 py-10 text-center">
-      <span className="flex h-12 w-12 items-center justify-center rounded-full bg-surface2 text-faint">
-        <Icon name={icon} size={22} />
-      </span>
+    <div className="rounded-card border border-line bg-surface flex flex-col items-center gap-3 px-6 py-10 text-center">
+      <Emblem name={emblem} size={52} />
       <div className="space-y-1">
         <p className="text-sm font-medium text-text">{title}</p>
         {description && (
@@ -58,7 +58,7 @@ export function ErrorState({
   return (
     <div
       role="alert"
-      className={`card border-bad/25 bg-badSoft/40 ${compact ? "p-3" : "p-4"}`}
+      className={`rounded-card border border-bad/25 bg-badSoft/40 ${compact ? "p-3" : "p-4"}`}
     >
       <div className="flex items-start gap-2.5">
         <Icon name="alert" size={18} className="mt-0.5 shrink-0 text-bad" />
