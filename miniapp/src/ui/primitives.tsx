@@ -1,5 +1,23 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import {
+  ButtonHTMLAttributes,
+  ReactNode,
+  useEffect,
+  useRef,
+} from "react";
+import { toFa } from "../lib/format";
+import { EcgRule } from "./Ecg";
 import { Icon, IconName } from "./Icon";
+
+/**
+ * The app's surface vocabulary (see `miniapp/DESIGN.md`):
+ *
+ *   chrome  — Card / Group rows: flat navy, hairline borders
+ *   paper   — PaperCard: warm cream, ink text, an ECG rule along the top
+ *   banner  — Banner: the booklet's navy banner register, one per screen
+ *
+ * Anything that looks like a setting or a record is a Row inside a Group, not
+ * a card; a card is reserved for things with real boundaries.
+ */
 
 export function Card({
   children,
@@ -10,7 +28,177 @@ export function Card({
   className?: string;
   as?: "div" | "section" | "article";
 }) {
-  return <Tag className={`card p-4 ${className}`}>{children}</Tag>;
+  return <Tag className={`rounded-card border border-line bg-surface p-4 ${className}`}>{children}</Tag>;
+}
+
+export function PaperCard({
+  children,
+  tone = "brand",
+  className = "space-y-4",
+}: {
+  children: ReactNode;
+  /** The ECG rule carries the verdict: brand while unanswered, ok/bad after. */
+  tone?: "brand" | "ok" | "bad";
+  className?: string;
+}) {
+  const ruleTone =
+    tone === "ok" ? "text-okInk" : tone === "bad" ? "text-badInk" : "text-trace";
+  return (
+    <div className="paper relative overflow-hidden">
+      <EcgRule className={`absolute inset-x-0 top-0 h-3 w-full ${ruleTone}`} />
+      <div className={`px-4 pb-4 pt-6 ${className}`}>{children}</div>
+    </div>
+  );
+}
+
+export function Banner({
+  children,
+  className = "",
+}: {
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div
+      className={`relative overflow-hidden rounded-card border border-line bg-banner ${className}`}
+    >
+      <div className="p-4">{children}</div>
+      <EcgRule className="absolute inset-x-0 bottom-0 h-3 w-full text-brand/70" />
+    </div>
+  );
+}
+
+/** A grouped list: section label plus flat rows on hairline dividers. */
+export function Group({
+  title,
+  children,
+  className = "",
+  listClassName = "",
+}: {
+  title?: string;
+  children: ReactNode;
+  className?: string;
+  /** Extra classes for the row container (e.g. "stagger" on a fresh list). */
+  listClassName?: string;
+}) {
+  return (
+    <section className={className}>
+      {title && (
+        <h2 className="mb-2 px-1 text-[13px] font-medium text-muted">{title}</h2>
+      )}
+      <div
+        className={`divide-y divide-line2 overflow-hidden rounded-card border border-line bg-surface ${listClassName}`}
+      >
+        {children}
+      </div>
+    </section>
+  );
+}
+
+/** One flat row of a Group: icon, title, meta, trailing control. */
+export function Row({
+  icon,
+  title,
+  meta,
+  trailing,
+  onClick,
+  className = "",
+}: {
+  icon?: IconName;
+  title: ReactNode;
+  meta?: ReactNode;
+  trailing?: ReactNode;
+  onClick?: () => void;
+  className?: string;
+}) {
+  const body = (
+    <>
+      {icon && <Icon name={icon} size={19} className="shrink-0 text-faint" />}
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium text-text">{title}</span>
+        {meta && <span className="mt-0.5 block truncate text-[11px] text-faint">{meta}</span>}
+      </span>
+      {trailing ?? (onClick ? <Icon name="forward" size={16} className="shrink-0 text-faint" /> : null)}
+    </>
+  );
+  const classes = `flex w-full items-center gap-3 px-4 py-3.5 text-right ${className}`;
+  return onClick ? (
+    <button type="button" onClick={onClick} className={`pressable ${classes}`}>
+      {body}
+    </button>
+  ) : (
+    <div className={classes}>{body}</div>
+  );
+}
+
+/**
+ * A bottom sheet over the current tab (chrome register). Money and settings
+ * live here so the tabs can stay about studying.
+ */
+export function Sheet({
+  open,
+  onClose,
+  title,
+  children,
+}: {
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  children: ReactNode;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open, onClose]);
+
+  if (!open) return null;
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      className="fixed inset-0 z-40 flex items-end justify-center"
+    >
+      <button
+        type="button"
+        aria-label="بستن"
+        onClick={onClose}
+        className="absolute inset-0 animate-fade bg-black/60"
+      />
+      <div
+        ref={panelRef}
+        className="safe-bottom relative max-h-[85vh] w-full max-w-md animate-sheet overflow-y-auto no-scrollbar rounded-t-[24px] border-t border-line bg-surface pb-4"
+      >
+        <div className="sticky top-0 z-10 flex items-center gap-3 border-b border-line2 bg-surface px-4 pb-3 pt-2.5">
+          <span
+            aria-hidden
+            className="absolute inset-x-0 top-1 mx-auto h-1 w-10 rounded-pill bg-line"
+          />
+          <h2 className="flex-1 pt-1 text-[15px] font-semibold text-text">{title}</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="بستن"
+            className="pressable flex h-9 w-9 items-center justify-center rounded-full text-muted hover:bg-surface2"
+          >
+            <Icon name="close" size={18} />
+          </button>
+        </div>
+        <div className="space-y-5 p-4">{children}</div>
+      </div>
+    </div>
+  );
 }
 
 export function SectionTitle({
@@ -42,20 +230,32 @@ const TONES: Record<Tone, string> = {
   bad: "border-bad/30 bg-badSoft text-bad",
 };
 
+const PAPER_TONES: Record<Tone, string> = {
+  neutral: "border-ink/15 bg-paper2 text-inkMuted",
+  brand: "border-trace/30 bg-trace/12 text-trace",
+  ok: "border-okInk/30 bg-ok/15 text-okInk",
+  bad: "border-badInk/30 bg-bad/15 text-badInk",
+};
+
 export function Chip({
   children,
   tone = "neutral",
   dot = false,
+  onPaper = false,
   className = "",
 }: {
   children: ReactNode;
   tone?: Tone;
   dot?: boolean;
+  /** Paper register: ink-based tones instead of the dark chrome ones. */
+  onPaper?: boolean;
   className?: string;
 }) {
   return (
     <span
-      className={`inline-flex items-center gap-1.5 rounded-pill border px-2.5 py-1 text-[11px] font-medium ${TONES[tone]} ${className}`}
+      className={`inline-flex items-center gap-1.5 rounded-pill border px-2.5 py-1 text-[11px] font-medium ${
+        onPaper ? PAPER_TONES[tone] : TONES[tone]
+      } ${className}`}
     >
       {dot && <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden />}
       {children}
@@ -232,4 +432,60 @@ export function Segmented<T extends string>({
 
 export function Divider() {
   return <div className="h-px w-full bg-line2" aria-hidden />;
+}
+
+/* --- paper quiz vocabulary (مرور and یک‌سؤال share it) ------------------- */
+
+export type PaperOptionState = "idle" | "chosen" | "correct" | "wrong" | "muted";
+
+const PAPER_OPTION_STYLES: Record<PaperOptionState, string> = {
+  idle: "border-ink/15 bg-paper2 text-ink hover:bg-paper",
+  chosen: "border-trace/60 bg-trace/10 text-ink",
+  correct: "border-ok/60 bg-ok/12 text-ink",
+  wrong: "border-bad/60 bg-bad/12 text-ink",
+  muted: "border-ink/10 text-inkMuted opacity-80",
+};
+
+/** One answer option on a paper card: ink borders, numbered in Persian. */
+export function PaperOption({
+  label,
+  index,
+  state,
+  disabled,
+  onPick,
+}: {
+  label: string;
+  index: number;
+  state: PaperOptionState;
+  disabled: boolean;
+  onPick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onPick}
+      disabled={disabled}
+      className={`pressable flex w-full items-start gap-3 rounded-field border px-3.5 py-3 text-right text-[13px] leading-6 transition-colors ${PAPER_OPTION_STYLES[state]}`}
+    >
+      <span
+        className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border text-[10px] ${
+          state === "correct"
+            ? "border-okInk bg-okInk text-paper"
+            : state === "wrong"
+              ? "border-badInk bg-badInk text-paper"
+              : "border-ink/25 text-inkMuted"
+        }`}
+        aria-hidden
+      >
+        {state === "correct" ? (
+          <Icon name="check" size={12} strokeWidth={3} />
+        ) : state === "wrong" ? (
+          <Icon name="close" size={12} strokeWidth={3} />
+        ) : (
+          toFa(index + 1)
+        )}
+      </span>
+      <span className="flex-1">{label}</span>
+    </button>
+  );
 }

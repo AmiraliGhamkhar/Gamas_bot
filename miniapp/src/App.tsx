@@ -1,4 +1,5 @@
 import { useCallback, useState } from "react";
+import monogram from "./assets/brand/monogram.png";
 import { api, MeResponse } from "./api";
 import { AccountTab } from "./features/account/AccountTab";
 import { ExploreTab } from "./features/explore/ExploreTab";
@@ -6,17 +7,32 @@ import { LibraryTab } from "./features/library/LibraryTab";
 import { ReviewTab } from "./features/review/ReviewTab";
 import { haptic, isInsideTelegram } from "./lib/telegram";
 import { useAsync } from "./lib/useAsync";
+import { EcgLoader } from "./ui/Ecg";
 import { Icon, IconName } from "./ui/Icon";
 import { ErrorState } from "./ui/states";
 
-type Tab = "account" | "library" | "review" | "explore";
+type Tab = "review" | "library" | "explore" | "account";
 
+/* Study first: the tab bar reads مرور · کتابخانه · یک‌سؤال · حساب من. */
 const TABS: { key: Tab; label: string; icon: IconName }[] = [
-  { key: "account", label: "حساب من", icon: "account" },
-  { key: "library", label: "کتابخانه", icon: "library" },
   { key: "review", label: "مرور", icon: "review" },
-  { key: "explore", label: "اکسپلور", icon: "explore" },
+  { key: "library", label: "کتابخانه", icon: "library" },
+  { key: "explore", label: "یک‌سؤال", icon: "explore" },
+  { key: "account", label: "حساب من", icon: "account" },
 ];
+
+function Monogram({ size = 56 }: { size?: number }) {
+  return (
+    <img
+      src={monogram}
+      alt="نشان گاماس"
+      width={size}
+      height={size}
+      className="rounded-[18px]"
+      style={{ width: size, height: size }}
+    />
+  );
+}
 
 function BottomNav({
   active,
@@ -27,7 +43,7 @@ function BottomNav({
 }) {
   return (
     <nav
-      className="fixed inset-x-0 bottom-0 z-20 border-t border-line bg-bg/95 backdrop-blur"
+      className="fixed inset-x-0 bottom-0 z-20 border-t border-line bg-bg"
       style={{ paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 6px)" }}
     >
       <div
@@ -74,10 +90,9 @@ function BottomNav({
 
 function Splash() {
   return (
-    <div className="flex min-h-[60vh] flex-col items-center justify-center gap-4" aria-busy="true">
-      <span className="flex h-14 w-14 items-center justify-center rounded-2xl bg-brandSoft text-2xl font-bold text-brand">
-        گ
-      </span>
+    <div className="flex min-h-[60vh] flex-col items-center justify-center gap-5" aria-busy="true">
+      <Monogram />
+      <EcgLoader label="در حال باز کردن گاماس" />
       <p className="text-xs text-faint">در حال باز کردن گاماس…</p>
     </div>
   );
@@ -85,8 +100,8 @@ function Splash() {
 
 export default function App() {
   const me = useAsync<MeResponse>(api.getMe, []);
-  const [tab, setTab] = useState<Tab>("account");
-  const [mounted, setMounted] = useState<Set<Tab>>(() => new Set<Tab>(["account"]));
+  const [tab, setTab] = useState<Tab>("review");
+  const [mounted, setMounted] = useState<Set<Tab>>(() => new Set<Tab>(["review"]));
   // A pack opened from the Library hands the Review tab its group to show.
   const [reviewPackId, setReviewPackId] = useState<number | null>(null);
 
@@ -114,8 +129,8 @@ export default function App() {
     if (!isInsideTelegram()) {
       return (
         <div className="mx-auto w-full max-w-md px-6 py-16 text-center">
-          <span className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-brandSoft text-2xl font-bold text-brand">
-            گ
+          <span className="mx-auto flex">
+            <Monogram />
           </span>
           <p className="mt-5 text-base font-semibold text-text">
             گاماس داخل تلگرام باز می‌شود
@@ -157,33 +172,52 @@ export default function App() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-md px-4 pb-28 pt-4">
-      {mounted.has("account") && (
-        <div role="tabpanel" aria-label="حساب من" hidden={tab !== "account"}>
-          <AccountTab me={currentUser} onMeChanged={reloadMe} />
-        </div>
-      )}
+    <div className="relative mx-auto w-full max-w-md px-4 pb-28 pt-4">
+      {/* On wide screens the navy void carries the monogram, quietly. */}
+      <div
+        aria-hidden
+        className="pointer-events-none fixed inset-0 z-0 hidden items-center justify-center sm:flex"
+      >
+        <img
+          src={monogram}
+          alt=""
+          className="h-[min(72vw,520px)] w-auto opacity-[0.035]"
+        />
+      </div>
 
-      {mounted.has("library") && (
-        <div role="tabpanel" aria-label="کتابخانه" hidden={tab !== "library"}>
-          <LibraryTab onOpenReview={openReviewForPack} />
-        </div>
-      )}
+      <div className="relative z-10">
+        {mounted.has("review") && (
+          <div role="tabpanel" aria-label="مرور" hidden={tab !== "review"}>
+            <ReviewTab
+              initialPackId={reviewPackId}
+              onConsumedInitial={() => setReviewPackId(null)}
+            />
+          </div>
+        )}
 
-      {mounted.has("review") && (
-        <div role="tabpanel" aria-label="مرور" hidden={tab !== "review"}>
-          <ReviewTab
-            initialPackId={reviewPackId}
-            onConsumedInitial={() => setReviewPackId(null)}
-          />
-        </div>
-      )}
+        {mounted.has("library") && (
+          <div role="tabpanel" aria-label="کتابخانه" hidden={tab !== "library"}>
+            <LibraryTab onOpenReview={openReviewForPack} />
+          </div>
+        )}
 
-      {mounted.has("explore") && (
-        <div role="tabpanel" aria-label="اکسپلور" hidden={tab !== "explore"}>
-          <ExploreTab onReward={reloadMe} />
-        </div>
-      )}
+        {mounted.has("explore") && (
+          <div role="tabpanel" aria-label="یک‌سؤال" hidden={tab !== "explore"}>
+            <ExploreTab onReward={reloadMe} />
+          </div>
+        )}
+
+        {mounted.has("account") && (
+          <div role="tabpanel" aria-label="حساب من" hidden={tab !== "account"}>
+            <AccountTab
+              me={currentUser}
+              onMeChanged={reloadMe}
+              onGoReview={() => changeTab("review")}
+              onGoLibrary={() => changeTab("library")}
+            />
+          </div>
+        )}
+      </div>
 
       <BottomNav active={tab} onChange={changeTab} />
     </div>

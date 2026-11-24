@@ -57,14 +57,19 @@ Ensure `.env` on the server includes:
 ## 6. Smoke Test Checklist (Post-Deploy)
 1. Send `/start` in the bot: one short message, one button. Press it and confirm
    `https://<your-domain>/app/` opens inside Telegram (Android, iOS, Desktop).
-2. Verify **My Account** loads `user_id`, `credit_seconds`, `reward_points`, referrals, and payments.
-3. Verify **Library** lists Study Packs and downloads an asset.
-4. Verify **Review** groups the user's questions by Study Pack and records an answer.
-5. Verify **Explore** loads one card (no total count/index shown), submits an answer,
+   The app opens on **مرور** (study first).
+2. Verify **حساب من** shows the identity row (`user_id`) and the balance banner
+   (`credit_seconds`, `reward_points`), and that the **«کیف پول»** sheet carries
+   plans, reward redemption, payments and referrals.
+3. Verify **کتابخانه** lists Study Packs and downloads an asset.
+4. Verify **مرور** groups the user's questions by Study Pack and records an answer
+   (the question sits on a cream paper card with the ECG rule).
+5. Verify **یک‌سؤال** loads one card (no total count/index shown), submits an answer,
    shows the points the server awarded, records engagement, and offers a new round
    at the end.
-6. Verify the four tabs are exactly حساب من / کتابخانه / مرور / اکسپلور, that RTL
-   text and Persian numerals render, and that «خرید در ربات» opens the bot's wallet.
+6. Verify the four tabs are exactly مرور / کتابخانه / یک‌سؤال / حساب من, that RTL
+   text and Persian numerals render, and that «خرید در ربات» (inside the
+   «کیف پول» sheet) opens the bot's wallet.
 
 ## 7. Rollback Instructions
 1. Restore the previous `miniapp/dist/` or git commit.

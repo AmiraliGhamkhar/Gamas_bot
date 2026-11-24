@@ -7,6 +7,9 @@ import App from "../App";
  * The smoke test walks the four tabs against the exact JSON shapes the backend
  * returns, so a contract drift between `api.ts` and the screens fails here
  * rather than inside somebody's Telegram client.
+ *
+ * The shell is study-first: it opens on مرور, and money lives behind the
+ * «کیف پول» sheet on حساب من.
  */
 
 const ME = {
@@ -187,36 +190,45 @@ describe("Gamas Mini App shell", () => {
     signIn();
   });
 
-  it("opens on the account tab with the four required tabs", async () => {
+  it("opens on Review with the four study-first tabs", async () => {
     installFetch();
+    const user = userEvent.setup();
     render(<App />);
 
-    expect(await screen.findByText("سارا")).toBeTruthy();
+    // Study first: the shell lands on مرور, never on the wallet.
+    const review = await screen.findByRole("tabpanel", { name: "مرور" });
+    expect(await within(review).findByText("جزوهٔ فصل سوم زیست")).toBeTruthy();
     expect(screen.getAllByRole("tab").map((node) => node.textContent)).toEqual([
-      "حساب من",
-      "کتابخانه",
       "مرور",
-      "اکسپلور",
+      "کتابخانه",
+      "یک‌سؤال",
+      "حساب من",
     ]);
 
+    await user.click(tab("حساب من"));
+    expect(await screen.findByText("سارا")).toBeTruthy();
     const account = screen.getByRole("tabpanel", { name: "حساب من" });
     expect(within(account).getByText("اعتبار گاماس")).toBeTruthy();
-    // 5400s arrives from /me; the card splits it into a big "۱" and its unit.
+    // 5400s arrives from /me; the banner splits it into a big "۱" and its unit.
     expect(within(account).getByText("ساعت و ۳۰ دقیقه")).toBeTruthy();
-    // reward_points is shown in the stat row and again in the rewards card.
+    // reward_points is shown in the balance banner.
     expect(within(account).getAllByText("۱۲۰", { selector: ".nums" }).length).toBeGreaterThan(0);
+
+    // Money lives behind the wallet sheet: plans, payments and invitations.
+    await user.click(within(account).getByText("کیف پول"));
     // Purchase options come from /plans; the price is never computed here.
-    expect((await screen.findAllByText("۴۹٬۰۰۰ تومان")).length).toBeGreaterThan(0);
-    expect(screen.getAllByText("۸۹٬۰۰۰ تومان").length).toBeGreaterThan(0);
-    expect(await screen.findByText("تأییدشده")).toBeTruthy();
-    expect(await screen.findByText("۳")).toBeTruthy();
+    // (The same amount also appears in the payment history row.)
+    expect((await within(account).findAllByText("۴۹٬۰۰۰ تومان")).length).toBeGreaterThan(0);
+    expect(within(account).getAllByText("۸۹٬۰۰۰ تومان").length).toBeGreaterThan(0);
+    expect(await within(account).findByText("تأییدشده")).toBeTruthy();
+    expect(await within(account).findByText("۳")).toBeTruthy();
   });
 
   it("lists study packs, opens a pack and reaches Review from it", async () => {
     const calls = installFetch();
     const user = userEvent.setup();
     render(<App />);
-    await screen.findByText("سارا");
+    await screen.findByRole("tab", { name: "حساب من" });
 
     await user.click(tab("کتابخانه"));
     const library = await screen.findByRole("tabpanel", { name: "کتابخانه" });
@@ -237,7 +249,7 @@ describe("Gamas Mini App shell", () => {
     installFetch();
     const user = userEvent.setup();
     render(<App />);
-    await screen.findByText("سارا");
+    await screen.findByRole("tab", { name: "حساب من" });
 
     await user.click(tab("مرور"));
     const review = await screen.findByRole("tabpanel", { name: "مرور" });
@@ -252,10 +264,10 @@ describe("Gamas Mini App shell", () => {
     const calls = installFetch();
     const user = userEvent.setup();
     render(<App />);
-    await screen.findByText("سارا");
+    await screen.findByRole("tab", { name: "حساب من" });
 
-    await user.click(tab("اکسپلور"));
-    const explore = await screen.findByRole("tabpanel", { name: "اکسپلور" });
+    await user.click(tab("یک‌سؤال"));
+    const explore = await screen.findByRole("tabpanel", { name: "یک‌سؤال" });
     expect(await within(explore).findByText("واحد ساختاری بدن چیست؟")).toBeTruthy();
     // No internal counts or scores are exposed to the user.
     expect(within(explore).queryByText(/۲۰۰|امتیاز داخلی/)).toBeNull();

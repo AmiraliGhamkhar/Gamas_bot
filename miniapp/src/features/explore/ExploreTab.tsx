@@ -3,9 +3,17 @@ import { api, ExploreAnswerResult, ExploreItem } from "../../api";
 import { toFa } from "../../lib/format";
 import { haptic } from "../../lib/telegram";
 import { useAsync } from "../../lib/useAsync";
+import { EcgLoader } from "../../ui/Ecg";
 import { Icon } from "../../ui/Icon";
-import { Button, Card, Chip, ScreenHeader } from "../../ui/primitives";
-import { EmptyState, ErrorState, InlineNote, ListSkeleton } from "../../ui/states";
+import {
+  Button,
+  Chip,
+  PaperCard,
+  PaperOption,
+  PaperOptionState,
+  ScreenHeader,
+} from "../../ui/primitives";
+import { EmptyState, ErrorState, ListSkeleton } from "../../ui/states";
 
 const TOPIC_LABELS: Record<string, string> = {
   biology: "زیست‌شناسی",
@@ -113,7 +121,7 @@ export function ExploreTab({ onReward }: { onReward: () => void }) {
   if (feed.error && !feed.data) {
     return (
       <div className="space-y-4">
-        <ScreenHeader title="اکسپلور" />
+        <ScreenHeader title="یک‌سؤال" />
         <ErrorState message={feed.error} onRetry={feed.reload} />
       </div>
     );
@@ -122,11 +130,11 @@ export function ExploreTab({ onReward }: { onReward: () => void }) {
     return (
       <div className="space-y-4">
         <ScreenHeader
-          title="اکسپلور"
+          title="یک‌سؤال"
           subtitle="سؤال‌های کوتاه برای مرور سریع در زمان‌های مرده."
         />
         <EmptyState
-          icon="explore"
+          emblem="network"
           title="فعلاً سؤالی برای نمایش نیست"
           description="با پاسخ دادن به سؤال‌های دیگر یا انتشار سؤال در بخش مرور، این فهرست پر می‌شود."
           action={
@@ -145,7 +153,7 @@ export function ExploreTab({ onReward }: { onReward: () => void }) {
   return (
     <div className="space-y-4">
       <ScreenHeader
-        title="اکسپلور"
+        title="یک‌سؤال"
         subtitle="یک سؤال، یک پاسخ، یک نکتهٔ تازه."
         actions={
           <span className="flex items-center gap-1 rounded-pill border border-line bg-surface px-2.5 py-1 text-[11px] text-muted">
@@ -156,93 +164,80 @@ export function ExploreTab({ onReward }: { onReward: () => void }) {
       />
 
       <div key={current.question_id} className="animate-rise space-y-3">
-        <Card className="space-y-4">
+        <PaperCard tone={result ? (result.is_correct ? "ok" : "bad") : "brand"} className="space-y-4">
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-1.5">
-              <Chip tone="brand">{topicLabel(current.topic)}</Chip>
-              <Chip>{DIFFICULTY_LABELS[current.difficulty] ?? current.difficulty}</Chip>
+              <Chip tone="brand" onPaper>
+                {topicLabel(current.topic)}
+              </Chip>
+              <Chip onPaper>{DIFFICULTY_LABELS[current.difficulty] ?? current.difficulty}</Chip>
             </div>
             {justEarned !== null && (
-              <span className="animate-pop flex items-center gap-1 text-[11px] font-medium text-ok">
+              /* The reward lands quietly: a teal line of text, not a coin jingle. */
+              <span className="animate-fade flex items-center gap-1 text-[11px] font-medium text-okInk">
                 <Icon name="spark" size={13} />
                 <span className="nums">+{toFa(justEarned)} امتیاز</span>
               </span>
             )}
           </div>
 
-          <p className="text-[15px] leading-8 text-text">{current.question_text}</p>
+          <p className="text-[15px] leading-8 text-ink">{current.question_text}</p>
 
           <div className="space-y-2">
             {current.options.map((option, optionIndex) => {
-              let tone = "border-line bg-surface2 text-text hover:bg-surface3";
-              let disabled = false;
+              let state: PaperOptionState = "idle";
               if (result) {
-                disabled = true;
-                if (optionIndex === result.correct_index) {
-                  tone = "border-ok/50 bg-okSoft text-text";
-                } else if (optionIndex === pickedOption && !result.is_correct) {
-                  tone = "border-bad/50 bg-badSoft text-text";
-                } else {
-                  tone = "border-line bg-surface text-muted opacity-70";
-                }
+                if (optionIndex === result.correct_index) state = "correct";
+                else if (optionIndex === pickedOption && !result.is_correct) state = "wrong";
+                else state = "muted";
               }
               return (
-                <button
+                <PaperOption
                   key={optionIndex}
-                  type="button"
-                  disabled={disabled || (submitting && !result)}
-                  onClick={() => answer(optionIndex)}
-                  className={`pressable flex w-full items-start gap-3 rounded-field border px-3.5 py-3 text-right text-[13px] leading-6 transition-colors ${tone}`}
-                >
-                  <span
-                    className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border text-[10px] ${
-                      result && optionIndex === result.correct_index
-                        ? "border-ok bg-ok text-bg"
-                        : result && optionIndex === pickedOption
-                          ? "border-bad bg-bad text-bg"
-                          : "border-line text-faint"
-                    }`}
-                    aria-hidden
-                  >
-                    {result && optionIndex === result.correct_index ? (
-                      <Icon name="check" size={12} strokeWidth={3} />
-                    ) : (
-                      toFa(optionIndex + 1)
-                    )}
-                  </span>
-                  <span className="flex-1">{option}</span>
-                </button>
+                  label={option}
+                  index={optionIndex}
+                  state={state}
+                  disabled={Boolean(result) || submitting}
+                  onPick={() => answer(optionIndex)}
+                />
               );
             })}
           </div>
 
           {submitting && !result && (
-            <p className="text-center text-[11px] text-faint">در حال ثبت پاسخ…</p>
+            <div className="flex flex-col items-center gap-1.5 py-1">
+              <EcgLoader label="در حال ثبت پاسخ" className="text-trace" />
+              <p className="text-[11px] text-inkMuted">در حال ثبت پاسخ…</p>
+            </div>
           )}
 
-          {error && <InlineNote>{error}</InlineNote>}
+          {error && (
+            <p className="rounded-field bg-bad/12 px-3 py-2 text-[11px] leading-6 text-badInk">
+              {error}
+            </p>
+          )}
 
           {result && (
             <div
               className={`animate-fade space-y-1.5 rounded-field px-3.5 py-3 ${
-                result.is_correct ? "bg-okSoft" : "bg-badSoft"
+                result.is_correct ? "bg-ok/12" : "bg-bad/12"
               }`}
               role="status"
             >
               <p
                 className={`flex items-center gap-1.5 text-xs font-medium ${
-                  result.is_correct ? "text-ok" : "text-bad"
+                  result.is_correct ? "text-okInk" : "text-badInk"
                 }`}
               >
                 <Icon name={result.is_correct ? "check" : "close"} size={15} />
                 {result.is_correct ? "درست!" : "پاسخ درست نبود"}
               </p>
               {result.explanation && (
-                <p className="text-[12px] leading-6 text-muted">{result.explanation}</p>
+                <p className="text-[12px] leading-6 text-inkMuted">{result.explanation}</p>
               )}
             </div>
           )}
-        </Card>
+        </PaperCard>
       </div>
 
       <div className="flex items-center gap-2 pb-1">

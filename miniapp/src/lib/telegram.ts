@@ -8,10 +8,21 @@ export interface TelegramUser {
   language_code?: string;
 }
 
+interface TelegramThemeParams {
+  bg_color?: string;
+  secondary_bg_color?: string;
+  text_color?: string;
+  hint_color?: string;
+  link_color?: string;
+  button_color?: string;
+  button_text_color?: string;
+}
+
 interface TelegramWebApp {
   initData?: string;
   initDataUnsafe?: { user?: TelegramUser; start_param?: string };
   colorScheme?: "light" | "dark";
+  themeParams?: TelegramThemeParams;
   version?: string;
   ready?: () => void;
   expand?: () => void;
@@ -48,7 +59,20 @@ export function isInsideTelegram(): boolean {
   return Boolean(root()?.initData);
 }
 
-/** One-time SDK boot: fill the screen, adopt our ink background, tame swipes. */
+/** The host's colour scheme; the app ships its own navy theme and only listens. */
+export function getColorScheme(): "light" | "dark" {
+  return root()?.colorScheme ?? "dark";
+}
+
+/** Raw theme params from the host — read for awareness, never mixed into ours. */
+export function getThemeParams(): TelegramThemeParams {
+  return root()?.themeParams ?? {};
+}
+
+/** Gamas navy ground: the Palette navy family darkened for the app chrome. */
+const APP_GROUND = "#03181F";
+
+/** One-time SDK boot: fill the screen, adopt our navy ground, tame swipes. */
 export function initTelegram(): void {
   const app = root();
   if (!app) return;
@@ -61,9 +85,14 @@ export function initTelegram(): void {
   };
   safe(app.ready);
   safe(app.expand);
-  safe(() => app.setHeaderColor?.("#0B0C0E"));
-  safe(() => app.setBackgroundColor?.("#0B0C0E"));
-  // Vertical swipes belong to the page (the Explore feed is a snap list).
+  safe(() => app.setHeaderColor?.(APP_GROUND));
+  safe(() => app.setBackgroundColor?.(APP_GROUND));
+  if (typeof document !== "undefined") {
+    document
+      .querySelector('meta[name="theme-color"]')
+      ?.setAttribute("content", APP_GROUND);
+  }
+  // Vertical swipes belong to the page (the یک‌سؤال feed is a snap list).
   if (app.isVersionAtLeast?.("7.7")) safe(app.disableVerticalSwipes);
 }
 
