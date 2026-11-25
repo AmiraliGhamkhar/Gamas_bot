@@ -3593,10 +3593,16 @@ class SectionWriter:
                 strict=self.settings.note_strict_grounding,
                 packed_topics=packed_topics if len(packed_topics) > 1 else (),
             )
+            # A packed body owns several topics, not just the first one. The
+            # plural topic marker makes the writer produce one section per
+            # topic; otherwise the model sees one label and silently drops the
+            # rest, leaving the verification pass to reconstruct them.
+            covered = part.covered_titles if len(part.covered_topic_ids) > 1 else ()
             if total == 1:
-                return build_chunk_message(body, index=1, total=1, header=(header or SINGLE_CHUNK_HEADER) + "\n" + metadata)
+                return build_chunk_message(body, index=1, total=1, topics=covered,
+                                           header=(header or SINGLE_CHUNK_HEADER) + "\n" + metadata)
             return build_chunk_message(body, index=index, total=total, topic=part_topic.title,
-                                       context_block=metadata, header=header)
+                                       topics=covered, context_block=metadata, header=header)
 
         try:
             result = await _structure_piece(

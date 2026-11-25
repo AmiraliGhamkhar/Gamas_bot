@@ -8,6 +8,7 @@ import time
 from unittest.mock import patch
 
 from gamas_bot import llm, llm_quota, notes as n
+from gamas_bot._prompt_block import CHUNK_TOPICS_PREFIX, PACKED_TOPIC_RULE
 from gamas_bot.booklet_verification import verify_and_repair
 from gamas_bot.config import (
     DEFAULT_NOTE_CONTEXT_TOKENS,
@@ -401,3 +402,57 @@ def test_pack_semantic_units_preserves_exact_source_offsets():
     assert 2 <= len(packed) < len(units)
     assert "".join(source.body(u) for u in packed) == document.text
     assert tuple(tid for u in packed for tid in u.covered_topic_ids) == tuple(u.topic_id for u in units)
+
+
+def _packed_topic_lines(messages: list[str]) -> list[list[str]]:
+    lines: list[list[str]] = []
+    for message in messages:
+        matches = [line for line in message.splitlines() if line.startswith(CHUNK_TOPICS_PREFIX)]
+        assert matches, "a packed request must list every topic it owns"
+        lines.append([title.strip() for title in matches[-1].split(":", 1)[1].split(" | ")])
+    return lines
+
+
+def test_packed_requests_name_every_topic_in_source_order(tmp_path):
+    """Packing many topics into one request must not hide all but the first."""
+    document = NormalizedDocument.from_source_text(lesson(240))
+    settings = _shipped_settings(tmp_path)
+    calls: list[str] = []
+
+    async def provider(_session, _settings, *, user, **_kwargs):
+        calls.append(user)
+        return {
+            "title": "چرخهٔ آب و اندازه\u200cگیری",
+            "sections": [{"heading": "بخش", "paragraphs": ["اندازه\u200cگیری در شرایط یکسان امکان مقایسهٔ مشاهده‌ها را فراهم می\u200cکند."]}],
+            "final_review": ["جمع\u200cبندی آزمایش."],
+        }
+
+    with patch.object(n, "complete_json", side_effect=provider):
+        asyncio.run(n.structure_document(document, settings, object()))
+
+    assert len(calls) == 3
+    expected = [topic.title for topic in plan_from_document(document).topics]
+    assert [title for group in _packed_topic_lines(calls) for title in group] == expected
+    assert all(len(group) == 2 for group in _packed_topic_lines(calls))
+    assert all(PACKED_TOPIC_RULE in message for message in calls)
+
+
+def test_single_request_with_packed_topics_names_all_of_them(tmp_path):
+    """A single-part request that owns several topics is not a one-topic lesson."""
+    document = NormalizedDocument.from_source_text(lesson(0))
+    settings = _shipped_settings(tmp_path)
+    calls: list[str] = []
+
+    async def provider(_session, _settings, *, user, **_kwargs):
+        calls.append(user)
+        return {
+            "title": "چرخهٔ آب و اندازه\u200cگیری",
+            "sections": [{"heading": "بخش", "paragraphs": ["اندازه\u200cگیری در شرایط یکسان امکان مقایسهٔ مشاهده‌ها را فراهم می\u200cکند."]}],
+            "final_review": ["جمع\u200cبندی آزمایش."],
+        }
+
+    with patch.object(n, "complete_json", side_effect=provider):
+        asyncio.run(n.structure_document(document, settings, object()))
+
+    assert len(calls) == 1
+    assert _packed_topic_lines(calls) == [[topic.title for topic in plan_from_document(document).topics]]
