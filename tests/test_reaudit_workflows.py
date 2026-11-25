@@ -71,19 +71,21 @@ class LearningChargeRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0][0], 1)
 
     async def test_artifact_and_paid_finalization_commit_or_rollback_together(self):
-        await self.db.spend_seconds(OWNER, 300, "fc-pending:1", operation_id="deck")
+        await self.db.spend_seconds(OWNER, 300, "quiz-pending:1", operation_id="quiz")
         with self.assertRaises(ValueError):
             await self.db.quiz_create_session(
-                OWNER, self.item_id, "بدون پاسخ", [{"front": "پرسش"}], paid_charge_id="deck"
+                OWNER, self.item_id, [{"question": "بدون گزینه"}], paid_charge_id="quiz"
             )
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
+        self.assertEqual(await self.db.library_count_kind(OWNER, "quiz"), 0)
         self.assertEqual(await self.db.recover_pending_learning_charges(), 1)
         with self.assertRaises(ValueError):
             await self.db.quiz_create_session(
-                OWNER, self.item_id, "بازپرداخت‌شده", [{"front": "پ", "back": "ج"}],
-                paid_charge_id="deck",
+                OWNER, self.item_id,
+                [{"question": "بازپرداخت‌شده", "options": ["a", "b", "c", "d"],
+                  "correct_index": 0}],
+                paid_charge_id="quiz",
             )
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
+        self.assertEqual(await self.db.library_count_kind(OWNER, "quiz"), 0)
         self.assertEqual(await self.db.available_seconds(OWNER), 2_000)
 
     async def test_prorata_refund_failure_rolls_back_artifact_and_credit(self):
@@ -103,19 +105,13 @@ class LearningChargeRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
                 with mock.patch.object(self.db, "_refund_debit_locked", side_effect=fail_after_credit):
                     with self.assertRaises(sqlite3.OperationalError):
-                        if kind == "deck":
-                            await self.db.quiz_create_session(
-                                OWNER, self.item_id, "deck", [{"front": "q", "back": "a"}],
-                                paid_charge_id=kind, refund_seconds_value=100,
-                            )
-                        else:
-                            await self.db.quiz_create_session(
-                                OWNER, self.item_id,
-                                [{"question": "q", "options": ["a", "b", "c", "d"],
-                                  "correct_index": 0}],
-                                paid_charge_id=kind, refund_seconds_value=100,
-                            )
-                for table in ("flashcard_decks", "flashcards", "quiz_sessions", "quiz_questions"):
+                        await self.db.quiz_create_session(
+                            OWNER, self.item_id,
+                            [{"question": "q", "options": ["a", "b", "c", "d"],
+                              "correct_index": 0}],
+                            paid_charge_id=kind, refund_seconds_value=100,
+                        )
+                for table in ("quiz_sessions", "quiz_questions"):
                     rows = await self.db.db.execute_fetchall(f"SELECT COUNT(*) FROM {table}")
                     self.assertEqual(rows[0][0], 0)
                 self.assertEqual((await self.db.db.execute_fetchall(
@@ -166,7 +162,6 @@ class CurationFixture(unittest.IsolatedAsyncioTestCase):
         await self.db.connect()
         await self.db.ensure_user(OWNER)
         await self.db.add_credit(OWNER, 1_000, note="credit")
-        await self.db.consume_free_use(OWNER, "deck")
         await self.db.consume_free_use(OWNER, "quiz")
         self.item = await self.db.library_add(OWNER, "booklet", OWNER, 10, title="درس")
         await self.db.library_set_content(self.item, "تنفس سلولی در میتوکندری انجام می‌شود.")
@@ -185,14 +180,16 @@ class CurationFixture(unittest.IsolatedAsyncioTestCase):
 
 class PaidCurationTests(CurationFixture):
     async def test_unlimited_change_between_checks_does_not_consume_a_free_try(self):
-        await self.db.refund_free_use(OWNER, "deck")
+        await self.db.refund_free_use(OWNER, "quiz")
         await self.db.set_unlimited(OWNER, True, admin_id=1)
         # Simulate the initial check racing with an admin's committed change;
         # the transaction must recheck the real account status.
         with mock.patch.object(self.db, "is_unlimited", new=mock.AsyncMock(return_value=False)):
-            budget = await self.bot._claim_generation_budget(self.press(b"fc:go:1"), OWNER, "deck", 300, "test")
+            budget = await self.bot._claim_generation_budget(
+                self.press(b"quiz:go:1:5"), OWNER, "quiz", 300, "test"
+            )
         self.assertEqual(budget, (False, False, None))
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        self.assertTrue((await self.db.free_use_state(OWNER))["quiz"])
         self.assertEqual(await self.db.available_seconds(OWNER), 1_000)
 
     async def test_refund_failure_is_reported_and_recovered_on_restart(self):
@@ -202,7 +199,7 @@ class PaidCurationTests(CurationFixture):
                 self.db, "refund_learning_charge", side_effect=sqlite3.OperationalError("database unavailable")
             ),
         ):
-            await self.bot._handle_callback(self.press(f"fc:go:{self.item}".encode()))
+            await self.bot._handle_callback(self.press(f"quiz:go:{self.item}:5".encode()))
         frames = [m["text"] for m in self.client.texts]
         self.assertTrue(any("فعلاً ناموفق" in f for f in frames), frames)
         self.assertEqual(await self.db.available_seconds(OWNER), 700)
@@ -212,20 +209,17 @@ class PaidCurationTests(CurationFixture):
     async def test_unlimited_failure_does_not_claim_a_gift_was_restored(self):
         await self.db.set_unlimited(OWNER, True, admin_id=1)
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=RuntimeError("provider down"))):
-            await self.bot._handle_callback(self.press(f"fc:go:{self.item}".encode()))
+            await self.bot._handle_callback(self.press(f"quiz:go:{self.item}:5".encode()))
         frames = [m["text"] for m in self.client.texts]
         self.assertFalse(any("هدیه" in f for f in frames), frames)
 
-    async def test_saved_paid_deck_and_quiz_are_not_refunded_on_restart(self):
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(6))):
-            await self.bot._handle_callback(self.press(f"fc:go:{self.item}".encode()))
+    async def test_saved_paid_quiz_is_not_refunded_on_restart(self):
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(5))):
             await self.bot._handle_callback(self.press(f"quiz:go:{self.item}:5".encode()))
-        self.assertEqual(await self.db.available_seconds(OWNER), 400)
+        # 1 000 s of credit minus the 300 s five-question preset.
+        self.assertEqual(await self.db.available_seconds(OWNER), 700)
         self.assertEqual(await self.db.recover_pending_learning_charges(), 0)
-        self.assertEqual(await self.db.deck_count(OWNER), 1)
         self.assertEqual(len(await self.db.db.execute_fetchall("SELECT * FROM quiz_sessions")), 1)
-        self.assertEqual(await self.db.library_count_kind(OWNER, "flashcards"), 1)
         self.assertEqual(await self.db.library_count_kind(OWNER, "quiz"), 1)
 
     async def test_cancel_during_committed_save_never_refunds_paid_artifact(self):
@@ -242,12 +236,12 @@ class PaidCurationTests(CurationFixture):
             mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(6))),
             mock.patch.object(self.db, "quiz_create_session", side_effect=save_then_wait),
         ):
-            task = asyncio.create_task(self.bot._handle_callback(self.press(f"fc:go:{self.item}".encode())))
+            task = asyncio.create_task(self.bot._handle_callback(self.press(f"quiz:go:{self.item}:5".encode())))
             await asyncio.wait_for(committed.wait(), 2)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
-        self.assertEqual(await self.db.deck_count(OWNER), 1)
+        self.assertEqual(len(await self.db.db.execute_fetchall("SELECT * FROM quiz_sessions")), 1)
         self.assertEqual(await self.db.available_seconds(OWNER), 700)
         self.assertEqual(await self.db.recover_pending_learning_charges(), 0)
 
@@ -285,7 +279,7 @@ class CallbackAnswerTests(CurationFixture):
             await unblock.wait()
             return quiz_payload(6)
 
-        event = OneShotCallback(self.client, data=f"fc:go:{self.item}".encode(), chat_id=OWNER)
+        event = OneShotCallback(self.client, data=f"quiz:go:{self.item}:5".encode(), chat_id=OWNER)
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
             task = asyncio.create_task(self.bot._handle_callback(event))
             await asyncio.wait_for(entered.wait(), 2)
@@ -555,10 +549,8 @@ class LearningProgressTests(CurationFixture):
     async def test_learning_chunk_concurrency_honors_the_configured_range(self):
         """Quizzes run ``learning_chunk_concurrency`` chunks at a time.
 
-        Decks deliberately serialize chunk calls (one provider request at a
-        time) so their peak is honest about that; the same provider must still
-        answer from the chunk whose text appears in the prompt, because the
-        dedupe boundary appends prior stems.
+        The provider must answer from the chunk whose text appears in the
+        prompt, because the dedupe boundary appends previous stems to it.
         """
         from dataclasses import replace
 
@@ -612,7 +604,11 @@ class LearningProgressTests(CurationFixture):
             await asyncio.sleep(0.01)
             chunk = next(item for item in chunks if item.text in kwargs["user"])
             calls.append(chunk.index)
-            return {"cards": [{"front": f"پرسش {chunk.index}", "back": "پاسخ", "source": chunk.locator}]}
+            return {"questions": [
+                {"question": f"پرسش {chunk.index}", "options": ["الف", "ب", "ج", "د"],
+                 "correct": 0, "explain": "چرا", "difficulty": "medium",
+                 "source": chunk.locator}
+            ]}
 
         with mock.patch("gamas_bot.bot.LEARNING_PROGRESS_EDIT_TIMEOUT_SECONDS", 0.05), \
              mock.patch.object(self.bot, "_progress_edit", side_effect=progress), \

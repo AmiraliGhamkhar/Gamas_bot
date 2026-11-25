@@ -1,5 +1,11 @@
 # Phase 8 — Booklet regression and rollout report
 
+> **Historical audit — not current documentation.** This page records one earlier
+> checkout and the measurements taken on it. Line numbers, file inventories,
+> test counts, migration numbers and "planned" phases may no longer match the
+> code. Current operator guides live in [docs/](../docs/README.md); treat
+> `gamas_bot/` as the source of truth.
+
 **Decision:** Candidate for controlled staging/canary after the offline gate. Live provider latency, quota entitlement, cost, and human educational quality remain unverified; do not treat this report as production sign-off. No deployment, push, or production-data changes were performed.
 
 ## Changes and compatibility

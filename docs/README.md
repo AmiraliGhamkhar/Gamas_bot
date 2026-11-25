@@ -36,13 +36,21 @@ examples assume you activated the virtualenv (`source .venv/bin/activate`).
 | [Testing](TESTING.md) | Offline gates on Windows and cPanel/Linux, smoke checklist |
 | [Development](DEVELOPMENT.md) | Architecture, code map, migration and dependency rules |
 | [Booklet design](BOOKLET_DESIGN.md) | Design tokens, components, cover artwork, DOCX/PDF pipelines and visual QA |
+| [Mini App design](../miniapp/DESIGN.md) | The Mini App design law: tokens, surfaces, motion and the enforced lint rules |
+| [Mini App deployment](DEPLOY_MINIAPP.md) | Build, cPanel/Passenger placement, BotFather menu button, smoke test, rollback |
 | [Changelog](CHANGELOG.md) | Latest release notes |
 
 ## Other documentation
 
-- [Audit report](../AUDIT/REPORT.md), [architecture](../AUDIT/architecture.md)
-  and [working notes](../AUDIT/notes.md) are a historical audit, not a current
-  security certification. Its generated evidence logs are not tracked.
+- Every page under [AUDIT/](../AUDIT/) is a **historical snapshot** of one earlier
+  checkout, not current documentation and not a security certification. Its
+  generated evidence logs are not tracked; read `gamas_bot/` and these guides
+  instead, and re-run the checks before relying on any finding.
+- [API contract](../API_CONTRACT.md), [architecture](../ARCHITECTURE.md) and
+  [database design](../DATABASE_DESIGN.md) describe the current code surface.
+- [Production readiness](PRODUCTION_READINESS.md) is a historical verification
+  record from one earlier checkout; its §7 residual-risk list is still current,
+  its test counts are not.
 - [Test fixtures](../tests/fixtures/README.md) describes the synthetic corpus
   and private-audio guidance.
 

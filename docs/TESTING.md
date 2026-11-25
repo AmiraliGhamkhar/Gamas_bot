@@ -22,6 +22,17 @@ python -m unittest discover -s tests -q
 python -m gamas_bot.media_worker check
 ```
 
+The Mini App has its own gate (Node 20+, run from `miniapp/`):
+
+```bash
+cd miniapp && npm ci && npm test && npm run build
+```
+
+`npm test` is vitest + jsdom and walks all four tabs against the real JSON
+shapes; `npm run build` is `tsc -b && vite build` and is what actually ships to
+`/app`. CI covers the Python suite only, so a red `npm test` is only visible if
+someone runs it.
+
 Also run the workflow's **Migration integrity (fresh v3 database)** Python
 block: create a temporary `Database`, connect, compare applied SQL filenames
 with `MIGRATIONS_DIR`, compare the exact application table set with
@@ -149,6 +160,6 @@ Run `python -m scripts.booklet_regression_bench --compile --repeats 250` and
 repeat with `--fault --jobs 3` to exercise bounded retries, fallback and
 incomplete repair. This benchmark fakes model replies but uses real routing,
 quota, verification and PDF/Word rendering. Estimated tokens, timing, peak RSS
-and exact source-key scores describe only the synthetic workload. See the
-[Phase 8 technical report](../AUDIT/PHASE_8_ROLLOUT.md) for the comparisons and
-rollout gates.
+and exact source-key scores describe only the synthetic workload. The
+[Phase 8 technical report](../AUDIT/PHASE_8_ROLLOUT.md) is a **historical
+snapshot** of one earlier checkout; re-measure before quoting its numbers.

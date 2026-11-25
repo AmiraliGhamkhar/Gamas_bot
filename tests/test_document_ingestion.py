@@ -23,7 +23,7 @@ from tests.support import (
     FakeTelegramClient,
     make_settings,
 )
-from tests.test_doc_extract import make_docx_bytes, make_pdf_bytes, make_pptx_bytes
+from tests.test_doc_extract import make_docx_bytes, make_pdf_bytes
 from tests.test_learning import quiz_payload
 
 OWNER = 707
@@ -173,7 +173,7 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("chunks_json", metadata)
         self.assertGreater(metadata["text_chars"], 0)
         with mock.patch.object(self.db, "document_get", side_effect=AssertionError("large read")):
-            await self.bot._show_document_generate_screen(self.press(b"menu:main"), OWNER, document["id"], "deck")
+            await self.bot._show_document_generate_screen(self.press(b"menu:main"), OWNER, document["id"], "quiz")
             await self.bot._show_document_card(self.press(b"menu:main"), OWNER, document["id"])
 
     async def test_oversized_document_is_rejected_before_download(self):

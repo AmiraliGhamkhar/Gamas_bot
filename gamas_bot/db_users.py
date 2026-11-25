@@ -16,11 +16,11 @@ class UsersRepositoryMixin(DatabaseCore):
     # Provided by ``BillingRepositoryMixin``. Declared as an annotation only:
     # assigning a body here would shadow the real method through the MRO.
     _refresh_balance_locked: Any
-    FREE_USE_COLUMNS: dict[str, str] = {
-        "deck": "free_deck_used",
-        "quiz": "free_quiz_used",
-    }
-    FREE_CLAIM_COLUMNS: dict[str, str] = {"deck": "deck_claim", "quiz": "quiz_claim"}
+    #: The free-first-try gift exists for quizzes only. Flashcards (and the
+    #: second "deck" gift they came with) were removed; migration 043 drops the
+    #: retired columns, so no code path may name them again.
+    FREE_USE_COLUMNS: dict[str, str] = {"quiz": "free_quiz_used"}
+    FREE_CLAIM_COLUMNS: dict[str, str] = {"quiz": "quiz_claim"}
 
     async def user_exists(self, telegram_id: int) -> bool:
         """Whether this Telegram account has ever used the bot."""
@@ -421,12 +421,12 @@ class UsersRepositoryMixin(DatabaseCore):
     async def free_use_state(self, user_id: int) -> dict[str, bool]:
         rows = await _rows(
             self.read_db,
-            "SELECT free_deck_used, free_quiz_used FROM free_uses WHERE user_id = ?",
+            "SELECT free_quiz_used FROM free_uses WHERE user_id = ?",
             (int(user_id),),
         )
         if not rows:
-            return {"deck": True, "quiz": True}
-        return {"deck": not int(rows[0][0]), "quiz": not int(rows[0][1])}
+            return {"quiz": True}
+        return {"quiz": not int(rows[0][0])}
 
     async def consume_free_use(
         self,
@@ -441,8 +441,8 @@ class UsersRepositoryMixin(DatabaseCore):
         now = iso(self._now())
         async with self._transaction():
             await self.db.execute(
-                "INSERT OR IGNORE INTO free_uses(user_id, free_deck_used, "
-                "free_quiz_used, updated_at) VALUES (?, 0, 0, ?)",
+                "INSERT OR IGNORE INTO free_uses(user_id, free_quiz_used, "
+                "updated_at) VALUES (?, 0, ?)",
                 (int(user_id), now),
             )
             guard = (
@@ -506,13 +506,13 @@ class UsersRepositoryMixin(DatabaseCore):
         now = iso(self._now())
         async with self._transaction():
             await self.db.execute(
-                "INSERT OR IGNORE INTO free_uses(user_id, free_deck_used, "
-                "free_quiz_used, updated_at) VALUES (?, 0, 0, ?)",
+                "INSERT OR IGNORE INTO free_uses(user_id, free_quiz_used, "
+                "updated_at) VALUES (?, 0, ?)",
                 (int(user_id), now),
             )
             await self.db.execute(
-                "UPDATE free_uses SET free_deck_used = 0, free_quiz_used = 0, "
-                "deck_claim = NULL, quiz_claim = NULL, updated_at = ? WHERE user_id = ?",
+                "UPDATE free_uses SET free_quiz_used = 0, "
+                "quiz_claim = NULL, updated_at = ? WHERE user_id = ?",
                 (now, int(user_id)),
             )
             await self.db.execute(

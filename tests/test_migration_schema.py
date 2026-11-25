@@ -154,14 +154,23 @@ class MigrationSchemaTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
             )
             self.assertEqual(len(rows), 1, table)
-        # The free-use flags are booleans by construction, not by convention.
+        # The free-use flag is a boolean by construction, not by convention.
         await self.db.ensure_user(11)
         with self.assertRaises(sqlite3.IntegrityError):
             await self.db._write(
-                "INSERT INTO free_uses(user_id, free_deck_used, free_quiz_used, "
-                "updated_at) VALUES (?, 2, 0, '2026-01-01')",
+                "INSERT INTO free_uses(user_id, free_quiz_used, "
+                "updated_at) VALUES (?, 2, '2026-01-01')",
                 (11,),
             )
+        # Migration 043 dropped the retired flashcard gift for good: the columns
+        # of a removed feature must not linger in the live schema.
+        columns = {
+            hit[1]
+            for hit in await self.db.db.execute_fetchall("PRAGMA table_info(free_uses)")
+        }
+        self.assertEqual(
+            columns, {"user_id", "free_quiz_used", "quiz_claim", "updated_at"}
+        )
         # A document cannot claim a source type the extractor cannot produce.
         with self.assertRaises(sqlite3.IntegrityError):
             await self.db._write(
@@ -215,7 +224,7 @@ class PopulatedUpgradeTests(unittest.IsolatedAsyncioTestCase):
                 "INSERT INTO documents(user_id,file_msg_ref,title,source_type,page_count,sha256,text,chunks_json,"
                 "library_item_id,created_at) VALUES (?, '1:2','سند','pdf',1,'hash','متن','[]',100,'2026-01-01')", (owner,)
             )
-            conn.execute("INSERT INTO free_uses(user_id,free_deck_used,updated_at) VALUES (?,1,'2026-01-01')", (owner,))
+            conn.execute("INSERT INTO free_uses(user_id,free_quiz_used,updated_at) VALUES (?,1,'2026-01-01')", (owner,))
             conn.commit()
             conn.close()
 
@@ -229,7 +238,7 @@ class PopulatedUpgradeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(rows[0][0], "صفحهٔ ۱")
                 self.assertEqual((await db.db.execute_fetchall("SELECT COUNT(*) FROM quiz_answers"))[0][0], 1)
                 self.assertEqual((await db.document_get(owner, 1))["library_item_id"], 100)
-                self.assertFalse((await db.free_use_state(owner))["deck"])
+                self.assertFalse((await db.free_use_state(owner))["quiz"])
                 self.assertEqual((await db.db.execute_fetchall("PRAGMA foreign_keys"))[0][0], 1)
                 if not replay:
                     # Simulate a crash after the rebuild COMMIT but before the

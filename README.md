@@ -1,8 +1,8 @@
 # Gamas Bot
 
 Persian Telegram study assistant: turn lecture audio, video, PowerPoint or
-documents into a transcript, a right-to-left Word/PDF booklet, quizzes,
-flashcards and Office exports.
+documents into a transcript, a right-to-left Word/PDF booklet, multiple-choice
+quizzes and Office exports.
 
 Runs on **Windows with PowerShell** or on **shared Linux hosting with cPanel**.
 One process per bot token, SQLite only — no Docker, Redis, external database,

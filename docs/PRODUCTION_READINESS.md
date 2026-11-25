@@ -1,5 +1,11 @@
 # Production readiness — Phase 8 final verification
 
+> **Historical verification record — not current documentation.** Every number
+> below was measured on one earlier checkout (`fb427d5`); test counts, line
+> numbers and file lists have moved since. The residual-risk list in §7 is still
+> the useful part. For current guidance read [docs/](README.md) and
+> [Testing](TESTING.md).
+
 Scope: verify the integrated system produced by phases 1–7 (Study Packs, Review as a
 pack view, atomic reward redemption, Explore seed bank, minimal bot UX, Mini App).
 No feature was added and no product code was changed while verifying; this page
@@ -52,7 +58,7 @@ Telegram ──► Telethon bot (long polling, one process)
 | 3 — Atomic redemption | points debit + real credit lot + idempotent retry in one transaction | `tests/test_reward_redemption.py` (23), `041`, probe §5.1 |
 | 4 — Explore seed bank | 200 curated questions / 12 topics, stable `seed_key`, idempotent seeding | `tests/test_explore_seed_bank.py` (22), `042`, §5.4 |
 | 6 — Minimal bot UX | `/start` = one message + one Mini App button, no reply keyboard, no flashcards | `tests/test_bot_ux.py` (27) |
-| 7 — Mini App | exactly four tabs (حساب من، کتابخانه، مرور، اکسپلور), token design system, real APIs | `miniapp/src/test/app.test.tsx` (6), build, §5.2 |
+| 7 — Mini App | exactly four tabs (مرور، کتابخانه، یک‌سؤال، حساب من), token design system, real APIs | `miniapp/src/test/app.test.tsx` (6), build, §5.2 |
 
 Journey steps 1–9 (open bot → send file → pack created → processing → transcript →
 outputs stored → questions attached → ready → delivery actions) are covered by the
@@ -194,9 +200,11 @@ Residual risks are listed in §7; none is a new regression introduced by phases 
 
 ## 7. Remaining known issues
 
-1. **20 stale tests** (`test_free_uses.py`, `test_reaudit_workflows.py`) still describe
-   the retired chat flashcard flow; they should be retired or rewritten so a red run
-   means something again. (Pre-existing.)
+1. ~~**20 stale tests** (`test_free_uses.py`, `test_reaudit_workflows.py`) still
+   describe the retired chat flashcard flow.~~ **Resolved:** both files were
+   rewritten to the quiz-only contract and the retired `deck` free-use kind and
+   columns were removed (migration 043), so the full suite is green again
+   (`pytest` 2187 passed, `unittest discover` 2057 OK).
 2. **Banned users are not refused at the API level.** The Mini App shows a blocked
    screen and the bot refuses them, but `/api/v1` still answers their own data and
    accepts Explore answers. Not new; a one-place fix if it matters.
@@ -219,7 +227,7 @@ Unchanged hosting (cPanel + Passenger + Python 3.11), no configuration change wa
 
 1. `pip install -r requirements.txt` — unchanged.
 2. `cd miniapp && npm ci && npm run build` — produces `miniapp/dist` served at `/app`.
-3. Environment: `BOT_TOKEN` (required, also verifies `initData`), optional
+3. Environment: `TELEGRAM_BOT_TOKEN` (required, also verifies `initData`), optional
    `WEBAPP_URL=https://<host>` (bot's single menu button → `{origin}/app`) and
    `BOT_USERNAME=Gamas_bot` (Mini App deep links). Both have safe defaults.
 4. Restart the application so migrations `039`–`042` apply (automatic on connect).

@@ -20,7 +20,7 @@
 
 ## 3. Required Environment Configuration
 Ensure `.env` on the server includes:
-- `BOT_TOKEN` (already configured for the bot; used server-side for `initData` HMAC-SHA256 validation)
+- `TELEGRAM_BOT_TOKEN` (already configured for the bot; used server-side for `initData` HMAC-SHA256 validation — there is no separate `BOT_TOKEN`)
 - `BOT_USERNAME=Gamas_bot` (default) so the Mini App can build its invite, support
   and purchase deep links (`t.me/<username>?start=ref_<id>` / `?start=buy`).
 - `WEBAPP_URL=https://<your-domain>` so the bot's `/start` screen carries its one
@@ -67,9 +67,10 @@ Ensure `.env` on the server includes:
 5. Verify **یک‌سؤال** loads one card (no total count/index shown), submits an answer,
    shows the points the server awarded, records engagement, and offers a new round
    at the end.
-6. Verify the four tabs are exactly مرور / کتابخانه / یک‌سؤال / حساب من, that RTL
-   text and Persian numerals render, and that «خرید در ربات» (inside the
-   «کیف پول» sheet) opens the bot's wallet.
+6. Verify the four tabs are exactly **مرور · کتابخانه · یک‌سؤال · حساب من** in that
+   order, that RTL text and Persian numerals render, and that «خرید در ربات»
+   (inside the «کیف پول» sheet) opens the bot's wallet. There is no tab called
+   «اکسپلور» or «کاوش»: the third tab is «یک‌سؤال».
 
 ## 7. Rollback Instructions
 1. Restore the previous `miniapp/dist/` or git commit.

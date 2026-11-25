@@ -1,5 +1,11 @@
 # Phase 0 — Gamas document pipeline audit
 
+> **Historical audit — not current documentation.** This page records one earlier
+> checkout and the measurements taken on it. Line numbers, file inventories,
+> test counts, migration numbers and "planned" phases may no longer match the
+> code. Current operator guides live in [docs/](../docs/README.md); treat
+> `gamas_bot/` as the source of truth.
+
 Baseline: `e2148f4dd097783b313685dbda205354ff7d0068` on `arena/44809b9d-gamas-bot`. Read-only with respect to implementation and tests. Defaults are from `config.from_env`, not comments, `.env.example`, or a production deployment. Provider capabilities below are repository declarations, not live upstream measurements.
 
 ## A. Current architecture and execution paths

@@ -8,6 +8,21 @@ paths, retention and host sizing. The default database is `data/gamas_v3.db`;
 set `DB_PATH` if an intentionally different database is required, and include
 that path in backups.
 
+## Public URL and the Mini App
+
+Two optional values connect the bot to the Mini App; both default to "not
+deployed", where the bot is a pure file interface and no button points at a
+dead URL.
+
+| Setting | Meaning |
+| --- | --- |
+| `WEBAPP_URL` | Bare origin of this deployment (for example `https://gamas.example`). The bot appends `/app` itself and strips a trailing slash; empty means no Mini App button. |
+| `BOT_USERNAME` | Bot username without the `@` (default `Gamas_bot`). The Mini App builds its invite, share, support and credit-purchase deep links from it. |
+
+The Mini App is served by the same Passenger application at `/app`, so its
+JSON calls are relative (`/api/v1/*`) and never carry a host or a credential.
+Deployment steps are in [Mini App deployment](DEPLOY_MINIAPP.md).
+
 ## Subscription plans
 
 `gamas_bot.billing.PAID_PLAN_SPECS` is the canonical six-plan catalog. Each
@@ -153,7 +168,6 @@ a default of the renderer and planner API, not a deployment setting.
 Generated quizzes require a nonempty source and valid `medium`/`hard`
 difficulty by default, matching `QUIZ_SCHEMA` and the strict learning caller.
 Persian/English aliases are normalized; wrong types, empty/missing tags and
-unrecognized difficulty labels are rejected. Flashcards require a source too.
-Explicit `require_source=False`/`require_difficulty=False` are legacy-reader
+unrecognized difficulty labels are rejected. Explicit `require_source=False`/`require_difficulty=False` are legacy-reader
 options, not production generation defaults; they do not relax question/option
 validation. Finite numeric locators remain compatible; NaN/Infinity do not.

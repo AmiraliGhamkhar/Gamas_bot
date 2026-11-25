@@ -4,6 +4,37 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Dead code, expired plans and retired flags are gone (cleanup pass).** The
+flashcard feature's last survivors were removed rather than left to mislead:
+`free_uses.free_deck_used`/`deck_claim` are dropped by migration
+`043_drop_retired_free_deck_gift.sql` (the table is rebuilt, not truncated, so
+every quiz gift row survives), `free_use_state()` now returns `{"quiz": bool}`
+only, and `consume_free_use(user, "deck", ...)` raises `ValueError` instead of
+reading a column that no user surface can reach. The unused
+`gamas_bot/document/typography.py` module is deleted, along with
+`docx_export._wrap_estimate`. `miniapp/tsconfig.tsbuildinfo` (a `tsc -b` build
+artifact) is no longer tracked and is ignored. No behaviour changed for users.
+
+Three expired planning pages were retired: `IMPLEMENTATION_PLAN.md` and
+`MIGRATION_PLAN.md` (their still-relevant backfill/rollback/backup rules now live
+in `DATABASE_DESIGN.md`) and `docs/ANTI_SLOP_DESIGN_PLAN.md` (superseded by the
+enforced `miniapp/DESIGN.md`). `BOOKLET_LLM_MAP.md` was a per-checkout line-count
+inventory that had already drifted by thousands of lines; the module map in
+`docs/DEVELOPMENT.md` is the maintained version. Every `AUDIT/` page now opens
+with a historical-snapshot notice.
+
+Documentation was brought back in line with the code: `API_CONTRACT.md` now
+lists the routes `webapp_api.py` actually answers (the planned
+`/api/account/summary`, `/api/review/sessions*`, `/api/explore/preferences` and
+similar were never built) and drops the obsolete "Planned (Phases 4–5)" section;
+`ARCHITECTURE.md` and `DATABASE_DESIGN.md` describe the shipped schema and the
+real 24-hour `initData` window with `pending → approved/rejected` moderation;
+`docs/CONFIGURATION.md` gained the `WEBAPP_URL`/`BOT_USERNAME` section the code
+and `.env.example` already required; the mini-app deployment guide no longer uses
+the non-existent `BOT_TOKEN` and names the four real tabs (مرور · کتابخانه ·
+یک‌سؤال · حساب من, not «اکسپلور»); operator guides (features, providers, security,
+admin, troubleshooting, README) no longer advertise flashcards or a 30-deck cap.
+
 **The Mini App is a product, not a dashboard (phase 7).** The four tabs are fixed —
 حساب من، کتابخانه، مرور، اکسپلور — and each one is built from the same token layer
 (one ink scale, one amber accent, Vazirmatn bundled locally, 20px cards, 44px

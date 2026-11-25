@@ -1635,27 +1635,6 @@ def _new_document(meta: DocumentMeta, title: str) -> DocumentType:
     return document
 
 
-def _wrap_estimate(text: str, chars_per_line: int) -> list[str]:
-    """Rough word-wrap of ``text`` for layout *estimation* only.
-
-    Word does the real wrapping; this exists so the cover can adapt its spacer
-    count to a longer title or a longer metadata block without a layout engine.
-    """
-    words = (text or "").split()
-    lines: list[str] = []
-    current = ""
-    for word in words:
-        candidate = f"{current} {word}".strip()
-        if current and len(candidate) > chars_per_line:
-            lines.append(current)
-            current = word
-        else:
-            current = candidate
-    if current or not lines:
-        lines.append(current)
-    return lines
-
-
 # ---------------------------------------------------------------------------
 # Cover page
 # ---------------------------------------------------------------------------

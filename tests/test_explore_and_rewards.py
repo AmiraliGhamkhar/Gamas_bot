@@ -12,7 +12,6 @@ from gamas_bot.db import Database
 from gamas_bot.explore_recommender import (
     classify_engagement,
     compute_topic_affinities,
-    recommend_explore_feed,
 )
 from gamas_bot.explore_seed import seed_explore_questions
 from gamas_bot.webapp_api import make_wsgi_app

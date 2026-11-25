@@ -133,7 +133,7 @@ class UserIdentityTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         )
-        await self.db.consume_free_use(HUGE_ID, "deck")
+        await self.db.consume_free_use(HUGE_ID, "quiz")
         await self.db.document_add(
             HUGE_ID,
             file_msg_ref="1:2",
