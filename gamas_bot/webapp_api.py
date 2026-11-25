@@ -939,22 +939,62 @@ def make_wsgi_app(
                     if rel
                     else (dist_dir / "index.html").resolve()
                 )
+                spa_fallback = False
                 if (
                     not candidate.is_relative_to(dist_dir.resolve())
                     or not candidate.is_file()
                 ):
                     candidate = (dist_dir / "index.html").resolve()
+                    spa_fallback = True
                 if candidate.is_file():
                     data = candidate.read_bytes()
                     ctype, _ = mimetypes.guess_type(str(candidate))
+                    if not ctype:
+                        ctype = {
+                            ".js": "text/javascript; charset=utf-8",
+                            ".mjs": "text/javascript; charset=utf-8",
+                            ".css": "text/css; charset=utf-8",
+                            ".html": "text/html; charset=utf-8",
+                            ".json": "application/json; charset=utf-8",
+                            ".svg": "image/svg+xml",
+                            ".png": "image/png",
+                            ".jpg": "image/jpeg",
+                            ".jpeg": "image/jpeg",
+                            ".webp": "image/webp",
+                            ".ico": "image/x-icon",
+                            ".woff": "font/woff",
+                            ".woff2": "font/woff2",
+                            ".ttf": "font/ttf",
+                            ".map": "application/json; charset=utf-8",
+                        }.get(candidate.suffix.lower())
+                    # index.html must be revalidated so deploys take effect;
+                    # Vite-hashed assets under /assets/ are immutable.
+                    if spa_fallback or candidate.name == "index.html":
+                        cache_control = "no-store"
+                    elif rel.startswith("assets/"):
+                        cache_control = "public, max-age=31536000, immutable"
+                    else:
+                        cache_control = "public, max-age=3600"
                     start_response(
                         "200 OK",
                         [
                             ("Content-Type", ctype or "application/octet-stream"),
                             ("Content-Length", str(len(data))),
+                            ("Cache-Control", cache_control),
                         ],
                     )
                     return [b"" if method == "HEAD" else data]
+            # A deployed Python app without a built frontend should fail clearly,
+            # not with a misleading JSON 404 from the API router.
+            return _json_response(
+                start_response,
+                "503 Service Unavailable",
+                {
+                    "error": "miniapp_not_built",
+                    "detail": "miniapp/dist is missing; build the Mini App and upload miniapp/dist.",
+                },
+                method=method,
+            )
 
         return _json_response(
             start_response, "404 Not Found", {"error": "not found"}, method=method

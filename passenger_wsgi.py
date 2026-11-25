@@ -1,14 +1,19 @@
-"""Optional cPanel "Setup Python App" (Passenger) entry point.
+"""cPanel "Setup Python App" (Passenger) WSGI entry point.
 
-The bot is a long-running Telegram client, not a website, so this WSGI app does
-only two things:
+This single WSGI application is the authoritative deployment entry point:
 
-* every request makes sure the bot process is running (start-up trigger), and
-* it answers a tiny JSON status document that an uptime monitor can poll.
+* ``/app`` and ``/app/*`` serve the built Telegram Mini App (SPA) from
+  ``miniapp/dist``.
+* ``/api/*`` (including ``/api/v1/*``) serves the Mini App JSON API.
+* ``/`` and ``/health`` answer a tiny bot-watchdog status document that an
+  uptime monitor can poll.
 
-It never exposes configuration, user data or logs. Point an external monitor
-(for example UptimeRobot) at the app URL every 5 minutes as a second watchdog
-next to the cron job described in docs/CPANEL.md.
+The bot itself is a long-running Telegram client started/kept alive by the
+launcher; the Mini App and API are served by the same Passenger process. This
+module never exposes configuration, user data or logs.
+
+cPanel setup: Application root = repository root, Startup file =
+``passenger_wsgi.py``, Entry point = ``application``.
 """
 
 from __future__ import annotations

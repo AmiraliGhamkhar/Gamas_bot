@@ -104,16 +104,50 @@ otherwise it restarts the bot within a minute. After fixing a startup error use
 `--force` to bypass the spawn throttle. Never delete `data/gamas.lock` while a
 process is alive and never use `pkill python` on shared hosting.
 
-## 5. Optional: bot-launcher health endpoint
+## 5. cPanel Python App (Mini App + API + bot watchdog)
 
-This optional root-level `passenger_wsgi.py` exposes the bot watchdog status.
-You do not need Passenger to run the bot.
-If you want an uptime monitor for the bot-launcher endpoint, create a separate
-Python app whose startup file is `passenger_wsgi.py` and entry point
-`application`. `GET /` and `GET /health` answer
-`{"service":"gamas-bot","status":"running"}` (or `starting`/`error`); they never
-expose configuration or user data. Keep cron enabled — the endpoint only starts
-or reports the process.
+The repository ships a single Passenger WSGI application in
+`passenger_wsgi.py` (entry point `application`). The same app serves:
+
+- `GET /app/` — the built Telegram Mini App SPA from `miniapp/dist/`.
+- `/api/v1/*` — the Mini App JSON API (authenticated with Telegram
+  `X-Telegram-Init-Data`).
+- `GET /api/v1/health` — returns `{"status":"ok"}` (HTTP 200).
+- `GET /` and `GET /health` — bot watchdog status (`running` / `starting` /
+  `error`); these never expose configuration or user data.
+
+**cPanel “Setup Python App” configuration**
+
+| Field | Value |
+| --- | --- |
+| Python version | 3.11–3.13 (use the host’s supported interpreter) |
+| Application root | `/home/USER/gamas_bot` (repository root, outside `public_html`) |
+| Application URL | the domain/subdomain serving Gamas (for example `gamasrobot.ir`) |
+| Application startup file | `passenger_wsgi.py` |
+| Application Entry point | `application` |
+| Passenger log file | optional, e.g. `/home/USER/logs/gamas_passenger.log` |
+
+After creating or updating the Python App, install dependencies in its
+virtualenv:
+
+```bash
+cd /home/USER/gamas_bot
+. /home/USER/virtualenv/gamas_bot/<python-version>/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m gamas_bot --check
+```
+
+Restart the Python App from cPanel (**Setup Python App → Restart**) after every
+code, dependency, `.env`, or `miniapp/dist/` change.
+
+The cron watchdog from section 3 is still required to keep the long-running
+Telegram bot process alive. The Passenger app serves the Mini App/API and can
+trigger the bot launcher on health/status requests; cron remains the primary
+watchdog.
+
+For the full Mini App build, upload, BotFather, smoke-test, and rollback
+procedure, see [Deploy Mini App](DEPLOY_MINIAPP.md).
 
 ## 6. Update safely
 
