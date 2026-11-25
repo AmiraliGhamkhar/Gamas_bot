@@ -122,7 +122,7 @@ class StudyStorageAndApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reward_points", me)
 
         # Create pack as Alice
-        status, body = await asyncio.to_thread(_call_wsgi, 
+        status, body = await asyncio.to_thread(_call_wsgi,
             self.app,
             "POST",
             "/api/packs",
@@ -156,14 +156,14 @@ class StudyStorageAndApiTests(unittest.IsolatedAsyncioTestCase):
         )
         await db.close()
 
-        status, dl = await asyncio.to_thread(_call_wsgi, 
+        status, dl = await asyncio.to_thread(_call_wsgi,
             self.app, "GET", f"/api/assets/{asset_id}/download", headers=alice_hdr
         )
         self.assertTrue(status.startswith("200"))
         self.assertEqual(dl, b"secret notes")
 
         # Bob cannot download Alice's asset
-        status, _ = await asyncio.to_thread(_call_wsgi, 
+        status, _ = await asyncio.to_thread(_call_wsgi,
             self.app, "GET", f"/api/assets/{asset_id}/download", headers=bob_hdr
         )
         self.assertTrue(status.startswith("404"))

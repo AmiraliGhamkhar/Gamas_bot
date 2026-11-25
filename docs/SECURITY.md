@@ -16,7 +16,7 @@
 | Data | Where |
 | --- | --- |
 | Audio/video | The configured STT chain (Speechmatics, Deepgram and/or an OpenAI-compatible transcription API) |
-| Transcript text for booklets, AI quizzes and AI flashcards | Configured approved note-generation routes in task-specific order; OpenRouter remains the last fallback |
+| Transcript text for booklets and AI quizzes | Configured approved note-generation routes in task-specific order; OpenRouter remains the last fallback |
 | Transcripts, notes, billing, tickets | Local SQLite (`data/gamas_v3.db` by default; configurable with `DB_PATH`) |
 | Media-submission booklet PDF, DOCX and review HTML | Validated bytes stored in SQLite and sent to Telegram on request |
 | Library | References to delivered Telegram files; document text may also be cached locally |

@@ -22,7 +22,6 @@ The governing principle:
 | `gamas_bot/document/components.py` | The semantic component vocabulary (callouts, tips, cards, labels, chapter numbers). |
 | `gamas_bot/document/assets.py` | The asset manifest, semantic lookup and deterministic topic selection. |
 | `gamas_bot/document/rtl.py` | Line-level BiDi: shaping, display order, logical-order wrapping. |
-| `gamas_bot/document/typography.py` | Font faces, sizes and leading shared by both renderers. |
 | `gamas_bot/document/layout.py` | A4 page geometry and the frame both outputs share. |
 | `gamas_bot/document/qa.py` | Post-render inspection: PDF rasterization, DOCX structure, asset audit. |
 | `assets/booklet/manifest.json` | The asset contract: path, size, role and topic for every image. |

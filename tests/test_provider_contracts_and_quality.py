@@ -15,7 +15,6 @@ from gamas_bot import llm, office_ai
 from gamas_bot.bot import GamasBot
 from gamas_bot.config import NoteRoute, note_routes
 from gamas_bot.db import Database
-from gamas_bot.doc_extract import DocChunk
 from gamas_bot.learning import (
     QUIZ_SCHEMA,
     parse_quiz_payload,
@@ -734,16 +733,21 @@ class LearningRobustnessTests(unittest.IsolatedAsyncioTestCase):
             await db.connect()
             await db.ensure_user(77)
             await db.grant_free_plan_once(77, 1000)
-            await db.consume_free_use(77, "deck")
-            item_id = await db.library_add(77, "booklet", 77, 10, None, title="درس", content_text="متن کافی برای ساخت فلش‌کارت " * 30)
+            await db.consume_free_use(77, "quiz")
+            item_id = await db.library_add(77, "booklet", 77, 10, None, title="درس", content_text="متن کافی برای ساخت آزمون " * 30)
             client = FakeTelegramClient()
             client.send_file = mock.AsyncMock(side_effect=RuntimeError("telegram upload down"))
             bot = GamasBot(settings, db=db, client=client)
             try:
-                cards = {"cards": [{"front": f"پرسش {i}", "back": f"پاسخ {i}", "source": "بخش ۱"} for i in range(6)]}
-                ev = FakeCallbackEvent(client, data=f"fc:go:{item_id}".encode(), chat_id=77)
+                questions = {"questions": [
+                    {"question": f"پرسش {i}", "options": ["الف", "ب", "ج", "د"],
+                     "correct": 0, "explain": "چرا", "difficulty": "medium",
+                     "source": "بخش ۱"}
+                    for i in range(5)
+                ]}
+                ev = FakeCallbackEvent(client, data=f"quiz:go:{item_id}:5".encode(), chat_id=77)
                 ev.client = client
-                with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards)):
+                with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=questions)):
                     await bot._handle_callback(ev)
                 self.assertEqual(await db.available_seconds(77), 1000)
             finally:

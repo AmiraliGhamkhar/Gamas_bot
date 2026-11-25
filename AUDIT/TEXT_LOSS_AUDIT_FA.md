@@ -1,5 +1,11 @@
 # بررسی امکان «جا انداختن متن یا اشتباه در ارسال و گرفتن درخواست»
 
+> **Historical audit — not current documentation.** This page records one earlier
+> checkout and the measurements taken on it. Line numbers, file inventories,
+> test counts, migration numbers and "planned" phases may no longer match the
+> code. Current operator guides live in [docs/](../docs/README.md); treat
+> `gamas_bot/` as the source of truth.
+
 **تاریخ:** ۲۰۲۶-۱۱-۲۲ · **شاخه:** `arena/eb96ef66-gamas-bot` · **پایه:** `092371eb`
 **دامنه:** لایهٔ LLM (`gamas_bot/llm.py`)، ساخت جزوه (`notes.py`)، تفکیک معنایی (`semantic_segments.py`)،
 قالب پیام‌ها (`_prompt_block.py`)، ساختار فایل ترنسکریپت (`transcript.py`).

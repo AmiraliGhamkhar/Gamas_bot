@@ -135,7 +135,6 @@ files = [
     "gamas_bot/document/qa.py",
     "gamas_bot/document/rtl.py",
     "gamas_bot/document/theme.py",
-    "gamas_bot/document/typography.py",
     "gamas_bot/db_learning.py",
     "gamas_bot/db_library.py",
     "gamas_bot/db_payments.py",

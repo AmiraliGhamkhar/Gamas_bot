@@ -13,9 +13,7 @@ import random
 import sqlite3
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from gamas_bot.db import MIGRATIONS_DIR
@@ -35,7 +33,6 @@ from gamas_bot.llm import LLMContextOverflowError, LLMError
 from tests.support import (
     FakeCallbackEvent,
     FakeTelegramClient,
-    FakeSentMessage,
     make_settings,
 )
 from tests.test_bot import FakeMessageEvent, menu_payloads
@@ -1286,7 +1283,6 @@ class AnchoredQualityTests(unittest.TestCase):
         self.assertLess(topic_importance_weight(long_plain), topic_importance_weight(short))
 
     def test_new_generation_strictly_requires_sources_and_quiz_difficulty(self):
-        card = {"cards": [{"front": "یک پرسش", "back": "یک پاسخ"}]}
         legacy = quiz_payload(1)
         legacy["questions"][0].pop("difficulty")
         self.assertEqual(parse_quiz_payload(legacy, 1, require_difficulty=True, require_source=True), [])

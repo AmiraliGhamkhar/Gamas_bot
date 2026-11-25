@@ -38,7 +38,7 @@ python -m gamas_bot.media_worker check
 ## Booklets (Word and PDF)
 
 With a note provider configured, a finished transcript also produces a Persian
-RTL booklet. Booklets, AI quizzes and AI flashcards use the same note-provider
+RTL booklet. Booklets and AI quizzes use the same note-provider
 allowlist: AvalAI, Gemini and OpenRouter. The default chain is
 `avalai,gemini,openrouter`; task-specific priorities apply before dispatch,
 and OpenRouter is always a fallback. The deterministic merge keeps source order,
@@ -147,9 +147,10 @@ configured AI calls still cost the operator money.
   user. Telegram receives files when requested; media-submission booklet PDF,
   DOCX and review HTML bytes are also persisted in SQLite. Pruning a library
   reference does not delete cached extracted text.
-- **Learning**: quizzes and flashcards generated from a saved booklet or
-  document, previewed before saving. Costs are in [Billing](BILLING.md). Every
-  study workflow stays inside the chat.
+- **Learning**: multiple-choice quizzes generated from a saved booklet or
+  document and delivered as one offline interactive HTML file, whose questions
+  also feed the Mini App's Review tab. Costs are in [Billing](BILLING.md).
+  Flashcards were removed; the free first try applies to a quiz only.
 
 ## Privacy summary
 

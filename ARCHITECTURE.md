@@ -1,120 +1,123 @@
-# Gamas Product Architecture Blueprint
+# Gamas Architecture
 
-## 1. System Architecture & Component Responsibilities
-
-The architecture extends the existing `gamas_bot` Python package, SQLite database, and `passenger_wsgi.py` entry point rather than replacing them.
+One Python service, one SQLite database and one static bundle, on one origin.
+This page describes what the code does today; `gamas_bot/` is the source of
+truth, and [Development](docs/DEVELOPMENT.md) lists the module map.
 
 ```
-+-----------------------------------------------------------------------+
-|                       Telegram Client & Mini App                      |
-|  - Bot Chat (Telethon): file uploads, job progress, admin, support    |
-|  - Mini App (React/TS/Vite/Tailwind at /app/):                        |
-|      [1. My Account] [2. Library] [3. Review] [4. Explore]            |
-+-----------------------------------+-----------------------------------+
-                                    | HTTPS (X-Telegram-Init-Data)
-                                    ▼
-+-----------------------------------------------------------------------+
-|                cPanel / Passenger (passenger_wsgi.py)                 |
-|  - GET /, /health   -> gamas_bot.launcher.ensure_running()            |
-|  - /api/*           -> gamas_bot.webapp_api (stdlib WSGI JSON API)    |
-|  - /app/*           -> miniapp/dist/ (static SPA)                     |
-+-----------------------------------+-----------------------------------+
-                                    |
-          +-------------------------+-------------------------+
-          ▼                                                   ▼
-+-------------------------------+               +-----------------------+
-|   SQLite (gamas_bot.db)       |               | Private File Storage  |
-|   - Existing Bot/Billing/Quiz |               | (study_storage.py)    |
-|   - Study Packs & Assets      |               | - Outside public_html |
-|   - Review & Explore Bank     |               | - Per-user/pack dirs  |
-|   - Engagement & Reward Ledger|               | - 0o600 permissions   |
-+-------------------------------+               +-----------------------+
+Telegram ──► Telethon bot (long polling, one process)
+              │  intake: submissions (audio/video/voice) / documents (PDF, DOCX, PPTX)
+              │  jobs:   probe → extract → STT → notes → booklet/DOCX/HTML → delivery
+              ▼
+           SQLite (WAL, single writer, append-only ledger)
+              │  study_packs (one per source) + study_assets (references, not copies)
+              │  quiz_sessions / quiz_questions linked to the pack that produced them
+              │  explore_questions (pending → approved/rejected, stable seed_key)
+              │  explore_impressions (dwell/signal/is_correct)
+              │  reward_points_ledger ↔ reward_redemptions ↔ ledger (credit lots)
+              ▼
+           Passenger WSGI app (passenger_wsgi.py, same host)
+              ├── /api/v1/*   initData-authenticated JSON  (gamas_bot/webapp_api.py)
+              └── /app/*      the built Mini App (Vite SPA, RTL, Persian)
 ```
 
-### Component Responsibilities
-1. **Existing Python Telegram Bot (`gamas_bot/bot*.py`)**:
-   - Handles media/document uploads, STT (`stt.py`), booklet synthesis (`booklet_synthesis.py`), PDF/DOCX/HTML export, quiz generation (`bot_learning.py`), payments (`bot_wallet.py`), referrals (`bot_referrals.py`), support, and admin commands (`bot_admin.py`).
-   - Registers newly processed uploads as `study_packs` + `study_assets` alongside existing `library_items` / `submissions`.
-2. **Backend WSGI API (`gamas_bot/webapp_api.py`)**:
-   - Stateless stdlib WSGI layer sharing `gamas_bot.db.Database` and `gamas_bot.config.Settings`.
-   - Validates Telegram `initData` HMAC-SHA256 (`telegram_auth.py`), enforces per-user ownership, serves private files via `study_storage.py`, and exposes JSON endpoints for all 4 Mini App tabs.
-3. **React Telegram Mini App (`miniapp/`)**:
-   - Single-page React/TS/Vite/Tailwind app with 4 bottom-nav tabs: **My Account**, **Library**, **Review**, **Explore**.
-4. **Question System**:
-   - **Private Review Questions**: `quiz_sessions` / `quiz_questions` / `quiz_answers` linked to user Study Packs.
-   - **Public Explore Question Bank**: Curated, admin-approved Persian multiple-choice questions (`explore_questions`) — strictly separated from private user media/transcripts.
-5. **Deterministic Recommendation Engine**:
-   - Ranks `explore_questions` per user using impression/engagement signals (`3` = answer submitted, `2` = dwell > 8s, `1` = fast skip < 3s, `neutral` = 3–8s), topic affinity, diversity, and time decay.
-6. **Independent Reward System**:
-   - `reward_points_ledger` tracks redeemable points separately from Gamas `credit_seconds`. Only **correct answers to approved public Explore questions** (first-time per question) earn answer-based reward points.
+## 1. Components
 
----
+1. **Telegram bot** (`gamas_bot/bot*.py`) — uploads, job progress, the file
+   interface, wallet, support, referrals and admin. Every accepted source is
+   registered as one `study_packs` row plus `study_assets` references, alongside
+   the `library_items`/`submissions` rows the rest of the bot uses.
+2. **Document and booklet engine** (`notes*`, `docx_export`, `notes_pdf`,
+   `notes_typst`, `document/`) — one validated `StructuredNotes` model rendered to
+   Word and PDF; see [Booklet design](docs/BOOKLET_DESIGN.md).
+3. **WSGI JSON API** (`gamas_bot/webapp_api.py`) — stdlib, no framework; shares
+   `Database` and `Settings` with the bot. Routes are listed in
+   [API contract](API_CONTRACT.md).
+4. **Mini App** (`miniapp/`) — React/TS/Vite/Tailwind SPA with exactly four tabs:
+   **مرور · کتابخانه · یک‌سؤال · حساب من**. It computes no money and shows no
+   number the server did not send. Design law: `miniapp/DESIGN.md`.
+5. **Question system** — private Review questions (`quiz_sessions`,
+   `quiz_questions`, `quiz_answers`, scoped to the owner's packs) are strictly
+   separated from the public Explore bank (`explore_questions`).
+6. **Deterministic recommender** (`gamas_bot/explore_recommender.py`) — scores
+   approved questions by topic affinity, quality, freshness and a discovery
+   bonus, then enforces a consecutive-same-topic cap. Engagement signal
+   (`3` answered, `2` dwell > 8 s, `1` skip < 3 s, `0` neutral) only ranks; it
+   never grants points.
+7. **Reward system** (`gamas_bot/rewards.py`, `db_rewards.py`) — reward points are
+   an independent ledger. Only a first-time **correct** answer to an **approved**
+   Explore question earns points, guarded by a unique `(user_id, ref_id)`.
 
-## 2. Study Pack Model
+## 2. Study Pack model
 
-Each uploaded file creates one `study_packs` record identified by `pack_id` (integer primary key, never by title; duplicate titles get distinct `pack_id`s).
+Each accepted source creates one `study_packs` row identified by `pack_id`
+(integer, never a title; duplicate titles get distinct ids):
 
-- **`pack_id`**: `INTEGER PRIMARY KEY AUTOINCREMENT`
-- **`user_id`**: `INTEGER NOT NULL` (owner `telegram_id`)
-- **`title`**: `TEXT NOT NULL` (display label only)
-- **`source_type`**: `TEXT NOT NULL` (`audio`, `video`, `voice`, `pdf`, `docx`, `pptx`, `txt`, `upload`)
-- **`status`**: `TEXT NOT NULL` (`queued`, `processing`, `ready`, `failed`)
-- **`created_at` / `updated_at` / `deleted_at`**: ISO-8601 UTC timestamps
-- **Linked Assets (`study_assets`)**:
-  - `original_source` (private FS path)
-  - `transcript` / `extracted_text` (private FS path)
-  - `pdf` (private FS path)
-  - `docx` (private FS path)
-  - `quiz_html` (private FS path)
-- **Linked Questions**: `quiz_sessions` / `quiz_questions` referenced via `library_item_id` or `pack_id`.
+- `pack_id`, `user_id` (owner `telegram_id`), `title` (display only),
+  `source_type` (`audio`, `video`, `voice`, `pdf`, `docx`, `pptx`, `txt`, `upload`),
+  `status` (`queued`, `processing`, `ready`, `failed`),
+  `created_at`/`updated_at`/`deleted_at` (ISO-8601 UTC).
+- `study_assets`: `original_source`, `transcript`, `extracted_text`, `pdf`,
+  `docx`, `quiz_html` — each a reference into the store that owns the bytes.
+- Questions attach through `quiz_sessions.pack_id`, so Review can group by the
+  pack that produced them. Sessions from before Study Packs are shown as explicit
+  legacy groups.
 
----
+## 3. Explore ranking
 
-## 3. Recommendation Architecture (Deterministic)
+```
+affinity(user, topic) = Σ signal_weight · exp(−λ · age_days)
+score(user, q)        = w_affinity·affinity + w_quality·quality
+                      + w_freshness·freshness + w_diversity·discovery
+```
 
-- **Engagement Classification** (internal ranking signal only, never redeemable points):
-  - Answer submitted = `3`
-  - Long dwell (> 8s without answering) = `2`
-  - Fast skip (< 3s without answering) = `1`
-  - Medium dwell (3–8s without answering) = `0` (neutral)
-- **Impression Lifecycle**:
-  - `explore_impressions` records `(impression_id, user_id, question_id, shown_at, dwell_ms, action)`.
-  - Duplicate prevention: questions answered or skipped within the cooldown window are excluded from the candidate pool.
-- **Topic Affinity & Ranking**:
-  - `affinity(user, topic) = sum(signal_weight * exp(-lambda * age_days))`
-  - `score(user, q) = w_affinity * topic_affinity + w_novelty * novelty_bonus - w_seen * recent_penalty`
-- **Diversity Rules**:
-  - No more than 2 consecutive questions from the same `topic` in a feed page.
-- **Cold-Start**:
-  - New users with zero engagement history receive a balanced round-robin sample across active `topic`s ordered by global approval/ease.
-- **Explore UI Rule**:
-  - Never display total question counts, question indices, or bank progress indicators.
+- Answered or recently seen questions are excluded from the candidate pool.
+- At most `max_consecutive_same_topic` items from one topic run back to back.
+- Cold start: new users get approved questions in ascending id order, because
+  every topic has neutral affinity.
+- The Explore UI never shows a bank count, a question index or a progress bar.
 
----
+## 4. Rewards and credit
 
-## 4. Reward Architecture
+- **Separate ledgers.** Processing credit (`ledger`, integer seconds,
+  lot-aware) and reward points (`reward_points_ledger`) are independent; a
+  `reward_redemptions` row is the single bridge that ties a points debit to a real
+  credit lot, written in the same transaction as both.
+- **Earning.** Only `is_correct = 1` on an `approved` question inserts a positive
+  delta, keyed `"explore_q:" || question_id` so a user earns at most once per
+  question. Dwell, skips, neutral reads and wrong answers never grant points.
+- **Redemption.** `POST /api/v1/rewards/redeem` checks the balance, debits points,
+  grants the credit lot and records the redemption inside one `BEGIN IMMEDIATE`
+  transaction; the response reports only what the ledger holds.
 
-- **Independent Ledger**: `reward_points_ledger(entry_id, user_id, delta, reason, ref_id, created_at)`.
-- **Earning Rule**: Only `is_correct = 1` on an `approved` public `explore_questions` row inserts a positive delta, guarded by a `UNIQUE(user_id, ref_id)` constraint on `(user_id, "explore_q:" || question_id)` so a user can earn at most once per question.
-- **Non-Earning Actions**: Dwell (`2`), skip (`1`), neutral (`0`), and incorrect answers (`is_correct = 0`) never insert into `reward_points_ledger`.
-- **Redemption**: `POST /api/rewards/redeem` atomically checks `SUM(delta) >= cost` inside a `BEGIN IMMEDIATE` transaction, inserts a negative `reward_points_ledger` entry, and grants the corresponding reward (e.g., Gamas credit seconds via `db_billing`).
+## 5. Security
 
----
+- **Telegram authentication.** `X-Telegram-Init-Data` is validated server-side
+  with HMAC-SHA256 over the sorted payload using `TELEGRAM_BOT_TOKEN`
+  (`gamas_bot/telegram_auth.py`), constant-time compared, with `auth_date`
+  freshness (24 h) and a required `user.id`. The client's `user_id` is never
+  trusted.
+- **Authorization.** Every query scopes by the authenticated `user_id`; a foreign
+  id resolves to `404`, never to data. Admin routes require `ADMIN_IDS`
+  (`403` otherwise).
+- **Private files.** `study_storage.py` keeps bytes outside `public_html` with
+  `0o600` permissions and traversal checks; downloads always send
+  `Cache-Control: private, no-store`.
+- **Money and rewards.** `BEGIN IMMEDIATE` prevents double-spend; unique indexes
+  prevent duplicate Explore awards, duplicate redemptions and duplicate seeds.
+- **Untrusted input.** JSON bodies are capped at 1 MiB, every value is bound as a
+  SQL parameter, and the client never computes a price, a balance or an award.
 
-## 5. Security Architecture
+## 6. Mini App tabs
 
-- **Telegram Authentication**: `X-Telegram-Init-Data` validated server-side via HMAC-SHA256 (`telegram_auth.py`) using `bot_token` and `max_age_seconds = 86400`. Frontend-supplied `user_id` is never trusted.
-- **User Authorization**: Every query scopes by `user_id = authenticated_user_id`; cross-user access returns `404 Not Found`.
-- **Private File Access**: `study_storage.py` stores files outside `public_html` with `0o600` permissions and `Path.is_relative_to()` traversal checks; `/api/assets/{id}/download` sets `Cache-Control: private, no-store`.
-- **Payment & Reward Security**: `BEGIN IMMEDIATE` transactions prevent double-spend on reward redemption; `UNIQUE(user_id, ref_id)` prevents duplicate Explore answer rewards.
-- **Admin Authorization**: Admin-only endpoints (e.g., Explore question moderation) check `user_id in settings.admin_ids`.
-
----
-
-## 6. Frontend Architecture (`miniapp/`)
-
-- **4 Primary Bottom-Nav Tabs**:
-  1. **My Account (`account`)**: Profile, Gamas `credit_seconds`, separate `reward_points`, subscription/free-use status, referrals, payment/redemption actions.
-  2. **Library (`library`)**: Study Packs list, pack detail view, private asset downloads, pack deletion.
-  3. **Review (`review`)**: Private quiz sessions from user Study Packs, interactive question answering, score/history.
-  4. **Explore (`explore`)**: Public curated Persian question feed (no counts/indices/progress bars), dwell/skip/answer telemetry, instant correctness feedback + reward point notification.
+1. **حساب من** — identity, credit split into hours/minutes, active plan window,
+   purchase options, referral count and invite link, reward balance and catalogue,
+   payment history; buying still happens in the bot via deep link.
+2. **کتابخانه** — one row per Study Pack with its processing state; the detail
+   screen downloads real assets, offers Review only when the pack owns questions,
+   and re-reads itself while the pipeline is still working.
+3. **مرور** — the user's own questions grouped by the pack that produced them;
+   answers are recorded through `/api/v1/review/answers` and the stored verdict is
+   shown.
+4. **یک‌سؤال** — one Explore card at a time, with the server's verdict, the points
+   the server says were awarded, and engagement recorded as dwell time.

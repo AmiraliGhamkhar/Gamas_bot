@@ -105,8 +105,7 @@ Behavior to remember:
   `left`, `kicked` and "not a participant" block access.
 - The gate is deferred: `/start`, help, wallet, purchases, support, library
   browsing and receipt upload stay open, so a non-member can pay and ask for
-  help. Files, booklets, quizzes and flashcard exports are gated when work would
-  start.
+  help. Files, booklets and quizzes are gated when work would start.
 - A blocked file is remembered for up to seven days and resumes automatically
   after **✅ بررسی عضویت** succeeds — the user does not resend it.
 - `ADMIN_IDS` are exempt. `SUBSCRIPTION_REQUIRED=false` disables the gate for

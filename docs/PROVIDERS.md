@@ -26,7 +26,7 @@ approved legacy-slot compatibility and how to disable a route fully.
 | Task | Eligible attempt order |
 | --- | --- |
 | Booklet generation, repair, compile; 20-question and difficult quizzes | AvalAI → Gemini → OpenRouter |
-| Key points, compact notes, smaller quizzes, flashcards, Office tables/slides/documents | Gemini → AvalAI → OpenRouter |
+| Key points, compact notes, smaller quizzes, Office tables/slides/documents | Gemini → AvalAI → OpenRouter |
 | Unspecified/custom task | Configured approved primaries, then OpenRouter |
 
 Task policy takes priority over list ordering and preferences. OpenRouter is
@@ -130,7 +130,7 @@ submitted request or received completion text; an unavailable output is logged
 as unknown, not as usage equal to the reserved maximum. `BOOKLET_PLAN` identifies
 optional LLM planning separately from `BOOKLET_GENERATION`, `BOOKLET_COMPILE`,
 `BOOKLET_VERIFY`, and `BOOKLET_REPAIR`. Booklet renderers make no provider calls;
-quiz and flashcard routes remain independent. Bounded booklet chunk/split/repair
+quiz and Office routes remain independent. Bounded booklet chunk/split/repair
 and grounding/completeness checks are unchanged.
 
 ### Prompt handling

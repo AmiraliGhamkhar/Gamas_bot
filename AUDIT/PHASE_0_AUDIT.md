@@ -1,5 +1,11 @@
 # Phase 0 — Repository audit and implementation plan
 
+> **Historical audit — not current documentation.** This page records one earlier
+> checkout and the measurements taken on it. Line numbers, file inventories,
+> test counts, migration numbers and "planned" phases may no longer match the
+> code. Current operator guides live in [docs/](../docs/README.md); treat
+> `gamas_bot/` as the source of truth.
+
 **Date:** 2026-11-23 (UTC)
 **Branch:** `arena/9a305ce5-gamas-bot` (base `fb427d57bc3420f9c07769a445b481b6cb724033`, status `active`)
 **Scope:** source, migrations, tests and Mini App in this checkout. No `.env`, Telegram

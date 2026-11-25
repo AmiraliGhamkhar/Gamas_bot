@@ -81,7 +81,7 @@ tail -n 80 data/logs/launcher.err
 | Receipt uploaded, no credit | A human admin must approve the order; see the wallet history |
 | Balance differs from the sum of history | Ledger is authoritative; the cache refreshes on read after the next expiry — report it, do not edit rows |
 | Paid generation failed, no refund | Check the pending charge; refunds are automatic once, recoverable at startup |
-| Quiz/flashcard refused | Admission caps: one active quiz, 3 sessions/hour, 30 decks — or insufficient credit |
+| Quiz refused | Admission caps: one active quiz and 3 sessions/hour — or insufficient credit |
 
 ## What to include in a support request
 
