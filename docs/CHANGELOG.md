@@ -4,6 +4,15 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Packed booklet requests keep every topic.** When consecutive short topics
+were packed into one provider request, the request ended with only the first
+topic name while the source body contained all of them. The writer could
+therefore produce a single section and leave the remaining topics to the
+repair pass (or to the source-only fallback). Packed requests now list every
+topic in source order and carry an explicit one-section-per-topic rule; the
+cacheable system prompt is unchanged. Regression tests cover both packed
+multi-request and packed single-request booklets.
+
 **Dead code, expired plans and retired flags are gone (cleanup pass).** The
 flashcard feature's last survivors were removed rather than left to mislead:
 `free_uses.free_deck_used`/`deck_claim` are dropped by migration

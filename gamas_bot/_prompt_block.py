@@ -23,6 +23,7 @@ of a job share the same bytes instead of four near-identical assemblies.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Final
 
 from .progress import to_persian_digits
@@ -445,6 +446,15 @@ def build_system_prompt(
 CHUNK_POSITION_PREFIX = "متن پیاده‌سازی‌شدهٔ خام (بخش {index} از {total}):"
 SINGLE_CHUNK_HEADER = "متن پیاده‌سازی‌شدهٔ خام (درس تک‌بخشی):"
 CHUNK_TOPIC_PREFIX = "موضوع همین بخش:"
+#: A packed request carries several consecutive topics in one source body. The
+#: plural marker tells the writer to produce one section for every listed topic
+#: instead of silently writing only the first one (the rule travels in the user
+#: message, so the cacheable static prompt keeps its exact size).
+CHUNK_TOPICS_PREFIX = "موضوعات همین بخش:"
+PACKED_TOPIC_RULE = (
+    "چند موضوع مستقل در همین درخواست: برای هر موضوع فهرستشده دقیقاً یک بخش جداگانه "
+    "به همان ترتیب بنویسید و هیچ موضوعی را حذف یا در بخش دیگری ادغام نکنید."
+)
 SOURCE_DIGEST_HEADING = "نقشهٔ موضوعی منبع (راهنمای ترتیب، نه شاهد محتوا):"
 DRAFT_HEADING = "پیش‌نویس جزوه که باید ویرایش و یکدست شود:"
 
@@ -455,6 +465,7 @@ def build_chunk_message(
     index: int,
     total: int,
     topic: str = "",
+    topics: Sequence[str] = (),
     context_block: str = "",
     header: str = "",
 ) -> str:
@@ -473,19 +484,36 @@ def build_chunk_message(
 
     A one-part lesson has no "part i of n" to announce, so its header says the
     lesson is single-part: that is what tells the model to fill the
-    lesson-level keys (see clause ۶-۳ of the contract).
+    lesson-level keys (see clause ۶-۳ of the contract). A packed one-part lesson
+    still lists every topic in ``topics`` so no source topic is dropped. The
+    one conditional rule that travels in the user message concerns that packed
+    case: it is needed only for those requests and must not lengthen the
+    cacheable system prompt for every other job.
     """
+    titles = tuple(" ".join(value.split()) for value in topics if value.strip())
+    if len(titles) > 1:
+        topic_line = CHUNK_TOPICS_PREFIX + " " + " | ".join(titles)
+    else:
+        selected = titles[0] if titles else topic
+        topic_line = f"{CHUNK_TOPIC_PREFIX} {selected}" if selected else f"{CHUNK_TOPIC_PREFIX} (نامشخص)"
     label = header or SINGLE_CHUNK_HEADER
-    if total <= 1:
+    if total <= 1 and len(titles) <= 1:
         return label + "\n\n" + body
-    position = CHUNK_POSITION_PREFIX.format(
-        index=to_persian_digits(index), total=to_persian_digits(total)
-    )
-    parts = [label, position] if header else [position]
+    parts: list[str] = []
+    if total > 1:
+        if header:
+            parts.append(label)
+        parts.append(CHUNK_POSITION_PREFIX.format(
+            index=to_persian_digits(index), total=to_persian_digits(total)
+        ))
+    else:
+        parts.append(label)
     if context_block:
         parts.append(context_block)
+    if len(titles) > 1:
+        parts.append(PACKED_TOPIC_RULE)
     parts.append(body)
-    parts.append(f"{CHUNK_TOPIC_PREFIX} {topic}" if topic else f"{CHUNK_TOPIC_PREFIX} (نامشخص)")
+    parts.append(topic_line)
     return "\n\n".join(parts)
 
 

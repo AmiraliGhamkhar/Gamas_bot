@@ -99,8 +99,11 @@ no page image is ever sent to a third-party recognition service.
   Booklets split complete extracted text into request-sized pieces. If the
   full booklet would need more than 200 initial map requests, it uses the
   complete source-only fallback when enabled, rather than charging the
-  provider for a pathological request count. On shared cPanel, deployment must
-  pass `python -m scripts.cpanel_preflight`: the 1 GiB default with two download
+  provider for a pathological request count. When several short topics share
+  one request, the request names every topic it owns and asks for one
+  section each, so packing never hides the rest of the lesson. On shared cPanel,
+  deployment must pass `python -m scripts.cpanel_preflight`: the 1 GiB default
+  with two download
   slots needs 4.125 GiB of *free* temporary space. The documented 1 GiB cPanel
   profile uses 128 MiB document/input ceilings instead; see
   [cPanel deployment](CPANEL.md#2-validate).
