@@ -885,9 +885,16 @@ class RejectedBookletTests(BotPipelineTestCase):
         self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
         self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "docx"))
         self.assertIn("سلام دوستان", await self.fetch_transcript(submission))
-        self.assertTrue(
+        # The recovered-quality notice is internal-only: the user sees a
+        # clean success message, while status/error_kind stay partial for
+        # admin reporting.
+        self.assertFalse(
             any("بازیابی" in text for text in event.edits + event.replies),
-            f"the user must be told about the source-safe result: {event.edits + event.replies!r}",
+            f"the recovered notice must not be shown to the user: {event.edits + event.replies!r}",
+        )
+        self.assertFalse(
+            any("نکته:" in text for text in event.edits + event.replies),
+            f"no quality note must be shown to the user: {event.edits + event.replies!r}",
         )
         # One charge for the work that was actually done, never a duplicate.
         debits = await self.db.db.execute_fetchall(
@@ -900,7 +907,11 @@ class RejectedBookletTests(BotPipelineTestCase):
 
 
 class IncompleteBookletDeliveryTests(BotPipelineTestCase):
-    """An accepted booklet that lost source facts is delivered as partial."""
+    """An accepted booklet that lost source facts is delivered as partial.
+
+    The «جزوه ناقص است» note is internal-only: the user sees a clean
+    success message, while status/error_kind stay partial for admin.
+    """
 
     def settings_overrides(self) -> dict:
         return {
@@ -945,11 +956,16 @@ class IncompleteBookletDeliveryTests(BotPipelineTestCase):
             "SELECT error_kind FROM submissions WHERE submission_id=?", (submission,)
         )
         self.assertEqual(kinds[0][0], "notes_incomplete")
-        # The safe partial draft remains renderable; missing facts are reported.
+        # The safe partial draft remains renderable; the incomplete note is
+        # internal-only and must not be shown to the user at delivery.
         self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
-        self.assertTrue(
+        self.assertFalse(
             any("متن خام" in text for text in event.edits + event.replies),
-            "the user must be told the booklet is incomplete",
+            f"the incomplete note must not be shown to the user: {event.edits + event.replies!r}",
+        )
+        self.assertFalse(
+            any("نکته:" in text for text in event.edits + event.replies),
+            f"no quality note must be shown to the user: {event.edits + event.replies!r}",
         )
 
 

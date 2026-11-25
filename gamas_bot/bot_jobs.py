@@ -85,6 +85,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("gamas_bot.bot.jobs")
 
+#: Booklet-quality notices that must not be shown to the user at delivery
+#: time.  The booklet is still delivered and the submission is still
+#: recorded as ``partial`` with the original ``error_kind`` for admin
+#: reporting — only the user-facing «نکته: جزوه ناقص است» text is hidden.
+_HIDDEN_BOOKLET_NOTICE_KINDS: frozenset[str] = frozenset(
+    {"notes_incomplete", "notes_degraded", "notes_recovered"}
+)
+
 
 class JobPipelineMixin:
     """Queued media/presentation processing and progressive Telegram delivery."""
@@ -1767,10 +1775,36 @@ class JobPipelineMixin:
                     "\n\nنکته: فایل‌های جزوه ذخیره نشدند؛ متن خام درس در دسترس است.",
                 )
 
-        notice = "".join(text for _kind, text in notice_parts)
-        notice_kinds = tuple(dict.fromkeys(kind for kind, _text in notice_parts))
+        # Booklet-quality notices (incomplete / degraded / recovered) are
+        # internal-only: the user sees a clean success message, while the
+        # submission keeps status='partial' + error_kind for admin reporting.
+        user_notice_parts = [
+            (kind, text)
+            for kind, text in notice_parts
+            if kind not in _HIDDEN_BOOKLET_NOTICE_KINDS
+        ]
+        internal_notice_parts = [
+            (kind, text)
+            for kind, text in notice_parts
+            if kind in _HIDDEN_BOOKLET_NOTICE_KINDS
+        ]
+        if internal_notice_parts:
+            logger.info(
+                "booklet delivered with hidden quality notice submission=%s kinds=%s",
+                job.submission_id,
+                ",".join(dict.fromkeys(kind for kind, _text in internal_notice_parts)),
+            )
+        notice = "".join(text for _kind, text in user_notice_parts)
+        notice_kinds = tuple(dict.fromkeys(kind for kind, _text in user_notice_parts))
         notice_kind = notice_kinds[0] if len(notice_kinds) == 1 else (
             "booklet_partial" if notice_kinds else ""
+        )
+        internal_notice = "".join(text for _kind, text in internal_notice_parts)
+        internal_kinds = tuple(
+            dict.fromkeys(kind for kind, _text in internal_notice_parts)
+        )
+        internal_notice_kind = internal_kinds[0] if len(internal_kinds) == 1 else (
+            "booklet_partial" if internal_kinds else ""
         )
         await self._deliver_results(
             job,
@@ -1783,6 +1817,8 @@ class JobPipelineMixin:
             progress=progress,
             notice=notice,
             notice_kind=notice_kind,
+            internal_notice=internal_notice,
+            internal_notice_kind=internal_notice_kind,
         )
 
     async def _send_telegram_file(
@@ -1838,12 +1874,18 @@ class JobPipelineMixin:
         progress: Any | None = None,
         notice: str = "",
         notice_kind: str = "",
+        internal_notice: str = "",
+        internal_notice_kind: str = "",
     ) -> bool:
         """End the job with one message and a button per artifact.
 
         This replaces the old two-push ending (transcript file, a chat preview,
         then the booklet). Settlement already happened by the time this runs, so
         every button below is free and may be pressed any number of times.
+
+        ``notice`` is user-visible; ``internal_notice`` is recorded in the
+        database (status/error_kind for admin reporting) but never appended
+        to the message shown to the user.
         """
         from .artifacts import (
             KIND_BOOKLET,
@@ -1933,6 +1975,8 @@ class JobPipelineMixin:
             body = body.replace(header, f"خروجی‌های در دسترس — {reference}", 1)
         # Quality notices are a suffix to the single results message: do not
         # create a competing Telegram interaction or expose any source text.
+        # Internal-only notices (hidden booklet-quality warnings) never reach
+        # ``body``; they only keep the submission ``partial`` for admin.
         body += notice
         notified = await self._reply(job, body, buttons=buttons)
         if not notified:
@@ -1941,9 +1985,24 @@ class JobPipelineMixin:
                 job.submission_id,
             )
             job.meta["delivery_failed"] = True
-        status = "done" if notified and not notice and not render_incomplete else "partial"
-        status_error = notice.strip() or None
-        status_kind = notice_kind or ("booklet_render" if render_incomplete else None)
+        status = (
+            "done"
+            if notified and not notice and not internal_notice and not render_incomplete
+            else "partial"
+        )
+        status_error = (notice + internal_notice).strip() or None
+        if notice_kind and internal_notice_kind:
+            status_kind = (
+                notice_kind
+                if notice_kind == internal_notice_kind
+                else "booklet_partial"
+            )
+        else:
+            status_kind = (
+                internal_notice_kind
+                or notice_kind
+                or ("booklet_render" if render_incomplete else None)
+            )
         if not notified:
             status_error = "\n".join(
                 part for part in ("results notification failed", status_error) if part

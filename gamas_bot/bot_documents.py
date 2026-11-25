@@ -1477,10 +1477,15 @@ class DocumentOfficeWorkflowMixin:
             return outputs
 
         def _success_text(_outputs: list[Any]) -> str:
-            text = texts.BOOKLET_SUCCESS
+            # Incomplete-coverage warnings are internal-only (logged for
+            # admin/ops) and must not be shown to the user at delivery.
             if note_incomplete.get("reason"):
-                text += "\n\nℹ️ پوشش برخی جزئیات منبع تأیید نشد؛ متن اصلی را نیز بررسی کنید."
-            return text
+                logger.info(
+                    "office booklet delivered with hidden incomplete coverage "
+                    "reason=%s",
+                    note_incomplete.get("reason"),
+                )
+            return texts.BOOKLET_SUCCESS
 
         await self._office_run_operation(
             event,
@@ -2045,10 +2050,14 @@ class DocumentOfficeWorkflowMixin:
             return outputs
 
         def success_text(_outputs: list[Any]) -> str:
-            message = texts.BOOKLET_SUCCESS
+            # Incomplete-coverage warnings are internal-only (logged for
+            # admin/ops) and must not be shown to the user at delivery.
             if verification_incomplete:
-                message += "\nℹ️ پوشش همهٔ جزئیات منبع در اعتبارسنجی نهایی تأیید نشد."
-            return message
+                logger.info(
+                    "office booklet delivered with hidden incomplete coverage "
+                    "verification_incomplete=True",
+                )
+            return texts.BOOKLET_SUCCESS
 
         await self._office_run_operation(
             event,
