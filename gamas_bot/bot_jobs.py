@@ -1509,10 +1509,18 @@ class JobPipelineMixin:
             try:
                 notes = ensure_structured_booklet(notes, source_text)
                 if notes.verification_report is None and getattr(self.settings, "note_strict_grounding", False):
-                    notes, final_report = gate_notes(notes, source_text, strict=True, mode="full")
-                    notes = enforce_final_acceptance(
-                        notes, final_report, mode="full", stage="render_boundary", allow_incomplete=True
-                    )
+                    if source_text.strip():
+                        notes, final_report = gate_notes(notes, source_text, strict=True, mode="full")
+                        notes = enforce_final_acceptance(
+                            notes, final_report, mode="full", stage="render_boundary", allow_incomplete=True
+                        )
+                    else:
+                        logger.warning(
+                            "booklet render boundary skipped source gate: missing source text submission=%s",
+                            job.submission_id,
+                        )
+                        if isinstance(getattr(job, "meta", None), dict):
+                            job.meta.setdefault("note_quality", "DEGRADED")
                 if not structurally_valid_booklet(notes):
                     raise StructuringError("booklet structure is invalid")
                 if isinstance(getattr(job, "meta", None), dict):
@@ -1682,40 +1690,40 @@ class JobPipelineMixin:
             # The interactive review sheet is planned from the same validated
             # notes after the PDF and DOCX are final. Any failure here adds a
             # notice only: the PDF and DOCX bytes above are already stored.
-            from .artifacts import KIND_REVIEW_HTML
+            if pdf_ready or docx_ready:
+                from .artifacts import KIND_REVIEW_HTML
 
-            try:
-                review_file = await render_booklet_review(
-                    notes,
-                    reference=reference,
-                    announce=lambda label: progress.update(95, label),
-                )
-            except Exception:
-                logger.exception(
-                    "review HTML generation failed submission=%s", job.submission_id
-                )
-                add_notice("review_html", texts.NOTICE_REVIEW_HTML)
-            if review_file is not None:
                 try:
-                    await self.db.binary_artifact_upsert(
-                        job.submission_id,
-                        job.user_id,
-                        KIND_REVIEW_HTML,
-                        filename=review_file.filename,
-                        content_type="text/html",
-                        content=review_file.content,
+                    review_file = await render_booklet_review(
+                        notes,
+                        reference=reference,
+                        announce=lambda label: progress.update(95, label),
                     )
-                    review_ready = True
                 except Exception:
                     logger.exception(
-                        "could not persist review HTML submission=%s", job.submission_id
+                        "review HTML generation failed submission=%s", job.submission_id
                     )
-                    add_notice("review_html_storage", texts.NOTICE_REVIEW_HTML_STORAGE)
+                    add_notice("review_html", texts.NOTICE_REVIEW_HTML)
+                if review_file is not None:
+                    try:
+                        await self.db.binary_artifact_upsert(
+                            job.submission_id,
+                            job.user_id,
+                            KIND_REVIEW_HTML,
+                            filename=review_file.filename,
+                            content_type="text/html",
+                            content=review_file.content,
+                        )
+                        review_ready = True
+                    except Exception:
+                        logger.exception(
+                            "could not persist review HTML submission=%s", job.submission_id
+                        )
+                        add_notice("review_html_storage", texts.NOTICE_REVIEW_HTML_STORAGE)
 
-            # The Library retains the editable source text and learning entry
-            # points.  It is a virtual record (no automatic Telegram upload);
-            # re-download routes use the persisted PDF rather than message ids.
-            if pdf_ready or docx_ready:
+                # The Library retains the editable source text and learning entry
+                # points.  It is a virtual record (no automatic Telegram upload);
+                # re-download routes use the persisted PDF rather than message ids.
                 learning_text = normalize_content_text(source_text)
                 try:
                     match = await self.db.library_submission_source_item(

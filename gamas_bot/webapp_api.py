@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import mimetypes
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
+
+logger = logging.getLogger(__name__)
 
 from .config import Settings, from_env
 from .db import Database
@@ -221,7 +224,9 @@ def make_wsgi_app(
                 ("Content-Length", str(len(data))),
                 (
                     "Content-Disposition",
-                    f'attachment; filename="{_safe_filename(filename)}"',
+                    "attachment; "
+                    f'filename="{_safe_filename(filename)}"; '
+                    f"filename*=UTF-8''{quote(filename or _safe_filename(filename), safe='')}",
                 ),
                 ("Cache-Control", "private, no-store"),
             ],
@@ -314,8 +319,12 @@ def make_wsgi_app(
                     expires_at = expiry_rows[0]["expires_at"] if expiry_rows else None
                     plan_rows = list(await db.db.execute_fetchall(
                         """
-                        SELECT p.plan_code, pl.hours, pl.price, pl.original_price,
-                               pl.validity_days, p.created_at AS purchased_at
+                        SELECT p.plan_code,
+                               p.purchased_seconds, p.purchased_price, p.purchased_validity_days,
+                               p.created_at, p.reviewed_at,
+                               pl.hours AS plan_hours, pl.price AS plan_price,
+                               pl.original_price AS plan_original_price,
+                               pl.validity_days AS plan_validity_days
                         FROM payments p
                         LEFT JOIN plans pl ON pl.code = p.plan_code
                         WHERE p.user_id = ? AND p.status = 'approved'
@@ -326,13 +335,35 @@ def make_wsgi_app(
                     plan: dict[str, Any] | None = None
                     if plan_rows:
                         row = dict(plan_rows[0])
+                        purchased_seconds = row.get("purchased_seconds")
+                        if purchased_seconds is None and row.get("plan_hours") is not None:
+                            purchased_seconds = int(round(float(row["plan_hours"]) * 3600))
+                        hours = (
+                            int(round(int(purchased_seconds) / 3600))
+                            if purchased_seconds is not None
+                            else row.get("plan_hours")
+                        )
+                        purchased_price = row.get("purchased_price")
+                        if purchased_price is None:
+                            purchased_price = row.get("plan_price")
+                        purchased_validity_days = row.get("purchased_validity_days")
+                        if purchased_validity_days is None:
+                            purchased_validity_days = row.get("plan_validity_days")
                         plan = {
                             "code": row.get("plan_code"),
-                            "hours": row.get("hours"),
-                            "price": row.get("price"),
-                            "original_price": row.get("original_price"),
-                            "validity_days": row.get("validity_days"),
-                            "purchased_at": row.get("purchased_at"),
+                            "hours": hours,
+                            "price": (
+                                int(purchased_price)
+                                if purchased_price is not None
+                                else None
+                            ),
+                            "original_price": (
+                                int(row["plan_original_price"])
+                                if row.get("plan_original_price") is not None
+                                else None
+                            ),
+                            "validity_days": purchased_validity_days,
+                            "purchased_at": row.get("reviewed_at") or row.get("created_at"),
                         }
                     return {
                         "unlimited": unlimited,
@@ -690,7 +721,19 @@ def make_wsgi_app(
                         ORDER BY question_id ASC LIMIT 50
                         """
                     )
-                    return {"items": [dict(r) for r in rows]}
+                    items: list[dict[str, Any]] = []
+                    for row in rows:
+                        item = dict(row)
+                        raw_options = item.get("options_json")
+                        try:
+                            options = json.loads(raw_options) if isinstance(raw_options, str) else raw_options
+                        except Exception:
+                            options = []
+                        if not isinstance(options, list):
+                            options = []
+                        item["options"] = options
+                        items.append(item)
+                    return {"items": items}
 
                 return _json_response(
                     start_response, "200 OK", asyncio.run(_with_db(cfg, _pending))
@@ -903,14 +946,26 @@ def make_wsgi_app(
                         )
                     if error == "usage_limit":
                         return _json_response(
-                            start_response, "400 Bad Request", {"error": "usage limit reached"}
+                            start_response,
+                            "400 Bad Request",
+                            {"error": "usage limit reached"},
                         )
+                    if error == "insufficient_points":
+                        return _json_response(
+                            start_response,
+                            "400 Bad Request",
+                            {
+                                "error": "insufficient points",
+                                "balance": int(result.get("reward_points") or 0),
+                            },
+                        )
+                    logger.warning("reward redeem returned unexpected error=%s user=%s", error, user_id)
                     return _json_response(
                         start_response,
                         "400 Bad Request",
                         {
-                            "error": "insufficient points",
-                            "balance": int(result.get("reward_points") or 0),
+                            "error": "redemption_not_completed",
+                            "detail": error or "unknown_error",
                         },
                     )
 
