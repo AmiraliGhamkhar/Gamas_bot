@@ -382,15 +382,18 @@ class ReviewRepository:
                     "status": str(existing[0]["status"]),
                     "already_shared": True,
                 }
+            source_title = str(candidate.get("source_title") or "").strip()
+            topic = source_title[:48] if source_title else "عمومی"
             cursor = await self._core.db.execute(
                 """
                 INSERT INTO explore_questions(
                     topic, difficulty, question_text, options_json,
                     correct_index, explanation, status, created_by, created_at,
                     source_question_id
-                ) VALUES ('عمومی', 'easy', ?, ?, ?, ?, 'pending', ?, ?, ?)
+                ) VALUES (?, 'medium', ?, ?, ?, ?, 'pending', ?, ?, ?)
                 """,
                 (
+                    topic,
                     candidate["question"],
                     candidate["options_json"],
                     candidate["correct_index"],
@@ -420,11 +423,15 @@ class ReviewRepository:
         if not rows:
             return None
         row = dict(rows[0])
+        source_title = str(row.get("pack_title") or row.get("item_title") or "").strip()
+        source_kind = str(row.get("pack_source_type") or row.get("item_kind") or "").strip()
         return {
             "question": str(row["question"]),
             "options_json": str(row["options_json"]),
             "correct_index": int(row["correct_index"]),
             "explanation": str(row["explanation"] or ""),
+            "source_title": source_title,
+            "source_kind": source_kind,
         }
 
 

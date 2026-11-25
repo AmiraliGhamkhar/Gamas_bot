@@ -3255,7 +3255,8 @@ def ensure_structured_booklet(notes: StructuredNotes, source: str) -> Structured
     and deterministic so schema/format problems do not require another provider
     call or turn a usable transcript into a failed job.
     """
-    if not is_usable_transcript(source):
+    source_usable = is_usable_transcript(source)
+    if not source_usable and not any(section.has_content for section in notes.sections):
         raise StructuringError("متن پیاده‌سازی‌شده برای ساخت جزوه محتوای قابل‌استفاده‌ای نداشت.")
     sections: list[NoteSection] = []
     changed = False
@@ -3269,11 +3270,16 @@ def ensure_structured_booklet(notes: StructuredNotes, source: str) -> Structured
             changed = True
         sections.append(replace(section, heading=heading))
     if not sections:
+        if not source_usable:
+            raise StructuringError("متن پیاده‌سازی‌شده برای ساخت جزوه محتوای قابل‌استفاده‌ای نداشت.")
         return deterministic_fallback_notes(source)
 
     title = notes.title.strip()
     if not title or normalize_for_compare(title) in _GENERIC_BOOKLET_TITLES:
-        title = _fallback_title(source)
+        if source_usable:
+            title = _fallback_title(source)
+        else:
+            title = sections[0].heading.strip() if sections else "جزوهٔ گاماس"
         changed = True
 
     # A final review is mandatory for a delivered full booklet. When a provider
