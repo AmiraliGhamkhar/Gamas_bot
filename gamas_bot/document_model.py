@@ -619,6 +619,10 @@ _PLAN_DIMENSIONS = {
     "numbers": "important_numbers", "units": "important_numbers", "dates": "important_numbers",
     "terminology": "critical_terms", "abbreviations": "critical_terms",
     "formulas": "important_facts", "definitions": "important_facts",
+    "mechanism": "description", "classification": "description",
+    "causes_risk_factors": "description", "signs_symptoms": "description",
+    "diagnosis_treatment": "description", "examples_comparisons": "description",
+    "practical_relevance": "description", "exam_pitfalls": "description",
 }
 
 

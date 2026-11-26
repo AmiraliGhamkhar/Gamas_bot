@@ -387,6 +387,10 @@ def _present_dimensions(sections: Sequence[n.NoteSection]) -> tuple[set[str], st
         present.update(("definitions", "terminology"))
     if any(s.formulas for s in sections):
         present.add("formulas")
+    if any(c.kind in ("هشدار", "نکته") for s in sections for c in s.callouts):
+        present.add("exam_pitfalls")
+    if any(s.examples for s in sections) or any(s.all_tables for s in sections):
+        present.add("examples_comparisons")
     return present, text
 
 

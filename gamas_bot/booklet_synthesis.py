@@ -360,6 +360,19 @@ class _Editor:
             return left + await self.group(entries[cut:], depth + 1)
 
 
+def _finalize_global_learning_materials(candidate: n.StructuredNotes) -> n.StructuredNotes:
+    """Ensure global learning materials are deduplicated without violating preservation."""
+    objectives = tuple(dict.fromkeys(item.strip() for item in candidate.learning_objectives if item.strip()))
+    final_review = tuple(dict.fromkeys(item.strip() for item in candidate.final_review if item.strip()))
+    review_questions = tuple(dict.fromkeys(item.strip() for item in candidate.review_questions if item.strip()))
+    return replace(
+        candidate,
+        learning_objectives=objectives,
+        final_review=final_review,
+        review_questions=review_questions,
+    )
+
+
 def _candidate(basis: n.StructuredNotes, entries: list[_Entry], title: str, recovered: bool,
                document: NormalizedDocument, router: n.SectionWriter) -> n.StructuredNotes:
     headings = {entry.id: entry.section.heading for entry in entries}
@@ -367,7 +380,9 @@ def _candidate(basis: n.StructuredNotes, entries: list[_Entry], title: str, reco
     for entry in entries:
         callouts = list(entry.section.callouts)
         for target, kind in entry.links:
-            label = headings[target]
+            label = headings.get(target, "").strip()
+            if not label:
+                continue
             if kind == "potential_conflict":
                 text = f"ناهمخوانی احتمالی با «{label}»؛ هر دو مقدار در جزوه حفظ شده‌اند."
             elif kind == "transition":
@@ -376,8 +391,10 @@ def _candidate(basis: n.StructuredNotes, entries: list[_Entry], title: str, reco
                 text = f"برای ارتباط موضوعی، «{label}» را ببینید."
             callouts.append(n.NoteCallout("یادآوری", text))
         sections.append(replace(entry.section, callouts=tuple(dict.fromkeys(callouts))))
-    candidate = replace(basis, sections=tuple(sections), title=title,
-                        quality_state=n.QUALITY_RECOVERED if recovered else basis.quality_state)
+    candidate = _finalize_global_learning_materials(
+        replace(basis, sections=tuple(sections), title=title,
+                quality_state=n.QUALITY_RECOVERED if recovered else basis.quality_state)
+    )
     accepted = n.compile_accepts(candidate, basis) and not n.booklet_output_violations(candidate)
     if accepted and router.settings.note_strict_grounding:
         if candidate.to_payload() != basis.to_payload():
