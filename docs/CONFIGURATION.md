@@ -117,8 +117,11 @@ route checks its prompt with Google's `countTokens`; private proxies and other
 routes use the conservative configurable estimate. Unknown model IDs use the
 configurable ceilings above, not the provider default model's advertised size.
 `NOTE_COMPILE=true` opts into synthesis after deterministic merge and a local
-preflight. It edits the merged draft, not the raw source. Final verification
-and the bounded repair pass run on the retained draft after synthesis.
+preflight. The editorial request is only sent when deterministic checks find a
+coverage gap, duplicate, conflicting merge, bad title or plan-order problem;
+otherwise the merged draft stays untouched. It edits the merged draft, not the
+raw source. Final verification and the bounded repair pass run on the retained
+draft after synthesis.
 `NOTE_COMPILE_MAX_CHARS=0` derives the synthesis request ceiling from the routed
 context/output budgets; a positive ceiling can only lower it. Large drafts use
 whole-section topic groups, chapter outlines and a final complete ID manifest.

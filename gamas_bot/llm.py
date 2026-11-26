@@ -49,6 +49,7 @@ from .http_util import (
     retry_after_seconds as _retry_after_seconds,
     sanitize_error_text as _sanitize_error_text,
 )
+from .booklet_telemetry import record_provider_tokens, record_wire
 from .logging_config import collect_configured_secrets
 from .llm_profiles import (
     ModelCapacity,
@@ -1613,6 +1614,8 @@ def _log_usage(
     cached_tokens, reasoning_tokens = _usage_detail_counts(payload, route.style)
     _ACTUAL_USAGE_TOKENS.set(total_tokens)
     _REQUEST_USAGE.set((model, input_tokens, output_tokens))
+    # Best-effort job telemetry: a broken counter must never fail the request.
+    record_provider_tokens(input_tokens, output_tokens)
     request_id = _response_request_id(headers, payload=payload, api_key=route.api_key)
 
     def shown(value: int | None) -> str:
@@ -3012,6 +3015,7 @@ async def _dispatch_across_routes(
                 wire_attempts = max(1, _WIRE_ATTEMPTS.get())
                 _ACTUAL_USAGE_TOKENS.reset(usage_token)
                 _WIRE_ATTEMPTS.reset(wire_token)
+                record_wire(_REQUEST_STAGE.get(), wire_attempts)
                 _REQUEST_STAGE.reset(stage_scope)
                 await asyncio.to_thread(
                     finish_quota, hold, actual_tokens=actual_tokens, succeeded=succeeded,

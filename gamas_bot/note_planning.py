@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from .booklet_telemetry import record_call
 from .document_model import (
     DEFAULT_PLAN_DEPTH,
     PLAN_DEPTHS,
@@ -315,6 +316,8 @@ async def maybe_refine_plan(
         sent.add(user)
         attempts += 1
         try:
+            record_call("BOOKLET_PLAN", system=_WINDOW_SYSTEM, user=user,
+                        chars_per_token=settings.llm_token_estimation_chars_per_token)
             payload = await complete_json(
                 session, settings, system=_WINDOW_SYSTEM,
                 user=user,

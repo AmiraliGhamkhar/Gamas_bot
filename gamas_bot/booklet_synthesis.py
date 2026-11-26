@@ -10,6 +10,7 @@ from itertools import groupby
 
 from . import notes as n
 from ._prompt_block import synthesis_system_prompt
+from .booklet_telemetry import record_call
 from .document_model import ContentPlan, NormalizedDocument
 from .llm import LLMContextOverflowError, LLMError, LLMOutputBudgetError
 
@@ -308,6 +309,8 @@ class _Editor:
         self.attempts += 1
         try:
             async with self.router.semaphore:
+                record_call("BOOKLET_COMPILE", system=synthesis_system_prompt(), user=message,
+                            chars_per_token=self.router.settings.llm_token_estimation_chars_per_token)
                 reply = await n.complete_json(
                     self.router.session, self.router.settings, system=synthesis_system_prompt(), user=message,
                     schema=self.schema, task="BOOKLET_COMPILE", adaptive_capacity=True, strict_json=True,

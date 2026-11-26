@@ -25,6 +25,7 @@ from telethon.tl.custom import Message
 from . import texts
 from .artifact_validation import validate_docx_artifact, validate_pdf_artifact
 from .bot_deps import deps_for
+from .booklet_telemetry import enter_job_scope, exit_job_scope
 from .bot_ui import ACTIVE_LIMIT_MESSAGE
 from .db import InsufficientBalanceError, TooManyActiveJobsError
 from .db_study_packs import (
@@ -1375,16 +1376,20 @@ class JobPipelineMixin:
         job_meta = getattr(job, "meta", None)
         if not isinstance(job_meta, dict):
             job_meta = None
+        job_scope = enter_job_scope(job.submission_id)
         try:
-            notes = await self.deps.structure_transcript(
-                document_text,
-                self.settings,
-                self._http_session(),  # type: ignore[attr-defined]
-                mode=self.settings.note_mode,
-                on_merged=None,
-                on_stage=self._note_stage_callback(job, progress),
-                on_incomplete=self._note_incomplete_callback(job),
-            )
+            try:
+                notes = await self.deps.structure_transcript(
+                    document_text,
+                    self.settings,
+                    self._http_session(),  # type: ignore[attr-defined]
+                    mode=self.settings.note_mode,
+                    on_merged=None,
+                    on_stage=self._note_stage_callback(job, progress),
+                    on_incomplete=self._note_incomplete_callback(job),
+                )
+            finally:
+                exit_job_scope(job_scope)
             source = document_text.text if isinstance(document_text, NormalizedDocument) else document_text
             notes = ensure_structured_booklet(notes, source)
             quality_state = getattr(notes, "quality_state", "VERIFIED")
@@ -1436,17 +1441,21 @@ class JobPipelineMixin:
             return None
         if not outline.strip() and not transcript_text.strip():
             return None
+        job_scope = enter_job_scope(job.submission_id)
         try:
-            notes = await structure_presentation(
-                outline,
-                transcript_text,
-                self.settings,
-                self._http_session(),  # type: ignore[attr-defined]
-                mode=self.settings.note_mode,
-                document=document,
-                on_stage=self._note_stage_callback(job, progress),
-                on_incomplete=self._note_incomplete_callback(job),
-            )
+            try:
+                notes = await structure_presentation(
+                    outline,
+                    transcript_text,
+                    self.settings,
+                    self._http_session(),  # type: ignore[attr-defined]
+                    mode=self.settings.note_mode,
+                    document=document,
+                    on_stage=self._note_stage_callback(job, progress),
+                    on_incomplete=self._note_incomplete_callback(job),
+                )
+            finally:
+                exit_job_scope(job_scope)
             source_document = document or build_presentation_document(outline, transcript_text)
             notes = ensure_structured_booklet(notes, source_document)
             job.meta["note_quality"] = getattr(notes, "quality_state", "VERIFIED")

@@ -75,6 +75,14 @@ from ._prompt_block import (  # noqa: F401  (re-exported public prompt surface)
     synthesis_system_prompt,
 )
 
+from .booklet_telemetry import (
+    BookletTelemetry,
+    current_job_id,
+    current_telemetry,
+    enter_scope,
+    exit_scope,
+    record_call,
+)
 from .config import Settings, note_routes, resolve_note_mode
 from .llm import (
     LLMContextOverflowError,
@@ -3692,8 +3700,11 @@ async def _structure_piece(
                 validated_notes = _load_json_payload(candidate, mode=mode)
 
             async with semaphore:
+                message = render(unit)
+                record_call("BOOKLET_GENERATION", system=system_prompt, user=message,
+                            chars_per_token=settings.llm_token_estimation_chars_per_token)
                 payload = await complete_json(
-                    session, settings, system=system_prompt, user=render(unit),
+                    session, settings, system=system_prompt, user=message,
                     schema=_response_schema(settings), task="BOOKLET_GENERATION", adaptive_capacity=True,
                     validate_payload=validate_booklet_payload,
                 )
@@ -3795,6 +3806,53 @@ def compile_will_run(
 ) -> bool:
     """Whether the booklet is eligible for the optional editorial pass."""
     return compile_skip_reason(notes, settings, mode=mode, presentation=presentation) is None
+
+
+#: Deterministic verification codes that the bounded editorial pass can act
+#: on (coverage omissions and structural/edit defects). Unsupported claims and
+#: measurement mismatches belong to the separate targeted repair pass.
+_COMPILE_EDIT_CODES = frozenset({
+    "missing_number", "missing_date", "missing_term", "missing_topic", "missing_dimension",
+    "duplicate_content", "duplicate_section", "duplicate_identifier", "identifier_conflict",
+    "topic_order", "empty_section", "empty_heading", "missing_title", "missing_final_review",
+})
+
+
+def booklet_needs_compile(notes: StructuredNotes, plan: ContentPlan) -> bool:
+    """Cheap deterministic signals that the editorial pass can act on.
+
+    The compile stage only edits existing references, duplicates, titles and
+    order. When the deterministic merge shows none of those signals, sending
+    the whole booklet to a model buys no coverage and no factual content.
+    """
+    if notes.merge_conflicts:
+        return True
+    if not notes.title.strip() or normalize_for_compare(notes.title) in _GENERIC_BOOKLET_TITLES:
+        return True
+    seen: set[tuple] = set()
+    for section in notes.sections:
+        for field in ("paragraphs", "bullets"):
+            values = getattr(section, field)
+            if len(set(values)) != len(values):
+                return True
+        if section.has_content:
+            key = (section.topic_id, section.source_block_ids, section.heading,
+                   section.paragraphs, section.bullets, section.key_points)
+            if key in seen:
+                return True
+            seen.add(key)
+    positions: dict[str, int] = {}
+    for index, section in enumerate(notes.sections):
+        if section.topic_id and section.topic_id not in positions:
+            positions[section.topic_id] = index
+    for topic in plan.topics:
+        position = positions.get(topic.id)
+        if position is None:
+            continue
+        for dependency in (*topic.depends_on, topic.parent_id):
+            if dependency in positions and positions[dependency] > position:
+                return True
+    return False
 
 
 async def synthesize_booklet(
@@ -3912,9 +3970,12 @@ async def _structure_booklet(
             return len(text) <= unit_char_limit and estimate_tokens(text, chars_per_token=ratio) <= body_budget
 
         fitted = source.fit(topics, fits_body, max_probe_chars=unit_char_limit)
-        if pack_target > 0 and len(fitted) > 1:
-            return pack_semantic_units(source, fitted, target_chars=pack_target, fits=fits_body)
-        return fitted
+        units = (pack_semantic_units(source, fitted, target_chars=pack_target, fits=fits_body)
+                 if pack_target > 0 and len(fitted) > 1 else fitted)
+        telemetry = current_telemetry()
+        if telemetry is not None:
+            telemetry.record_units(len(topics), len(units))
+        return units
 
     units = await asyncio.to_thread(fit_plan, plan)
     if not units:
@@ -3967,9 +4028,30 @@ async def _structure_booklet(
             return await synthesize_booklet(with_provenance(baseline), plan, normalized, writer)
 
         has_healthy = len(writer.failures) < len(units)
+
+        async def needs_editorial_pass() -> bool:
+            """Only ask for an editorial pass when a deterministic signal exists."""
+            if booklet_needs_compile(draft, plan):
+                return True
+            # A full but still provider-free scan catches omitted planned facts
+            # that the compile can restore from its quoted source items.
+            from .booklet_verification import verify_booklet
+
+            try:
+                report = await asyncio.to_thread(
+                    verify_booklet, draft, normalized, plan, strict=settings.note_strict_grounding,
+                )
+            except Exception as exc:  # noqa: BLE001 - compile is optional
+                logger.debug("compile preflight skipped reason=%s", type(exc).__name__)
+                return False
+            return any(issue.code in _COMPILE_EDIT_CODES for issue in report.issues)
+
+        # Keep the deterministic merge as the baseline unless the compile is
+        # enabled *and* a cheap deterministic signal says an edit can help.
+        compile_enabled = compile_will_run(draft, settings, mode=resolved_mode, presentation=presentation)
         can_edit = (allow_repair and not writer.failures and draft.quality_state != QUALITY_RECOVERED
                     and any(section.section_id for section in draft.sections)
-                    and compile_will_run(draft, settings, mode=resolved_mode, presentation=presentation))
+                    and compile_enabled and await needs_editorial_pass())
         verified = await verify_and_repair(with_provenance(draft), normalized, plan, writer,
                                            allow_repair=allow_repair and has_healthy,
                                            before_verify=edit if can_edit else None)
@@ -4031,36 +4113,55 @@ async def structure_document(
         _normalized_presentation(document) if presentation
         else NormalizedDocument.from_source_text(document, source_type="txt")
     )
-    notes = await _structure_booklet(
-        normalized, settings, session,
-        mode=mode, presentation=presentation, on_merged=on_merged,
-        source_locators=source_locators, on_stage=on_stage, section_checkpoint=section_checkpoint,
-        on_section_checkpoint=on_section_checkpoint,
-    )
-    notes = ensure_structured_booklet(notes, normalized.text)
-    if not structurally_valid_booklet(notes):
-        raise StructuringError("جزوهٔ تولیدشده ساختار لازم برای رندر نداشت.")
-    report = notes.verification_report
-    if on_incomplete is None or report is None or report.passed or not settings.note_strict_grounding:
-        return notes
-    codes = {issue.code for issue in report.issues}
-    recovery_codes = {"source_only_fallback", "source_node_fallback", "removed_unverified_content"}
-    if "source_only_fallback" in codes or (notes.quality_state == QUALITY_RECOVERED and codes <= recovery_codes):
-        return notes  # recovery is already reported via quality_state
-    if codes & {"missing_number", "missing_date"}:
-        reason = "missing_numbers"
-    elif "missing_term" in codes:
-        reason = "missing_terms"
-    elif "missing_topic" in codes:
-        reason = "missing_topic"
-    else:
-        reason = "verification_incomplete"
-    logger.warning("note delivered incomplete reason=%s issue_count=%d", reason, len(report.issues))
+    telemetry = current_telemetry()
+    own_scope = telemetry is None
+    if telemetry is None:
+        telemetry = BookletTelemetry(job_id=current_job_id())
+    token = enter_scope(telemetry) if own_scope else None
+    notes: StructuredNotes | None = None
     try:
-        await on_incomplete(reason)
-    except Exception:  # noqa: BLE001 - reporting is never a note failure
-        logger.warning("note incomplete callback failed reason=%s", reason, exc_info=True)
-    return notes
+        telemetry.record_source(normalized.text,
+                                chars_per_token=settings.llm_token_estimation_chars_per_token)
+        notes = await _structure_booklet(
+            normalized, settings, session,
+            mode=mode, presentation=presentation, on_merged=on_merged,
+            source_locators=source_locators, on_stage=on_stage, section_checkpoint=section_checkpoint,
+            on_section_checkpoint=on_section_checkpoint,
+        )
+        notes = ensure_structured_booklet(notes, normalized.text)
+        telemetry.record_result(notes)
+        if not structurally_valid_booklet(notes):
+            raise StructuringError("جزوهٔ تولیدشده ساختار لازم برای رندر نداشت.")
+        report = notes.verification_report
+        if on_incomplete is None or report is None or report.passed or not settings.note_strict_grounding:
+            return notes
+        codes = {issue.code for issue in report.issues}
+        recovery_codes = {"source_only_fallback", "source_node_fallback", "removed_unverified_content"}
+        if "source_only_fallback" in codes or (notes.quality_state == QUALITY_RECOVERED and codes <= recovery_codes):
+            return notes  # recovery is already reported via quality_state
+        if codes & {"missing_number", "missing_date"}:
+            reason = "missing_numbers"
+        elif "missing_term" in codes:
+            reason = "missing_terms"
+        elif "missing_topic" in codes:
+            reason = "missing_topic"
+        else:
+            reason = "verification_incomplete"
+        telemetry.note("incomplete", reason)
+        logger.warning("note delivered incomplete reason=%s issue_count=%d", reason, len(report.issues))
+        try:
+            await on_incomplete(reason)
+        except Exception:  # noqa: BLE001 - reporting is never a note failure
+            logger.warning("note incomplete callback failed reason=%s", reason, exc_info=True)
+        return notes
+    except Exception as exc:
+        telemetry.fail(f"{type(exc).__name__}:{getattr(exc, 'reason', '') or ''}")
+        raise
+    finally:
+        telemetry.record_result(notes)
+        if own_scope:
+            telemetry.log_summary()
+            exit_scope(token)
 
 
 _SLIDE_NUMBER_CHARS = "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩"
