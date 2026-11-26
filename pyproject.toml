@@ -111,6 +111,7 @@ files = [
     "gamas_bot/bidi.py",
     "gamas_bot/billing.py",
     "gamas_bot/booklet_synthesis.py",
+    "gamas_bot/booklet_telemetry.py",
     "gamas_bot/booklet_verification.py",
     "gamas_bot/bot.py",
     "gamas_bot/bot_admin.py",

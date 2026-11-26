@@ -4,6 +4,20 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Booklet request efficiency is measured, and the optional editor is now
+conditional.** Every booklet job emits one failure-safe telemetry line with
+source/unit sizes, per-stage LLM request and retry counts, provider token usage
+when available, final booklet size/sections, quality state and failure or
+recovery reasons. Nothing in generation depends on those counters. With
+`NOTE_COMPILE=true`, the editorial pass is now sent only when deterministic
+checks find a coverage gap, duplicate, conflicting merge, bad title or
+plan-order problem; a clean merge keeps the deterministic baseline. Semantic
+verification is additionally gated on a cheap structural pre-check, while
+coverage gaps and measurement mismatches still use targeted node repair. Source
+content, output budgets, packing, provider fallback and all quality gates are
+unchanged. The shipped defaults remain `NOTE_LLM_PLANNER=false` and
+`NOTE_COMPILE=false`.
+
 **Packed booklet requests keep every topic.** When consecutive short topics
 were packed into one provider request, the request ended with only the first
 topic name while the source body contained all of them. The writer could
