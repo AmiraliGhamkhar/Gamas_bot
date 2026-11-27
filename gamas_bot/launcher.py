@@ -30,7 +30,14 @@ import subprocess
 import sys
 import time
 
-from .config import PROJECT_DIR, Settings, check, from_env, is_advisory
+from .config import (
+    PROJECT_DIR,
+    Settings,
+    available_memory_mib,
+    check,
+    from_env,
+    is_advisory,
+)
 from .instance_lock import AlreadyRunningError, InstanceLock, is_locked, read_lock_pid
 from .logging_config import collect_configured_secrets, redact_log_secrets
 
@@ -168,12 +175,15 @@ def ensure_running(
     *,
     min_interval: float = MIN_SPAWN_INTERVAL_SECONDS,
     startup_verify_seconds: float = DEFAULT_STARTUP_VERIFY_SECONDS,
+    min_free_memory_mib: int = 64,
 ) -> str:
     """Return ``running``, ``started``, ``throttled``, ``misconfigured``, or ``failed``.
 
     A separate launcher lock serializes watchdogs from cron and Passenger. The
     bot's own session lock remains authoritative after spawn, while this lock
     avoids starting redundant Python interpreters while the winner is booting.
+    ``min_free_memory_mib`` is the RAM floor below which the watchdog defers
+    the spawn instead of starting straight into an OOM kill.
     """
     prev_umask = os.umask(0o077) if hasattr(os, "umask") else None
     try:
@@ -242,6 +252,19 @@ def ensure_running(
 
             if is_locked(instance_lock_path):
                 return RUNNING
+
+            # RAM guard: never spawn into an OOM kill. Under critical memory
+            # pressure the fresh interpreter would likely be killed anyway;
+            # deferring lets the next watchdog tick retry after pressure drops.
+            mem = available_memory_mib()
+            if mem is not None and mem < min_free_memory_mib:
+                _record_launcher_diagnostic(
+                    log_dir,
+                    f"WARN memory: only {mem} MiB available (< {min_free_memory_mib} MiB); "
+                    "deferring bot spawn to a later watchdog tick",
+                    settings=settings,
+                )
+                return THROTTLED
 
             env = os.environ.copy()
             env.setdefault("PYTHONUNBUFFERED", "1")

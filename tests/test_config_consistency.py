@@ -30,9 +30,13 @@ CONFIG_SOURCE = Path(config.__file__)
 ENV_LINE = re.compile(r"^#?\s*([A-Z0-9_]+)=(.*)$", re.M)
 
 #: Variables documented in ``.env.example`` that are read outside ``config.py``.
-#: The removed Mini App was the only such integration; keep this empty unless a
-#: new out-of-process helper needs a documented setting.
-EXTRA_DOCUMENTED: frozenset[str] = frozenset()
+#: Keep this list minimal: each entry must be a real ``os.environ`` read in the
+#: codebase (checked by hand in review). ``GAMAS_DB_REUSE`` is read by
+#: ``gamas_bot.db_broker``; ``GAMAS_BUILD_POOL``/``GAMAS_BUILD_POOL_SIZE`` by
+#: ``gamas_bot.cpu_pool``.
+EXTRA_DOCUMENTED: frozenset[str] = frozenset(
+    {"GAMAS_DB_REUSE", "GAMAS_BUILD_POOL", "GAMAS_BUILD_POOL_SIZE"}
+)
 
 #: ``(variable, Settings attribute, kind)`` for the values an operator reads as
 #: "defaults" in the example file. ``kind`` drives the comparison.

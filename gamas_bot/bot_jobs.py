@@ -45,6 +45,7 @@ from .docx_export import (
 )
 from .notes_pdf import build_notes_pdf, notes_pdf_filename
 from .review_sheet import render_booklet_review
+from .cpu_pool import run_cpu_bound
 from .fileio import AsyncFileReader, run_file_io, run_file_io_resource
 from .intake import (
     USER_VISIBLE_ERRORS,
@@ -1633,7 +1634,7 @@ class JobPipelineMixin:
             docx_bytes: bytes | None = None
             try:
                 await progress.update(93, "آماده‌سازی جزوه PDF")
-                pdf_bytes = await asyncio.to_thread(
+                pdf_bytes = await run_cpu_bound(
                     build_notes_pdf,
                     notes,
                     meta=meta,

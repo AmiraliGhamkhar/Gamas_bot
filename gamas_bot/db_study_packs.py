@@ -346,6 +346,15 @@ class StudyPackRepository:
         )
         return [dict(r) for r in rows]
 
+    async def study_pack_count(self, user_id: int) -> int:
+        """Total non-deleted packs for one user (for paginated listings)."""
+        rows = await self._core.db.execute_fetchall(
+            "SELECT COUNT(*) FROM study_packs "
+            "WHERE user_id = ? AND deleted_at IS NULL",
+            (int(user_id),),
+        )
+        return int(rows[0][0]) if rows else 0
+
     async def study_pack_delete(self, user_id: int, pack_id: int) -> bool:
         now = _utc_now_iso()
         cur = await self._core.db.execute(

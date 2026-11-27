@@ -304,6 +304,23 @@ class LibraryRepositoryMixin(DatabaseCore):
         payload = bytes(content) if content is not None else None
         digest = hashlib.sha256(payload).hexdigest() if payload else ""
         async with self._transaction():
+            # The source text is stored once per submission: delivered artifact
+            # rows (PDF/Word/review HTML) used to each carry a full copy,
+            # inflating every library payload with duplicates. The first
+            # non-empty copy wins; readers already fall back across rows via
+            # ``library_submission_source_text``.
+            effective_text = str(content_text) if content_text is not None else None
+            if effective_text and submission_id is not None:
+                existing_copy = await _rows(
+                    self.db,
+                    "SELECT 1 FROM library_items "
+                    "WHERE user_id = ? AND submission_id = ? "
+                    "AND content_text IS NOT NULL AND trim(content_text) != '' "
+                    "LIMIT 1",
+                    (uid, int(submission_id)),
+                )
+                if existing_copy:
+                    effective_text = None
             item_id = 0
             if submission_id is not None and artifact_kind:
                 existing = await _rows(
@@ -326,7 +343,7 @@ class LibraryRepositoryMixin(DatabaseCore):
                             int(message_id),
                             str(title)[:200],
                             now,
-                            str(content_text) if content_text is not None else None,
+                            effective_text,
                             item_id,
                             uid,
                         ),
@@ -344,7 +361,7 @@ class LibraryRepositoryMixin(DatabaseCore):
                         int(message_id),
                         str(title)[:200],
                         now,
-                        str(content_text) if content_text is not None else None,
+                        effective_text,
                         str(artifact_kind),
                     ),
                 )

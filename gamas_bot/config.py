@@ -297,6 +297,34 @@ def _env(name: str, default: str = "") -> str:
     return default if value is None or value.strip() == "" else value.strip()
 
 
+def available_memory_mib() -> int | None:
+    """Currently-available RAM in MiB from ``/proc/meminfo`` (None when unknown)."""
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def recommended_max_active_jobs(*, mem_available_mib: int | None = None) -> int:
+    """Job concurrency that fits the host's spare RAM.
+
+    The historical default (3) is right for shared hosting where the account
+    may be capped at 1-2 GB even though ``/proc/meminfo`` shows the whole
+    machine. Machines with >= 2 GiB *available* can carry 6 concurrent jobs
+    (~2x file throughput at roughly 300 MiB of peak RSS per job). This is the
+    value preflight and the watchdog recommend; the ``MAX_ACTIVE_JOBS``
+    environment variable always decides what the bot actually uses.
+    """
+    if mem_available_mib is None:
+        mem_available_mib = available_memory_mib()
+    if mem_available_mib is not None and mem_available_mib >= 2048:
+        return 6
+    return 3
+
+
 def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
     raw = _env(name, str(default))
     try:

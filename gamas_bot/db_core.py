@@ -371,7 +371,24 @@ class DatabaseCore:
                 logger.warning("discarded uncommitted transaction before BEGIN IMMEDIATE")
                 METRICS.record_db_error()
             try:
-                await self.db.execute("BEGIN IMMEDIATE")
+                for attempt in range(8):
+                    try:
+                        await self.db.execute("BEGIN IMMEDIATE")
+                        break
+                    except sqlite3.OperationalError as exc:
+                        if "transaction" not in str(exc).lower() or attempt == 7:
+                            raise
+                        # ``in_transaction`` is a synchronous read that can lag
+                        # behind statements still queued on the aiosqlite
+                        # worker: a queued DML opens an implicit transaction
+                        # after the check above. Roll it back and retry — raw
+                        # writers may still sneak one statement into the queue
+                        # between the calls, so retry with a bound.
+                        await self.db.rollback()
+                        logger.warning(
+                            "discarded uncommitted transaction before BEGIN IMMEDIATE"
+                        )
+                        METRICS.record_db_error()
                 yield
                 if self._balances_ready and self.db.in_transaction:
                     while await self._flush_balance_dirty_locked(500) == 500:
