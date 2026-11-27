@@ -264,7 +264,19 @@ export const api = {
       body: JSON.stringify({ reward_code, idempotency_key }),
     }),
 
-  listPacks: () => request<{ packs: StudyPack[] }>("/api/v1/library"),
+  // The first page keeps the bare URL (older contracts and test mocks match
+  // it exactly); explicit paging appends clamped limit/offset query params.
+  listPacks: (limit?: number, offset?: number) =>
+    request<{
+      packs: StudyPack[];
+      total?: number;
+      limit?: number;
+      offset?: number;
+    }>(
+      limit === undefined
+        ? "/api/v1/library"
+        : `/api/v1/library?limit=${limit}&offset=${offset ?? 0}`,
+    ),
   getPack: (packId: number) =>
     request<PackDetailResponse>(`/api/v1/library/${packId}`),
   deletePack: (packId: number) =>

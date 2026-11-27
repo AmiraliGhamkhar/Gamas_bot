@@ -185,6 +185,29 @@ transport retries and schema compatibility adjustments still cost requests.
 Provider-specific caps and the shared quota ledger also apply (see
 [Providers](PROVIDERS.md)).
 
+### Raising throughput on a bigger host
+
+`scripts/cpanel_preflight` prints a RAM-based `MAX_ACTIVE_JOBS` recommendation
+(6 when at least 2 GiB of memory is available, otherwise 3); the environment
+variable always decides what the bot uses. Before raising it on a VPS, confirm
+the recommendation and measure with `scripts/perf_bench.py` /
+`scripts/concurrency_bench.py`. The cron watchdog defers a bot spawn while free
+memory is below 64 MiB instead of starting into an OOM kill.
+
+The daily jobs dashboard turns the submissions ledger into capacity numbers:
+
+```bash
+python scripts/job_report.py             # per-day counts, success rate, p50/p95
+python scripts/job_report.py --days 14 --json
+```
+
+Two runtime toggles ship with the capacity work: `GAMAS_DB_REUSE` (default on —
+one shared SQLite connection per API process, ~5-8x request capacity) and
+`GAMAS_BUILD_POOL=1` (run booklet builds in a spawn process pool so the bot
+event loop stays responsive). The Mini App API serves precompressed or on-the-fly
+gzip assets and exposes `/api/v1/healthz` (deep check incl. database) for uptime
+monitors; `/api/health` stays the shallow process check.
+
 Conservative 1 GiB cPanel profile (`.env`):
 
 ```dotenv

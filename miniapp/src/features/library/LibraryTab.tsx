@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, saveBlob, StudyAsset, StudyPack } from "../../api";
 import { formatDate, formatRelative, formatSize, toFa } from "../../lib/format";
 import { haptic } from "../../lib/telegram";
@@ -203,14 +203,38 @@ function PackDetail({
   const pack = detail.data?.pack ?? null;
 
   // While the pipeline is working on the pack, this screen is the progress view:
-  // one quiet re-read every few seconds, and nothing once it settles.
+  // one quiet re-read every few seconds, and nothing once it settles. When a
+  // poll returns no change, the interval backs off (8s → 30s) so an idle queue
+  // costs at most one request per half minute; any change snaps back to 8s.
   const pendingStatus =
     pack !== null &&
     ["pending", "queued", "processing", "running"].includes(pack.status);
+  const pollMisses = useRef(0);
+  const pollSignature = useRef("");
   useEffect(() => {
-    if (!pendingStatus) return;
-    const timer = setTimeout(detail.reload, 8000);
+    if (!pendingStatus) {
+      pollMisses.current = 0;
+      pollSignature.current = "";
+      return;
+    }
+    const signature = JSON.stringify([
+      pack?.status ?? "",
+      (detail.data?.assets ?? []).map((asset: StudyAsset) => [
+        asset.asset_id,
+        asset.byte_size,
+      ]),
+    ]);
+    if (signature !== pollSignature.current) {
+      pollSignature.current = signature;
+      pollMisses.current = 0;
+    }
+    const delay = Math.min(30000, Math.round(8000 * 1.5 ** pollMisses.current));
+    const timer = setTimeout(() => {
+      pollMisses.current += 1;
+      detail.reload();
+    }, delay);
     return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingStatus, detail.data, detail.reload]);
 
   const assets = detail.data?.assets ?? [];
@@ -347,9 +371,46 @@ export function LibraryTab({ onOpenReview }: { onOpenReview: (packId: number) =>
   const [openPackId, setOpenPackId] = useState<number | null>(null);
   const [query, setQuery] = useState("");
   const [order, setOrder] = useState<"newest" | "oldest">("newest");
+  // Server-side paging: the first page is one plain GET (contract-compatible);
+  // later pages are fetched only when the user asks for more.
+  const [morePacks, setMorePacks] = useState<StudyPack[]>([]);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [moreError, setMoreError] = useState<string | null>(null);
+
+  const loaded = useMemo(
+    () => [...(packs.data?.packs ?? []), ...morePacks],
+    [packs.data, morePacks],
+  );
+  const total = packs.data?.total ?? packs.data?.packs.length ?? 0;
+  const hasMore = loaded.length < total;
+
+  const loadMore = async () => {
+    setLoadingMore(true);
+    setMoreError(null);
+    haptic("tap");
+    try {
+      const page = await api.listPacks(50, loaded.length);
+      setMorePacks((prev) => {
+        const seen = new Set(
+          [...prev, ...(packs.data?.packs ?? [])].map((pack) => pack.pack_id),
+        );
+        return [...prev, ...page.packs.filter((pack) => !seen.has(pack.pack_id))];
+      });
+    } catch (error) {
+      setMoreError(describeError(error) || "دریافت بسته‌های بیشتر انجام نشد.");
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  const reloadAll = () => {
+    setMorePacks([]);
+    setMoreError(null);
+    packs.reload();
+  };
 
   const visible = useMemo(() => {
-    const list = packs.data?.packs ?? [];
+    const list = loaded;
     const needle = query.trim().toLowerCase();
     const filtered = needle
       ? list.filter(
@@ -363,7 +424,7 @@ export function LibraryTab({ onOpenReview }: { onOpenReview: (packId: number) =>
       const cmp = String(a.created_at).localeCompare(String(b.created_at));
       return order === "newest" ? -cmp : cmp;
     });
-  }, [packs.data, query, order]);
+  }, [loaded, query, order]);
 
   if (openPackId !== null) {
     return (
@@ -380,10 +441,8 @@ export function LibraryTab({ onOpenReview }: { onOpenReview: (packId: number) =>
 
   if (packs.loading && !packs.data) return <ListSkeleton rows={4} />;
   if (packs.error && !packs.data) {
-    return <ErrorState message={packs.error} onRetry={packs.reload} />;
+    return <ErrorState message={packs.error} onRetry={reloadAll} />;
   }
-
-  const total = packs.data?.packs.length ?? 0;
 
   return (
     <div className="space-y-4">
@@ -394,7 +453,7 @@ export function LibraryTab({ onOpenReview }: { onOpenReview: (packId: number) =>
             type="button"
             onClick={() => {
               haptic("tap");
-              packs.reload();
+              reloadAll();
             }}
             aria-label="به‌روزرسانی کتابخانه"
             className="pressable flex h-10 w-10 items-center justify-center rounded-full text-muted hover:bg-surface2"
@@ -470,6 +529,21 @@ export function LibraryTab({ onOpenReview }: { onOpenReview: (packId: number) =>
                 />
               ))}
             </Group>
+          )}
+          {hasMore && (
+            <div className="flex flex-col items-center gap-2 pt-1">
+              {moreError && <InlineNote>{moreError}</InlineNote>}
+              <Button
+                variant="ghost"
+                icon={loadingMore ? "refresh" : "forward"}
+                onClick={loadMore}
+                disabled={loadingMore}
+              >
+                {loadingMore
+                  ? "در حال دریافت…"
+                  : `نمایش بسته‌های بیشتر (${toFa(total - loaded.length)} مورد دیگر)`}
+              </Button>
+            </div>
           )}
         </>
       )}

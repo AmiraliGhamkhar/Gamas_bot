@@ -85,9 +85,10 @@ Equivalent crontab line:
 * * * * * /home/USER/gamas_bot/.venv/bin/python /home/USER/gamas_bot/scripts/ensure_running.py >/dev/null 2>&1
 ```
 
-The watchdog refuses a second instance and throttles failed restarts (45 s). Use
-the absolute interpreter path: cron has no activated virtualenv and no `PATH`
-from your shell.
+The watchdog refuses a second instance and throttles failed restarts (45 s), and
+it defers the spawn while free memory is below 64 MiB (a fresh interpreter would
+only be OOM-killed; the next tick retries). Use the absolute interpreter path:
+cron has no activated virtualenv and no `PATH` from your shell.
 
 ## 4. Status, stop and logs
 
@@ -113,6 +114,8 @@ The repository ships a single Passenger WSGI application in
 - `/api/v1/*` — the Mini App JSON API (authenticated with Telegram
   `X-Telegram-Init-Data`).
 - `GET /api/v1/health` — returns `{"status":"ok"}` (HTTP 200).
+- `GET /api/v1/healthz` — deep check for uptime monitors: 200 with
+  `{"status":"ok","db":"ok"}` when the database answers, 503 otherwise.
 - `GET /` and `GET /health` — bot watchdog status (`running` / `starting` /
   `error`); these never expose configuration or user data.
 

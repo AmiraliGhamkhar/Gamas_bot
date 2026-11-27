@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import mimetypes
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,8 +16,9 @@ from urllib.parse import parse_qs, quote
 
 logger = logging.getLogger(__name__)
 
-from .config import Settings, from_env
+from .config import PROJECT_DIR, Settings, from_env
 from .db import Database
+from .db_broker import db_reuse_enabled, get_broker
 from .explore_recommender import recommend_explore_feed
 from .rewards import REWARD_CATALOG as _REWARD_CATALOG
 from .study_storage import resolve_private_asset
@@ -87,6 +90,85 @@ def _paging(params: dict[str, str], *, default: int = 50, maximum: int = 200) ->
     return max(1, min(maximum, limit)), max(0, offset)
 
 
+# --------------------------------------------------------------- settings cache
+_env_settings_cache: tuple[tuple[Any, ...], Settings] | None = None
+
+
+def _env_file_stamp() -> tuple[Any, ...]:
+    """Cheap staleness key for the ``.env`` files ``from_env`` would load."""
+    stamp: list[Any] = []
+    for candidate in (PROJECT_DIR / ".env", Path.cwd() / ".env"):
+        try:
+            stat = candidate.stat()
+        except OSError:
+            stamp.append(None)
+        else:
+            stamp.append((stat.st_mtime_ns, stat.st_size))
+    return tuple(stamp)
+
+
+def _cached_env_settings() -> Settings:
+    """``from_env()`` once per process; re-parsed only when ``.env`` changes.
+
+    Production calls ``make_wsgi_app()`` without explicit settings, and parsing
+    ~100 environment variables on every request cost ~0.4 ms for a result that
+    only changes when the deployment file changes.
+    """
+    global _env_settings_cache
+    key = _env_file_stamp()
+    if _env_settings_cache is not None and _env_settings_cache[0] == key:
+        return _env_settings_cache[1]
+    settings = from_env()
+    _env_settings_cache = (key, settings)
+    return settings
+
+
+# --------------------------------------------------------------- gzip helpers
+_COMPRESSIBLE_SUFFIXES = {
+    ".js",
+    ".mjs",
+    ".css",
+    ".html",
+    ".json",
+    ".map",
+    ".svg",
+    ".txt",
+    ".xml",
+}
+_GZIP_MIN_BYTES = 1024
+_GZIP_CACHE_MAX = 32
+_gzip_cache: dict[tuple[str, int, int], bytes] = {}
+
+
+def _accepts_gzip(accept_encoding: str) -> bool:
+    """True when the client explicitly allows ``gzip`` (q>0)."""
+    for part in accept_encoding.lower().split(","):
+        token, _, params = part.strip().partition(";")
+        if token != "gzip":
+            continue
+        for param in params.split(";"):
+            key, _, value = param.partition("=")
+            if key.strip() == "q":
+                try:
+                    return float(value.strip() or "1") > 0
+                except ValueError:
+                    return True
+        return True
+    return False
+
+
+def _gzip_bytes(data: bytes, cache_key: tuple[str, int, int]) -> bytes:
+    """Compress once per (file, mtime, size); the dist is immutable per deploy."""
+    cached = _gzip_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    compressed = gzip.compress(data, compresslevel=6)
+    if len(_gzip_cache) >= _GZIP_CACHE_MAX:
+        _gzip_cache.clear()
+    _gzip_cache[cache_key] = compressed
+    return compressed
+
+
 def _read_json_body(environ: dict[str, Any]) -> dict[str, Any]:
     try:
         length = int(environ.get("CONTENT_LENGTH") or 0)
@@ -122,7 +204,7 @@ def make_wsgi_app(
     )
 
     def _get_settings() -> Settings:
-        return settings if settings is not None else from_env()
+        return settings if settings is not None else _cached_env_settings()
 
     def _assets_root(cfg: Settings) -> Path:
         if private_assets_dir is not None:
@@ -130,6 +212,12 @@ def make_wsgi_app(
         return Path(cfg.temp_dir).parent / "private_assets"
 
     async def _with_db(cfg: Settings, fn: Callable[[Database], Any]) -> Any:
+        # One shared connection per data file per process (~5-8x request
+        # capacity); GAMAS_DB_REUSE=0 restores the connect/close-per-request
+        # path, and :memory: databases can never be shared.
+        db_path = str(cfg.db_path)
+        if db_reuse_enabled() and db_path not in {":memory:", ""}:
+            return await get_broker().run(Path(db_path), fn)
         db = Database(cfg.db_path)
         await db.connect()
         try:
@@ -241,6 +329,31 @@ def make_wsgi_app(
             return _json_response(
                 start_response, "200 OK", {"status": "ok"}, method=method
             )
+
+        if path == "/api/v1/healthz" and method in {"GET", "HEAD"}:
+            # Deep health for uptime monitors: the shallow /api/health above
+            # must stay cheap and stable, so database reachability lives here.
+            async def _healthz(db: Database) -> dict[str, Any]:
+                await db.db.execute_fetchall("SELECT 1")
+                return {
+                    "status": "ok",
+                    "db": "ok",
+                    "time": _utc_now_iso(),
+                }
+
+            try:
+                payload = asyncio.run(_with_db(_get_settings(), _healthz))
+                return _json_response(
+                    start_response, "200 OK", payload, method=method
+                )
+            except Exception:
+                logger.warning("healthz database check failed", exc_info=True)
+                return _json_response(
+                    start_response,
+                    "503 Service Unavailable",
+                    {"status": "error", "db": "down"},
+                    method=method,
+                )
 
         if path.startswith("/api/"):
             cfg = _get_settings()
@@ -454,9 +567,19 @@ def make_wsgi_app(
 
             # ------------------------------------------------ Library APIs
             if path in {"/api/packs", "/api/v1/library"} and method == "GET":
+                params = _query_params(environ)
+                limit, offset = _paging(params, default=50, maximum=200)
+
                 async def _list(db: Database) -> dict[str, Any]:
-                    packs = await db.study_packs.study_pack_list(user_id)
-                    return {"packs": packs}
+                    packs = await db.study_packs.study_pack_list(
+                        user_id, limit=limit, offset=offset
+                    )
+                    return {
+                        "packs": packs,
+                        "limit": limit,
+                        "offset": offset,
+                        "total": await db.study_packs.study_pack_count(user_id),
+                    }
 
                 return _json_response(
                     start_response, "200 OK", asyncio.run(_with_db(cfg, _list))
@@ -1069,14 +1192,34 @@ def make_wsgi_app(
                         cache_control = "public, max-age=31536000, immutable"
                     else:
                         cache_control = "public, max-age=3600"
-                    start_response(
-                        "200 OK",
-                        [
-                            ("Content-Type", ctype or "application/octet-stream"),
-                            ("Content-Length", str(len(data))),
-                            ("Cache-Control", cache_control),
-                        ],
-                    )
+                    # Precompressed or on-the-fly gzip for text assets: the
+                    # Mini App bundle is ~270KB raw vs ~75KB compressed, and
+                    # mobile first-load latency is dominated by transfer.
+                    encoding: str | None = None
+                    if _accepts_gzip(str(environ.get("HTTP_ACCEPT_ENCODING") or "")):
+                        gz_sibling = candidate.with_name(candidate.name + ".gz")
+                        if gz_sibling.is_file():
+                            data = gz_sibling.read_bytes()
+                            encoding = "gzip"
+                        elif (
+                            candidate.suffix.lower() in _COMPRESSIBLE_SUFFIXES
+                            and len(data) >= _GZIP_MIN_BYTES
+                        ):
+                            stat = candidate.stat()
+                            data = _gzip_bytes(
+                                data,
+                                (str(candidate), stat.st_mtime_ns, stat.st_size),
+                            )
+                            encoding = "gzip"
+                    headers = [
+                        ("Content-Type", ctype or "application/octet-stream"),
+                        ("Content-Length", str(len(data))),
+                        ("Cache-Control", cache_control),
+                        ("Vary", "Accept-Encoding"),
+                    ]
+                    if encoding is not None:
+                        headers.append(("Content-Encoding", encoding))
+                    start_response("200 OK", headers)
                     return [b"" if method == "HEAD" else data]
             # A deployed Python app without a built frontend should fail clearly,
             # not with a misleading JSON 404 from the API router.

@@ -245,12 +245,36 @@ def check_settings() -> tuple[list[Result], Settings | None]:
         )
     if not problems:
         results.append(Result("PASS", "Configuration", "no configuration problems"))
-    if settings.max_active_jobs > 3:
+    from gamas_bot.config import available_memory_mib, recommended_max_active_jobs
+
+    mem = available_memory_mib()
+    recommended = recommended_max_active_jobs(mem_available_mib=mem)
+    if settings.max_active_jobs > recommended:
         results.append(
             Result(
                 "WARN", "MAX_ACTIVE_JOBS",
-                f"{settings.max_active_jobs}: shared hosting usually limits memory "
-                "to 1-2 GB; keep MAX_ACTIVE_JOBS at 1-3 with MEDIA_WORKER_CONCURRENCY=1.",
+                f"{settings.max_active_jobs} exceeds the RAM-based recommendation "
+                f"{recommended} (available memory: "
+                f"{f'{mem} MiB' if mem is not None else 'unknown'}); shared hosting "
+                "usually limits memory to 1-2 GB, so keep MAX_ACTIVE_JOBS at 1-3 "
+                "with MEDIA_WORKER_CONCURRENCY=1 there.",
+            )
+        )
+    elif settings.max_active_jobs < recommended:
+        results.append(
+            Result(
+                "PASS", "MAX_ACTIVE_JOBS",
+                f"{settings.max_active_jobs}; available memory {mem} MiB allows "
+                f"MAX_ACTIVE_JOBS={recommended} (~2x file throughput) — raise it "
+                "when this host is not memory-capped shared hosting.",
+            )
+        )
+    else:
+        results.append(
+            Result(
+                "PASS", "MAX_ACTIVE_JOBS",
+                f"{settings.max_active_jobs} fits available memory "
+                f"({f'{mem} MiB' if mem is not None else 'unknown'}).",
             )
         )
     results.extend(check_stt_queue(settings))

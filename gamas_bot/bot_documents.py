@@ -63,6 +63,7 @@ from .docx_export import (
     resolve_design,
     resolve_fonts,
 )
+from .cpu_pool import run_cpu_bound
 from .fileio import run_file_io, run_file_io_resource
 from .intake import _presentation_metadata, _to_int
 from .jobs import Job
@@ -1401,7 +1402,7 @@ class DocumentOfficeWorkflowMixin:
                 "خروجی‌های گرافیکی جزوه آماده می‌شوند…",
             )
             if mode == "full" and full_notes is not None:
-                pdf_payload = await run_file_io(
+                pdf_payload = await run_cpu_bound(
                     build_notes_pdf,
                     full_notes,
                     meta=meta,
@@ -1995,7 +1996,7 @@ class DocumentOfficeWorkflowMixin:
                 self.OFFICE_BUILD_PERCENT - 12,
                 "ساخت فایل‌های گرافیکی PDF و Word",
             )
-            pdf_payload = await run_file_io(
+            pdf_payload = await run_cpu_bound(
                 build_notes_pdf,
                 notes,
                 meta=meta,
