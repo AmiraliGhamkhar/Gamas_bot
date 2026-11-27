@@ -36,7 +36,7 @@ set.
 - **`reward_points_ledger`** — `entry_id`, `user_id`, `delta`, `reason`, `ref_id`,
   `created_at`.
 
-## 3. Review and Explore (migrations 038, 042, and later)
+## 3. Review and Explore (migrations 038, 042, 044, and later)
 
 ### `explore_questions` (public curated bank)
 - `question_id INTEGER PRIMARY KEY AUTOINCREMENT`
@@ -52,6 +52,32 @@ set.
   re-seeding is idempotent — migration 042)
 - `created_at TEXT NOT NULL`
 - Index: `idx_explore_questions_status_topic(status, topic, question_id)`
+
+### Academic source metadata (migration 044, purely additive and nullable)
+
+Every curated question carries the real source its fact comes from, so the feed
+can show «منبع علمی» instead of unsourced trivia. All ten columns are nullable:
+rows seeded before 044 and questions a user shared from Review keep working, and
+the feed labels them *awaiting verification* rather than pretending otherwise.
+
+- `source_type TEXT` — `textbook`, `fact_sheet`, `topic_page`, `reference`,
+  `encyclopedia`
+- `source_title TEXT`, `source_author TEXT`, `source_institution TEXT`
+- `source_url TEXT` — must be `https` with no embedded credentials; the client
+  additionally re-validates it before opening
+- `source_year TEXT`, `source_page_or_section TEXT`
+- `evidence_level TEXT` — `textbook` (Tier 1: textbooks/peer-reviewed/open
+  courseware), `institutional` (Tier 2: WHO, CDC, CIA, NASA, UNESCO,
+  Encyclopaedia Iranica, NCBI), `educational` (Tier 3: reputable educational
+  references such as MDN and Britannica)
+- `verified_at TEXT` — when the seeder last confirmed the citation
+- `updated_at TEXT`
+
+The seeder backfills **only NULL/empty** columns of `seed_key` rows
+(`COALESCE(NULLIF(col, ''), ?)`), so a curator's correction is never overwritten
+and no question is ever deleted, re-created or re-numbered. The catalog itself
+lives in code (`gamas_bot/explore_sources.py`), not in the UI: adding a question
+needs one bank entry plus one catalog entry, no React change and no migration.
 
 ### `explore_impressions` (engagement signal)
 - `impression_id`, `user_id`, `question_id`, `shown_at`, `dwell_ms`,

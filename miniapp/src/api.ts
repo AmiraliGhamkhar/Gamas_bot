@@ -140,12 +140,47 @@ export interface ReviewShareResult {
   already_shared: boolean;
 }
 
+/** The verifiable academic backing of one Explore question. */
+export interface ExploreSource {
+  source_type: string;
+  source_title: string;
+  source_author: string;
+  source_institution: string;
+  source_url: string;
+  source_year: string;
+  source_page_or_section: string;
+  /** `textbook` (Tier 1) · `institutional` (Tier 2) · `educational` (Tier 3). */
+  evidence_level: string;
+  /** The server's own verification verdict, as a string flag. */
+  verified: string;
+}
+
+/** The four weighted components behind a card's rank, for explainability. */
+export interface ExploreExplain {
+  affinity: number;
+  quality: number;
+  freshness: number;
+  discovery: number;
+  score: number;
+}
+
 export interface ExploreItem {
   question_id: number;
   topic: string;
   difficulty: string;
   question_text: string;
   options: string[];
+  /** `null` when the question's source is not verified — never rendered as one. */
+  source: ExploreSource | null;
+  verified: boolean;
+  explain?: ExploreExplain;
+}
+
+export interface ExploreFeedPage {
+  items: ExploreItem[];
+  /** Opaque token that continues this feed session; `""` when exhausted. */
+  next_cursor: string;
+  has_more: boolean;
 }
 
 export interface ExploreAnswerResult {
@@ -153,6 +188,8 @@ export interface ExploreAnswerResult {
   correct_index: number;
   explanation: string;
   points_awarded: number;
+  source?: ExploreSource | null;
+  verified?: boolean;
 }
 
 export interface StudyPack {
@@ -303,16 +340,31 @@ export const api = {
       body: JSON.stringify({ question_id }),
     }),
 
-  getExploreFeed: () => request<{ items: ExploreItem[] }>("/api/v1/explore/feed"),
+  /** One cursor-paginated page of the continuous Explore feed. */
+  getExploreFeed: (cursor = "", limit = 12) =>
+    request<ExploreFeedPage>(
+      `/api/v1/explore/feed?limit=${limit}${
+        cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""
+      }`,
+    ),
   submitExploreAnswer: (question_id: number, chosen_index: number, dwell_ms: number) =>
     request<ExploreAnswerResult>("/api/v1/explore/answers", {
       method: "POST",
       body: JSON.stringify({ question_id, chosen_index, dwell_ms }),
     }),
-  sendExploreEngagement: (question_id: number, dwell_ms: number) =>
+  /**
+   * One meaningful engagement event for a card: how long it was on screen and
+   * whether its source panel was opened. Fire-and-forget from the caller — the
+   * feed never waits on analytics.
+   */
+  sendExploreEngagement: (
+    question_id: number,
+    dwell_ms: number,
+    source_opened = false,
+  ) =>
     request<{ recorded: boolean }>("/api/v1/explore/engagement", {
       method: "POST",
-      body: JSON.stringify({ question_id, dwell_ms }),
+      body: JSON.stringify({ question_id, dwell_ms, source_opened }),
     }),
 };
 

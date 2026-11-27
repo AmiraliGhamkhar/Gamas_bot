@@ -19,7 +19,12 @@ logger = logging.getLogger(__name__)
 from .config import PROJECT_DIR, Settings, from_env
 from .db import Database
 from .db_broker import db_reuse_enabled, get_broker
-from .explore_recommender import recommend_explore_feed
+from .explore_recommender import (
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE,
+    recommend_explore_page,
+)
+from .explore_sources import row_source_payload
 from .rewards import REWARD_CATALOG as _REWARD_CATALOG
 from .study_storage import resolve_private_asset
 from .telegram_auth import InitDataError, validate_init_data
@@ -925,9 +930,22 @@ def make_wsgi_app(
 
             # ------------------------------------------------ Explore APIs
             if path == "/api/v1/explore/feed" and method == "GET":
+                # Cursor-paginated continuous feed. ``limit`` is clamped by the
+                # recommender (1..MAX_PAGE_SIZE); ``cursor`` is the opaque token
+                # from the previous page. A missing cursor starts a session.
+                params = _query_params(environ)
+                try:
+                    want = int(params.get("limit") or DEFAULT_PAGE_SIZE)
+                except (TypeError, ValueError):
+                    want = DEFAULT_PAGE_SIZE
+                limit = max(1, min(MAX_PAGE_SIZE, want))
+                cursor_token = str(params.get("cursor") or "")
+
                 async def _feed(db: Database) -> dict[str, Any]:
-                    items = await recommend_explore_feed(db, user_id, limit=10)
-                    return {"items": items}
+                    page = await recommend_explore_page(
+                        db, user_id, limit=limit, cursor=cursor_token
+                    )
+                    return page.as_payload()
 
                 return _json_response(
                     start_response, "200 OK", asyncio.run(_with_db(cfg, _feed))
@@ -937,6 +955,11 @@ def make_wsgi_app(
                 body = _read_json_body(environ)
                 qid = body.get("question_id")
                 raw_dwell = body.get("dwell_ms")
+                # "source_opened" is a real interest signal from the scroll
+                # feed: the user expanded the academic citation. It is recorded
+                # with a read-level signal so it strengthens the topic affinity
+                # without ever awarding points. Everything else is unchanged.
+                source_opened = bool(body.get("source_opened"))
                 if isinstance(raw_dwell, (bool, float)):
                     return _json_response(
                         start_response, "400 Bad Request", {"error": "invalid payload"}
@@ -952,6 +975,8 @@ def make_wsgi_app(
                         start_response, "400 Bad Request", {"error": "invalid payload"}
                     )
                 signal = 2 if dwell_ms > 8000 else (1 if dwell_ms < 3000 else 0)
+                if source_opened and signal < 2:
+                    signal = 2
 
                 async def _imp(db: Database) -> bool:
                     exists = await db.db.execute_fetchall(
@@ -1006,7 +1031,10 @@ def make_wsgi_app(
                 async def _e_ans(db: Database) -> dict[str, Any] | None:
                     rows = await db.db.execute_fetchall(
                         """
-                        SELECT correct_index, explanation
+                        SELECT correct_index, explanation, source_type,
+                               source_title, source_author, source_institution,
+                               source_url, source_year, source_page_or_section,
+                               evidence_level
                         FROM explore_questions
                         WHERE question_id = ? AND status = 'approved'
                         """,
@@ -1037,11 +1065,17 @@ def make_wsgi_app(
                         if cur.rowcount > 0:
                             points_awarded = 10
                     await db.db.commit()
+                    # The citation travels with the answer result too, so a
+                    # card answered before its feed payload was enriched still
+                    # renders its source panel without a second round-trip.
+                    source = row_source_payload(dict(rows[0]))
                     return {
                         "is_correct": bool(is_correct),
                         "correct_index": correct_idx,
                         "explanation": rows[0]["explanation"] or "",
                         "points_awarded": points_awarded,
+                        "source": source,
+                        "verified": source is not None,
                     }
 
                 res = asyncio.run(_with_db(cfg, _e_ans))

@@ -1,146 +1,164 @@
-import { useEffect, useRef, useState } from "react";
-import { api, ExploreAnswerResult, ExploreItem } from "../../api";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { api } from "../../api";
 import { toFa } from "../../lib/format";
 import { haptic } from "../../lib/telegram";
-import { describeError, useAsync } from "../../lib/useAsync";
-import { EcgLoader } from "../../ui/Ecg";
 import { Icon } from "../../ui/Icon";
-import {
-  Button,
-  Chip,
-  PaperCard,
-  PaperOption,
-  PaperOptionState,
-  ScreenHeader,
-} from "../../ui/primitives";
+import { Button, ScreenHeader } from "../../ui/primitives";
+import { EcgLoader } from "../../ui/Ecg";
 import { EmptyState, ErrorState, ListSkeleton } from "../../ui/states";
+import { ExploreCard } from "./ExploreCard";
+import { PREFETCH_MARGIN, useExploreFeed } from "./useExploreFeed";
 
-const TOPIC_LABELS: Record<string, string> = {
-  biology: "زیست‌شناسی",
-  chemistry: "شیمی",
-  physics: "فیزیک",
-  math: "ریاضی",
-  literature: "ادبیات",
-  arabic: "عربی",
-  language: "زبان",
-  english: "انگلیسی",
-  history: "تاریخ",
-  geography: "جغرافیا",
-  religion: "دینی",
-  psychology: "روان‌شناسی",
-  economics: "اقتصاد",
-  law: "حقوق",
-  accounting: "حسابداری",
-  statistics: "آمار",
-  computer: "کامپیوتر",
-  art: "هنر",
-  philosophy: "فلسفه",
-  civics: "اجتماعی",
-};
-
-function topicLabel(topic: string): string {
-  return TOPIC_LABELS[topic] ?? topic;
-}
-
-const DIFFICULTY_LABELS: Record<string, string> = {
-  easy: "آسان",
-  medium: "متوسط",
-  hard: "دشوار",
-};
-
+/**
+ * یک‌سؤال — the continuous academic feed.
+ *
+ * Interaction model: one question per viewport, moved by the phone's own
+ * vertical scroll with CSS snap points. There is no carousel library, no
+ * horizontal swiper, and no "next" button driving the feed — scrolling *is*
+ * the navigation, which is what makes it feel like a feed rather than a quiz.
+ *
+ * Everything else is chosen for the WebView it runs in:
+ *  * `overscroll-contain` keeps a hard flick at the end from bouncing the
+ *    Telegram sheet;
+ *  * the snap container is the scroll parent, so `position: sticky` headers and
+ *    `IntersectionObserver` both work without manual scroll math;
+ *  * the next page is requested when the reader is three cards from the end, so
+ *    it is in memory before the last card is on screen;
+ *  * engagement is reported per card (one event), never per scroll pixel.
+ */
 export function ExploreTab({ onReward }: { onReward: () => void }) {
-  const feed = useAsync(api.getExploreFeed, []);
-  const [index, setIndex] = useState(0);
-  const [answers, setAnswers] = useState<Record<number, ExploreAnswerResult>>({});
-  // The option the user picked, kept per question so the wrong choice can stay
-  // highlighted after the server's result arrives.
-  const [chosen, setChosen] = useState<Record<number, number>>({});
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [justEarned, setJustEarned] = useState<number | null>(null);
+  const feed = useExploreFeed();
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [answeredCount, setAnsweredCount] = useState(0);
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  // Height of one snap viewport. Measured rather than guessed: the header, the
+  // Telegram safe area and the fixed tab bar all change it, and a card that
+  // overflows the snap point makes the feed feel broken.
+  const [cardHeight, setCardHeight] = useState<number | null>(null);
+  // Questions whose engagement event has already been sent this session.
+  const reported = useRef<Set<number>>(new Set());
 
-  const enteredAt = useRef<number>(Date.now());
+  const items = feed.items;
+  const { loadMore } = feed;
 
-  const items = feed.data?.items ?? [];
-  const current: ExploreItem | null = items[index] ?? null;
+  useLayoutEffect(() => {
+    const surface = scrollerRef.current;
+    if (!surface || typeof window === "undefined") return;
+    const measure = () => {
+      const top = surface.getBoundingClientRect().top;
+      // 96px keeps the last card clear of the fixed bottom navigation.
+      setCardHeight(Math.max(320, Math.round(window.innerHeight - top - 96)));
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    window.addEventListener("orientationchange", measure);
+    return () => {
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("orientationchange", measure);
+    };
+  }, []);
 
-  // Dwell is measured per card from the moment it becomes the visible one.
+  // Prefetch: watch a sentinel a few cards before the end. When it enters the
+  // viewport (or nears it), ask for the next page. `loadMore` refuses to run
+  // while a request is in flight, so a fast flick cannot stampede the server.
   useEffect(() => {
-    enteredAt.current = Date.now();
-    setError(null);
-    setJustEarned(null);
-  }, [current?.question_id]);
+    const target = sentinelRef.current;
+    const root = scrollerRef.current;
+    if (!target || !root) return;
+    if (typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadMore();
+      },
+      { root, rootMargin: "0px 0px 60% 0px", threshold: 0.01 },
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [loadMore, items.length]);
 
-  // A skipped card must still leave an impression — the server's seen-filter
-  // and the recommender's bounce signal both depend on it — so this fires on
-  // every skip regardless of dwell. An answered card already recorded its
-  // impression inside `submitExploreAnswer` and is never sent twice.
-  const recordEngagement = (questionId: number) => {
-    const dwell = Math.max(0, Date.now() - enteredAt.current);
-    // Fire-and-forget: the feed must never wait on an analytics write.
-    void api.sendExploreEngagement(questionId, dwell).catch(() => undefined);
-  };
+  // Which card is the snapped one? The observer reports the entry closest to
+  // the top of the viewport, so dwell and impressions follow the reader.
+  useEffect(() => {
+    const root = scrollerRef.current;
+    if (!root || typeof IntersectionObserver === "undefined") return;
+    const cards = Array.from(root.querySelectorAll<HTMLElement>("[data-feed-index]"));
+    if (!cards.length) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const visible = entries
+          .filter((entry) => entry.isIntersecting)
+          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+        if (!visible) return;
+        const index = Number(visible.target.getAttribute("data-feed-index"));
+        if (!Number.isNaN(index)) setActiveIndex(index);
+      },
+      { root, threshold: [0.55, 0.75] },
+    );
+    cards.forEach((card) => observer.observe(card));
+    return () => observer.disconnect();
+  }, [items.length]);
 
-  const advance = () => {
-    if (current && !answers[current.question_id]) recordEngagement(current.question_id);
-    haptic("select");
-    setIndex((i) => (i + 1 >= items.length ? i : i + 1));
-  };
+  // One engagement event per card, fire-and-forget: analytics must never block
+  // the feed, and a duplicate must never skew the recommender's signals.
+  const onEngagement = useCallback(
+    (questionId: number, dwellMs: number, sourceOpened: boolean) => {
+      if (reported.current.has(questionId)) return;
+      reported.current.add(questionId);
+      void api
+        .sendExploreEngagement(questionId, Math.max(0, Math.round(dwellMs)), sourceOpened)
+        .catch(() => undefined);
+    },
+    [],
+  );
 
-  // Seen questions are filtered server-side, so a reload is a new round.
-  const startNewRound = () => {
-    setIndex(0);
-    setAnswers({});
-    setChosen({});
+  const onAnswered = useCallback(() => {
+    setAnsweredCount((count) => count + 1);
+  }, []);
+
+  const restart = () => {
     haptic("tap");
-    feed.reload();
+    reported.current = new Set();
+    setAnsweredCount(0);
+    setActiveIndex(0);
+    // Older WebViews may not implement scrollTo on elements; the feed is
+    // still usable, the reader just keeps their position.
+    scrollerRef.current?.scrollTo?.({ top: 0 });
+    feed.restart();
   };
 
-  const answer = async (optionIndex: number) => {
-    if (!current || submitting || answers[current.question_id]) return;
-    setSubmitting(true);
-    setChosen((prev) => ({ ...prev, [current.question_id]: optionIndex }));
-    setError(null);
-    const dwell = Date.now() - enteredAt.current;
-    try {
-      const res = await api.submitExploreAnswer(current.question_id, optionIndex, dwell);
-      setAnswers((prev) => ({ ...prev, [current.question_id]: res }));
-      haptic(res.is_correct ? "success" : "error");
-      if (res.points_awarded > 0) {
-        setJustEarned(res.points_awarded);
-        onReward();
-      }
-    } catch (err) {
-      haptic("error");
-      setError(describeError(err) || "ثبت پاسخ انجام نشد؛ دوباره تلاش کنید.");
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  if (feed.loading && !feed.data) return <ListSkeleton rows={3} />;
-  if (feed.error && !feed.data) {
+  if (feed.loading && items.length === 0) {
     return (
       <div className="space-y-4">
-        <ScreenHeader title="یک‌سؤال" />
-        <ErrorState message={feed.error} onRetry={feed.reload} />
+        <ScreenHeader title="یک‌سؤال" subtitle="فید پیوستهٔ سؤال‌های کوتاه." />
+        <ListSkeleton rows={3} />
       </div>
     );
   }
-  if (!current) {
+
+  if (feed.error && items.length === 0) {
+    return (
+      <div className="space-y-4">
+        <ScreenHeader title="یک‌سؤال" />
+        <ErrorState message={feed.error} onRetry={feed.loadMore} />
+      </div>
+    );
+  }
+
+  if (!feed.loading && items.length === 0) {
     return (
       <div className="space-y-4">
         <ScreenHeader
           title="یک‌سؤال"
-          subtitle="سؤال‌های کوتاه برای مرور سریع در زمان‌های مرده."
+          subtitle="سؤال‌های کوتاه با منبع علمی، برای مرور در زمان‌های مرده."
         />
         <EmptyState
           emblem="network"
           title="فعلاً سؤالی برای نمایش نیست"
-          description="با پاسخ دادن به سؤال‌های دیگر یا انتشار سؤال در بخش مرور، این فهرست پر می‌شود."
+          description="همهٔ سؤال‌های این دور را دیده‌اید. با سؤال‌های تازه ادامه دهید."
           action={
-            <Button variant="ghost" icon="refresh" onClick={feed.reload}>
-              بررسی دوباره
+            <Button variant="ghost" icon="refresh" onClick={restart}>
+              سؤال‌های تازه
             </Button>
           }
         />
@@ -148,129 +166,99 @@ export function ExploreTab({ onReward }: { onReward: () => void }) {
     );
   }
 
-  const result = answers[current.question_id] ?? null;
-  const pickedOption = chosen[current.question_id];
-  const atEnd = index >= items.length - 1;
   return (
-    <div className="space-y-4">
+    <div className="flex flex-col">
       <ScreenHeader
         title="یک‌سؤال"
-        subtitle="یک سؤال، یک پاسخ، یک نکتهٔ تازه."
+        subtitle="با کشیدن انگشت، سؤال بعدی را ببینید."
         actions={
           <span className="flex items-center gap-1 rounded-pill border border-line bg-surface px-2.5 py-1 text-[11px] text-muted">
             <Icon name="spark" size={13} className="text-brand" />
-            <span className="nums">{toFa(Object.keys(answers).length)} پاسخ</span>
+            <span className="nums">{toFa(answeredCount)} پاسخ</span>
           </span>
         }
       />
 
-      <div key={current.question_id} className="animate-rise space-y-3">
-        <PaperCard tone={result ? (result.is_correct ? "ok" : "bad") : "brand"} className="space-y-4">
-          <div className="flex items-center justify-between gap-2">
-            <div className="flex min-w-0 items-center gap-1.5">
-              <Chip tone="brand" onPaper className="max-w-[16ch] overflow-hidden">
-                <span className="truncate">{topicLabel(current.topic)}</span>
-              </Chip>
-              <Chip onPaper>{DIFFICULTY_LABELS[current.difficulty] ?? current.difficulty}</Chip>
-            </div>
-            {justEarned !== null && (
-              /* The reward lands quietly: a teal line of text, not a coin jingle. */
-              <span className="animate-fade flex items-center gap-1 text-[11px] font-medium text-okInk">
-                <Icon name="spark" size={13} />
-                <span className="nums">+{toFa(justEarned)} امتیاز</span>
-              </span>
-            )}
-          </div>
-
-          <p className="text-[15px] leading-8 text-ink">{current.question_text}</p>
-
-          <div className="space-y-2">
-            {current.options.map((option, optionIndex) => {
-              let state: PaperOptionState = "idle";
-              if (result) {
-                if (optionIndex === result.correct_index) state = "correct";
-                else if (optionIndex === pickedOption && !result.is_correct) state = "wrong";
-                else state = "muted";
-              }
-              return (
-                <PaperOption
-                  key={optionIndex}
-                  label={option}
-                  index={optionIndex}
-                  state={state}
-                  disabled={Boolean(result) || submitting}
-                  onPick={() => answer(optionIndex)}
-                />
-              );
-            })}
-          </div>
-
-          {submitting && !result && (
-            <div className="flex flex-col items-center gap-1.5 py-1">
-              <EcgLoader label="در حال ثبت پاسخ" className="text-trace" />
-              <p className="text-[11px] text-inkMuted">در حال ثبت پاسخ…</p>
-            </div>
-          )}
-
-          {error && (
-            <p className="rounded-field bg-bad/12 px-3 py-2 text-[11px] leading-6 text-badInk">
-              {error}
-            </p>
-          )}
-
-          {result && (
-            <div
-              className={`animate-fade space-y-1.5 rounded-field px-3.5 py-3 ${
-                result.is_correct ? "bg-ok/12" : "bg-bad/12"
-              }`}
-              role="status"
-            >
-              <p
-                className={`flex items-center gap-1.5 text-xs font-medium ${
-                  result.is_correct ? "text-okInk" : "text-badInk"
-                }`}
-              >
-                <Icon name={result.is_correct ? "check" : "close"} size={15} />
-                {result.is_correct ? "درست!" : "پاسخ درست نبود"}
-              </p>
-              {result.explanation && (
-                <p className="text-[12px] leading-6 text-inkMuted">{result.explanation}</p>
-              )}
-            </div>
-          )}
-        </PaperCard>
-      </div>
-
-      <div className="flex items-center gap-2 pb-1">
-        {!result ? (
-          <Button
-            variant="ghost"
-            block
-            onClick={advance}
-            disabled={atEnd}
-            className="!text-faint"
+      {/*
+        The scroll surface. `snap-y snap-mandatory` turns plain touch scrolling
+        into a page-at-a-time feed with zero JavaScript, and the height is the
+        viewport minus the header and the fixed tab bar, so a card never spills
+        under the navigation.
+      */}
+      <div
+        ref={scrollerRef}
+        data-testid="explore-feed"
+        role="feed"
+        tabIndex={0}
+        aria-label="فید سؤال‌های یک‌سؤال"
+        className="no-scrollbar snap-y snap-mandatory overflow-y-auto overscroll-contain"
+        style={{ height: cardHeight ? `${cardHeight}px` : "calc(100dvh - 190px)" }}
+      >
+        {items.map((item, index) => (
+          <div
+            key={item.question_id}
+            data-feed-index={index}
+            className="flex snap-start snap-always items-stretch"
+            style={{ minHeight: "100%" }}
           >
-            رد کردن
-          </Button>
-        ) : (
-          <Button variant="primary" block icon="forward" onClick={advance} disabled={atEnd}>
-            سؤال بعدی
-          </Button>
-        )}
-      </div>
+            <ExploreCard
+              item={item}
+              position={index + 1}
+              active={index === activeIndex}
+              onEngagement={onEngagement}
+              onReward={onReward}
+              onAnswered={onAnswered}
+            />
+          </div>
+        ))}
 
-      {atEnd && (
-        <div className="space-y-2 pb-2 text-center">
-          <p className="text-[11px] leading-5 text-faint">
-            {result
-              ? "به پایان سؤال‌های این دور رسیدید."
-              : "سؤال پاسخ‌داده‌نشده‌ای در این دور نمانده است."}
-          </p>
-          <Button variant="secondary" icon="refresh" onClick={startNewRound}>
-            سؤال‌های تازه
-          </Button>
+        {/* The prefetch sentinel: three cards before the end of what we have. */}
+        {items.length > PREFETCH_MARGIN && (
+          <div
+            ref={sentinelRef}
+            aria-hidden
+            data-testid="explore-sentinel"
+            className="pointer-events-none absolute h-px w-px"
+            style={{ marginTop: `-${(PREFETCH_MARGIN + 1) * 100}%` }}
+          />
+        )}
+
+        {/* ------------------------------------------------------------- tail */}
+        <div className="flex snap-start flex-col items-center justify-center gap-2 px-4 py-6 text-center">
+          {feed.loadingMore && (
+            <div className="flex flex-col items-center gap-1.5">
+              <EcgLoader label="در حال آوردن سؤال‌های بعدی" className="text-trace" />
+              <p className="text-[11px] text-faint">سؤال‌های بعدی در راه است…</p>
+            </div>
+          )}
+
+          {feed.error && (
+            <div className="space-y-2" role="alert">
+              <p className="text-[11px] leading-6 text-faint">{feed.error}</p>
+              <Button variant="secondary" icon="refresh" onClick={feed.loadMore}>
+                تلاش دوباره
+              </Button>
+            </div>
+          )}
+
+          {feed.exhausted && (
+            <div className="space-y-2">
+              <p className="text-[11px] leading-6 text-faint">
+                سؤال تازه‌ای برای این دور نمانده است.
+              </p>
+              <Button variant="secondary" icon="refresh" onClick={restart}>
+                سؤال‌های تازه
+              </Button>
+            </div>
+          )}
+
+          {!feed.exhausted && !feed.error && !feed.loadingMore && (
+            <Button variant="ghost" icon="forward" onClick={feed.loadMore}>
+              سؤال‌های بیشتر
+            </Button>
+          )}
         </div>
-      )}
+      </div>
     </div>
   );
 }

@@ -71,10 +71,43 @@ score(user, q)        = w_affinity·affinity + w_quality·quality
                       + w_freshness·freshness + w_diversity·discovery
 ```
 
-- Answered or recently seen questions are excluded from the candidate pool.
-- At most `max_consecutive_same_topic` items from one topic run back to back.
-- Cold start: new users get approved questions in ascending id order, because
-  every topic has neutral affinity.
+Component meaning (all four are returned to the client in `explain`):
+
+- `affinity` — smoothed, time-decayed topic interest learned from impression
+  signals (`λ = 0.1`, prior 2.0 over 5 pseudo-observations).
+- `quality` — difficulty fit × **academic source tier**: `textbook` 1.00 >
+  `institutional` 0.95 > `educational` 0.85 > unverified 0.55. A cited question
+  always outranks an equivalent uncited one; an uncited question can still appear
+  so the archive is not lost, but it is labelled *awaiting verification*.
+- `freshness` — `exp(−age_days / 120)` on `created_at`, giving new content a
+  window of visibility.
+- `discovery` — an explicit bonus for topics the user never engaged with, so
+  personalisation cannot collapse the feed into one subject.
+
+Structural rules on top of the score:
+
+- Answered or recently seen questions are excluded from the candidate pool **in
+  SQL**, never in a post-filter over a capped window.
+- At most `max_consecutive_same_topic` (2) items from one topic run back to back,
+  enforced across page boundaries via the cursor.
+- Cold start: every topic has neutral affinity, so the feed is naturally diverse.
+- Ranking is deterministic: score descending, then `question_id` ascending. The
+  same database state always produces the same page, which is what makes the
+  cursor stable.
+
+### Pagination
+
+`limit` is clamped to `1…20` (default `12`) and pages are cursor-based, not
+offset-based. The cursor is an opaque base64 token carrying the ids already
+served in the session plus the trailing topics. That closes the one hole offset
+pagination cannot: a prefetched next page may arrive while cards are still
+unread (so not yet impressioned), and the served-id set guarantees it cannot
+repeat one of them. A malformed cursor degrades to a fresh session; the SQL
+seen-filter still prevents repeats from the user's own history.
+
+The Mini App asks for the next page when the reader is three cards from the end,
+so questions are already in memory before the last card is on screen.
+
 - The Explore UI never shows a bank count, a question index or a progress bar.
 
 ## 4. Rewards and credit
@@ -119,5 +152,9 @@ score(user, q)        = w_affinity·affinity + w_quality·quality
 3. **مرور** — the user's own questions grouped by the pack that produced them;
    answers are recorded through `/api/v1/review/answers` and the stored verdict is
    shown.
-4. **یک‌سؤال** — one Explore card at a time, with the server's verdict, the points
-   the server says were awarded, and engagement recorded as dwell time.
+4. **یک‌سؤال** — a continuous vertical feed: one academic question per viewport,
+   moved by the phone's own scroll with CSS snap points (no carousel library, no
+   "next" button). Each card answers in place and reveals its explanation, the
+   points the server awarded, and a folded «منبع علمی» citation. The next page is
+   prefetched before the reader reaches the end; engagement is one event per card
+   (dwell, plus whether the source was opened), never per scroll pixel.

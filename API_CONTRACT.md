@@ -69,9 +69,57 @@ answered; an unanswered question never exposes the key.
 
 | Route | Response |
 | --- | --- |
-| `GET /api/v1/explore/feed` | `{"items": [{"question_id", "topic", "difficulty", "question_text", "options"}]}` — never a bank count or index |
-| `POST /api/v1/explore/answers` (`{"question_id", "chosen_index", "dwell_ms"}`) | `{"is_correct", "correct_index", "explanation", "points_awarded"}`; only a first-time correct answer to an approved question earns points |
-| `POST /api/v1/explore/engagement`, `POST /api/v1/explore/impressions` (`{"question_id", "dwell_ms", "action"}`) | `{"recorded": true}` — stores signal `2` (dwell > 8 s), `1` (skip < 3 s) or `0`; engagement never grants points |
+| `GET /api/v1/explore/feed?limit=&cursor=` | `{"items": [...], "next_cursor": "<opaque>", "has_more": bool}` — never a bank count, index or progress value. `limit` is clamped to `1…20` (default `12`). Pass the previous `next_cursor` to continue the session; `next_cursor` is `""` and `has_more` is `false` when nothing unseen remains. |
+| `POST /api/v1/explore/answers` (`{"question_id", "chosen_index", "dwell_ms"}`) | `{"is_correct", "correct_index", "explanation", "points_awarded", "source", "verified"}`; only a first-time correct answer to an approved question earns points. `source` is the same citation object the feed carries (or `null`). |
+| `POST /api/v1/explore/engagement`, `POST /api/v1/explore/impressions` (`{"question_id", "dwell_ms", "source_opened"}`) | `{"recorded": true}` — stores signal `2` (dwell > 8 s **or** the source panel was opened), `1` (skip < 3 s) or `0`; engagement never grants points |
+
+### Feed item shape
+
+```json
+{
+  "question_id": 12,
+  "topic": "زیست‌شناسی",
+  "difficulty": "easy",
+  "question_text": "…",
+  "options": ["…", "…", "…", "…"],
+  "verified": true,
+  "source": {
+    "source_type": "textbook",
+    "source_title": "Biology 2e",
+    "source_author": "OpenStax",
+    "source_institution": "Rice University",
+    "source_url": "https://openstax.org/details/books/biology-2e",
+    "source_year": "2018",
+    "source_page_or_section": "Chapters on cells",
+    "evidence_level": "textbook",
+    "verified": "true"
+  },
+  "explain": {"affinity": 0.6, "quality": 1, "freshness": 0.9, "discovery": 0.2, "score": 0.78}
+}
+```
+
+`source` is `null` and `verified` is `false` for a question whose citation is not
+complete, safe (`https`, no credentials) and in a known evidence tier. The client
+must render such a question as *awaiting verification*, never as sourced.
+`correct_index` and `explanation` never appear in a feed item — only in the answer
+response. `explain` is the four weighted ranking components (`gamas_bot/explore_recommender.py`),
+exposed so a ranking can be inspected in production instead of guessed at.
+
+### Cursor semantics
+
+The cursor is an opaque, URL-safe base64 token (not an offset, not a
+`question_id`). It carries the ids already served in the session and the topic
+of the last cards, so:
+
+* a prefetched page can never repeat a card that is still on screen, even though
+  no impression has been recorded for it yet;
+* the "at most two cards on the same topic" rule holds across page boundaries;
+* a truncated or forged cursor degrades to a fresh session (the SQL seen-filter
+  still prevents repeats from the user's own history) instead of erroring.
+
+Pagination is stable because the seen-question filter and the ranking are both
+deterministic for a fixed database state; the served-id set closes the window
+between "served" and "impressioned".
 
 ## Admin moderation
 
