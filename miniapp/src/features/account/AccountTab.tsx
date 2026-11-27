@@ -1,8 +1,8 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { api, MeResponse, PlanOption } from "../../api";
 import { formatDate, formatMoney, formatNumber, splitCredit, toFa } from "../../lib/format";
 import { copyText, getTelegramUser, haptic, openTelegramLink, shareLink } from "../../lib/telegram";
-import { useAsync } from "../../lib/useAsync";
+import { describeError, useAsync } from "../../lib/useAsync";
 import { Icon } from "../../ui/Icon";
 import {
   Banner,
@@ -61,6 +61,11 @@ export function AccountTab({
     message: string;
     ok: boolean;
   } | null>(null);
+  // One in-flight redemption at a time, and one idempotency key per attempt:
+  // a retry (double tap, flaky network) re-sends the same key so the server
+  // replays the original result instead of spending the points twice.
+  const [redeemingCode, setRedeemingCode] = useState<string | null>(null);
+  const redeemKeys = useRef(new Map<string, string>());
 
   const tgUser = getTelegramUser();
   const displayName =
@@ -89,13 +94,22 @@ export function AccountTab({
   };
 
   const redeem = async (code: string) => {
+    if (redeemingCode !== null) return;
     haptic("tap");
-    const key =
-      typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    setRedeemingCode(code);
+    setRedeemState(null);
+    let key = redeemKeys.current.get(code);
+    if (!key) {
+      key =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      redeemKeys.current.set(code, key);
+    }
     try {
       const res = await api.redeemReward(code, key);
+      // The key produced a committed redemption; the next one is a new attempt.
+      redeemKeys.current.delete(code);
       const minutes = Math.floor(res.credit_seconds_granted / 60);
       setRedeemState({
         code,
@@ -109,12 +123,16 @@ export function AccountTab({
       onMeChanged();
       plan.reload();
     } catch (error) {
+      // Keep the key: nothing was spent on the server (a failed redemption
+      // never consumes it), so a retry must stay idempotent.
       haptic("error");
       setRedeemState({
         code,
         ok: false,
-        message: (error as Error).message || "تبدیل امتیاز انجام نشد.",
+        message: describeError(error) || "تبدیل امتیاز انجام نشد.",
       });
+    } finally {
+      setRedeemingCode(null);
     }
   };
 
@@ -399,11 +417,11 @@ export function AccountTab({
                       </p>
                     </div>
                     <Button
-                      disabled={!affordable}
+                      disabled={!affordable || redeemingCode !== null}
                       onClick={() => redeem(item.code)}
                       className="px-3 text-xs"
                     >
-                      تبدیل
+                      {redeemingCode === item.code ? "در حال تبدیل…" : "تبدیل"}
                     </Button>
                   </div>
                   {redeemState?.code === item.code && (

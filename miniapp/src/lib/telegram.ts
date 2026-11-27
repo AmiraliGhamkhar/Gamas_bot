@@ -59,6 +59,28 @@ export function isInsideTelegram(): boolean {
   return Boolean(root()?.initData);
 }
 
+/**
+ * True when the page is hosted inside a Telegram client even if the WebApp SDK
+ * never loaded (blocked `telegram.org`, no self-hosted fallback). Used only to
+ * explain the failure honestly — never for authentication, which always needs
+ * server-verified initData.
+ */
+export function isInsideTelegramClient(): boolean {
+  if (typeof window === "undefined" || typeof navigator === "undefined") {
+    return false;
+  }
+  const w = window as unknown as {
+    TelegramWebviewProxy?: unknown;
+    TelegramWebviewProxyProto?: unknown;
+    external?: { notify?: unknown };
+    webkit?: { messageHandlers?: { TelegramWebviewProxy?: unknown } };
+  };
+  if (w.TelegramWebviewProxy || w.TelegramWebviewProxyProto) return true;
+  if (typeof w.external?.notify === "function") return true;
+  if (w.webkit?.messageHandlers?.TelegramWebviewProxy) return true;
+  return /telegram/i.test(navigator.userAgent || "");
+}
+
 /** The host's colour scheme; the app ships its own navy theme and only listens. */
 export function getColorScheme(): "light" | "dark" {
   return root()?.colorScheme ?? "dark";

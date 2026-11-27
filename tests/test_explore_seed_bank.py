@@ -433,6 +433,34 @@ class SeedBankDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen & served, set())
         self.assertTrue(served)
 
+    async def test_new_questions_stay_reachable_when_seen_fill_the_window(self) -> None:
+        """Fresh approved questions survive even when the user has already seen
+        everything an old fixed candidate window would have scanned (regression:
+        seen rows used to consume the window and starve newer content)."""
+        await seed_explore_questions(self.db)
+        for i in range(60):
+            await self.db.db.execute(
+                "INSERT INTO explore_questions(topic, difficulty, question_text, "
+                "options_json, correct_index, explanation, status, created_at) "
+                "VALUES ('فیزیک', 'easy', ?, '[\"الف\", \"ب\", \"ج\", \"د\"]', "
+                "0, '', 'approved', '2026-11-24T00:00:00+00:00')",
+                (f"سؤال تازهٔ شمارهٔ {i}",),
+            )
+        # The user has already seen the oldest 250 approved questions.
+        await self.db.db.execute(
+            "INSERT INTO explore_impressions(user_id, question_id, shown_at, "
+            "dwell_ms, signal) SELECT ?, question_id, '2026-11-23T00:00:00+00:00', "
+            "4000, 3 FROM explore_questions WHERE status = 'approved' "
+            "ORDER BY question_id ASC LIMIT 250",
+            (USER,),
+        )
+        await self.db.db.commit()
+
+        feed = await recommend_explore_feed(self.db, USER, limit=10)
+        self.assertEqual(len(feed), 10)
+        # Only the questions beyond that seen window may be served.
+        self.assertTrue(all(int(item["question_id"]) > 250 for item in feed))
+
     async def test_feed_and_cli_never_expose_the_bank_size(self) -> None:
         await seed_explore_questions(self.db)
         app = make_wsgi_app(self.settings)

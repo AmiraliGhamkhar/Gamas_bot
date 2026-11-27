@@ -91,7 +91,7 @@ const ROUTES: Record<string, unknown> = {
     ],
     question_count: 4,
   },
-  "/api/v1/review/groups?limit=50": {
+  "/api/v1/review/groups?limit=200": {
     groups: [
       {
         group_key: "pack:7",
@@ -108,7 +108,7 @@ const ROUTES: Record<string, unknown> = {
     ],
     total: 1,
   },
-  "/api/v1/review/questions?group_key=pack%3A7&limit=100": {
+  "/api/v1/review/questions?group_key=pack%3A7&limit=200": {
     questions: [
       {
         question_id: 501,

@@ -213,8 +213,25 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+/** RFC 5987-aware filename from Content-Disposition, or null. */
+function filenameFromDisposition(value: string | null): string | null {
+  if (!value) return null;
+  const extended = /filename\*\s*=\s*UTF-8''([^;]+)/i.exec(value);
+  if (extended) {
+    try {
+      return decodeURIComponent(extended[1].trim());
+    } catch {
+      /* fall through to the plain form */
+    }
+  }
+  const plain = /filename\s*=\s*"([^"]+)"|filename\s*=\s*([^;]+)/i.exec(value);
+  return plain ? (plain[1] ?? plain[2]).trim() : null;
+}
+
 /** Binary assets need the same auth header, so they are fetched, not linked. */
-async function download(path: string): Promise<Blob> {
+async function download(
+  path: string,
+): Promise<{ blob: Blob; filename: string | null }> {
   const res = await fetch(path, {
     headers: { "X-Telegram-Init-Data": getInitData() },
   });
@@ -222,7 +239,12 @@ async function download(path: string): Promise<Blob> {
     const payload = (await res.json().catch(() => null)) as { error?: string } | null;
     throw new ApiError(payload?.error || `HTTP ${res.status}`, res.status);
   }
-  return res.blob();
+  return {
+    blob: await res.blob(),
+    // The server already chose a safe filename with its extension; the caller
+    // falls back to a constructed name only when the header is missing.
+    filename: filenameFromDisposition(res.headers.get("Content-Disposition")),
+  };
 }
 
 export const api = {
@@ -250,11 +272,11 @@ export const api = {
   downloadAsset: (packId: number, assetId: number) =>
     download(`/api/v1/library/${packId}/download/${assetId}`),
 
-  getReviewGroups: (limit = 50) =>
+  getReviewGroups: (limit = 200) =>
     request<{ groups: ReviewGroup[]; total: number }>(
       `/api/v1/review/groups?limit=${limit}`,
     ),
-  getReviewQuestions: (groupKey: string, limit = 100) =>
+  getReviewQuestions: (groupKey: string, limit = 200) =>
     request<{ questions: ReviewQuestion[]; total: number }>(
       `/api/v1/review/questions?group_key=${encodeURIComponent(groupKey)}&limit=${limit}`,
     ),

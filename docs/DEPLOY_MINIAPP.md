@@ -70,6 +70,28 @@ npm test
 Build output: `miniapp/dist/` containing `index.html` and hashed files under
 `assets/`. Vite base is `/app/` (see `miniapp/vite.config.ts`).
 
+### 4.1 Self-host the Telegram WebApp SDK (recommended)
+
+`index.html` loads `https://telegram.org/js/telegram-web-app.js` and falls back
+to a self-hosted copy at `/app/telegram-web-app.js` when that host is
+unreachable (notably on Iranian ISPs, where `telegram.org` is blocked). Provide
+the fallback **before** building — it must be the **official** file, fetched
+once from the official URL:
+
+```bash
+curl -fsSL https://telegram.org/js/telegram-web-app.js \
+  -o miniapp/public/telegram-web-app.js
+```
+
+Vite copies `miniapp/public/` into `miniapp/dist/`, so the file is served next
+to `index.html`. Never take this file from an unofficial mirror: it handles
+`initData` and a tampered copy could exfiltrate sessions. The file is
+git-ignored — it is third-party and updated by Telegram.
+
+If the fallback is missing and `telegram.org` is blocked, the Mini App detects
+it is inside a Telegram client and shows a clear «ابزار تلگرام بارگذاری نشد»
+screen with a retry button instead of failing silently.
+
 ## 5. Upload destination for `miniapp/dist`
 
 Upload the **contents** of the built `miniapp/dist/` directory to:
@@ -78,7 +100,8 @@ Upload the **contents** of the built `miniapp/dist/` directory to:
 /home/USER/gamas_bot/miniapp/dist/
 ```
 
-The directory must contain `index.html` and an `assets/` subdirectory. Passenger
+The directory must contain `index.html` and an `assets/` subdirectory (plus
+`telegram-web-app.js` when you self-host the SDK fallback, §4.1). Passenger
 serves this directory at `https://gamasrobot.ir/app/` through
 `passenger_wsgi.py` → `gamas_bot/webapp_api.py`.
 
