@@ -66,8 +66,8 @@ never said is rejected by a deterministic final gate: the user keeps the
 transcript and the submission is reported as `partial`, never as a delivered
 booklet.
 
-Operating defaults remain 131,072 context tokens, 64,000 characters per chunk
-and 16,384 output tokens, with `NOTE_COMPILE=false` and no hedged requests.
+Operating defaults are 262,144 context tokens, 64,000 characters per chunk
+and 65,536 output tokens, with `NOTE_COMPILE=false` and no hedged requests.
 These are application budgets, not model/account guarantees. No live provider
 or deployment compatibility is implied by offline tests. See
 [Providers](docs/PROVIDERS.md) for task policy, quota budgets and safe probes.

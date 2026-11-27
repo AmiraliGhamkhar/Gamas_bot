@@ -176,10 +176,9 @@ space: `2 × ((2 × 1 GiB) + 64 MiB)`. `python -m scripts.cpanel_preflight` make
 this calculation from the effective environment and actual free space and fails
 instead of starting an impossible profile. Independent stages overlap network
 waits, so a single media worker is fine.
-`NOTE_MAX_OUTPUT_TOKENS` is a per-request budget, not RAM: 32 768 tokens at a
-conservative 20 tokens/s can exceed the 900 s request deadline, which `--check`
-warns about. The shipped output budget is 16,384, with a 131,072-token context
-and 64,000-character chunk ceiling; editorial compilation is off. Dispatch
+`NOTE_MAX_OUTPUT_TOKENS` is a per-request budget, not RAM. The shipped defaults
+are 65,536 output tokens, a 262,144-token context, a 64,000-character chunk
+ceiling, and a 20,000-character pack target; editorial compilation is off. Dispatch
 never hedges, including with a stale nonzero `NOTE_HEDGE_AFTER_SECONDS`; bounded
 transport retries and schema compatibility adjustments still cost requests.
 Provider-specific caps and the shared quota ledger also apply (see

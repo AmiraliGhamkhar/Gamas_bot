@@ -86,6 +86,9 @@ def summarize_daily(
         "total": 0,
         "terminal": 0,
         "succeeded": 0,
+        "partial": 0,
+        "failed": 0,
+        "delivered": 0,
         "success_rate": 0.0,
         "processing_hours": 0.0,
         "p50_duration_s": None,
@@ -100,12 +103,17 @@ def summarize_daily(
             for status, count in entry["by_status"].items()
             if status in TERMINAL_STATUSES
         )
-        succeeded = entry["by_status"].get("done", 0) + entry["by_status"].get("partial", 0)
+        succeeded = entry["by_status"].get("done", 0)
+        partial = entry["by_status"].get("partial", 0)
+        failed = entry["by_status"].get("failed", 0)
         days_out.append(
             {
                 **entry,
                 "terminal": terminal,
                 "succeeded": succeeded,
+                "partial": partial,
+                "failed": failed,
+                "delivered": succeeded + partial,
                 "success_rate": (
                     round(succeeded / terminal, 3) if terminal else 0.0
                 ),
@@ -117,6 +125,9 @@ def summarize_daily(
         totals["total"] += entry["total"]
         totals["terminal"] += terminal
         totals["succeeded"] += succeeded
+        totals["partial"] += partial
+        totals["failed"] += failed
+        totals["delivered"] += succeeded + partial
         totals["processing_hours"] += entry["processing_hours"]
         all_durations.extend(durations)
 
@@ -129,14 +140,22 @@ def summarize_daily(
     return {"days": days_out, "totals": totals}
 
 
-async def fetch_daily_job_report(db: Any, *, days: int = 7) -> dict[str, Any]:
-    """Read the submissions ledger and return :func:`summarize_daily` output."""
+async def fetch_daily_job_report(
+    db: Any, *, days: int = 7, now: datetime | None = None
+) -> dict[str, Any]:
+    """Read only rows in the requested UTC date window (before aggregation)."""
+    days = max(1, int(days))
+    today = (now or datetime.now(timezone.utc)).date()
+    cutoff = (today - timedelta(days=days - 1)).isoformat()
+    end = (today + timedelta(days=1)).isoformat()
     rows = await db.db.execute_fetchall(
         """
         SELECT created_at, status, kind, duration_seconds
         FROM submissions
+        WHERE julianday(created_at) >= julianday(?)
+          AND julianday(created_at) < julianday(?)
         ORDER BY created_at DESC
-        LIMIT 5000
-        """
+        """,
+        (cutoff, end),
     )
-    return summarize_daily([dict(r) for r in rows], days=days)
+    return summarize_daily([dict(r) for r in rows], days=days, now=now)

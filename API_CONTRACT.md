@@ -7,7 +7,7 @@ listed returns `404`.
 
 ## Authentication
 
-Every `/api/*` route except `/api/health` and `/api/v1/health` requires
+Every `/api/*` route except `/api/health`, `/api/v1/health`, and `/api/v1/healthz` requires
 `X-Telegram-Init-Data`, validated server-side with HMAC-SHA256 against
 `TELEGRAM_BOT_TOKEN` (`gamas_bot/telegram_auth.py`): sorted payload, constant-time
 compare, `auth_date` freshness, `user.id` required. Missing, expired or tampered
@@ -23,6 +23,7 @@ otherwise `403 Forbidden`.
 | --- | --- |
 | `GET`/`HEAD /api/health` | `200 {"status": "ok"}` |
 | `GET`/`HEAD /api/v1/health` | `200 {"status": "ok"}` |
+| `GET`/`HEAD /api/v1/healthz` | `200 {"status": "ok", "db": "ok"}`; `503` when the database check fails (`{"status":"error","db":"down"}`) |
 
 ## Account
 
@@ -40,7 +41,7 @@ otherwise `403 Forbidden`.
 
 | Route | Response |
 | --- | --- |
-| `GET /api/packs`, `GET /api/v1/library` | `{"packs": [...]}` |
+| `GET /api/packs`, `GET /api/v1/library` | `{"packs": [...], "limit": int, "offset": int, "total": int}`; `limit` defaults to 50 and clamps to 1–200, `offset` defaults to 0 and clamps to nonnegative values |
 | `POST /api/packs` (`{"title", "source_type"}`) | `201 {"pack": {...}}` |
 | `GET /api/packs/{pack_id}`, `GET /api/v1/library/{pack_id}` | `{"pack", "assets", "question_count"}` |
 | `DELETE /api/v1/library/{pack_id}` | `{"deleted": true, "pack_id": ...}` |
