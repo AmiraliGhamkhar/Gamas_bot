@@ -34,7 +34,6 @@ T = TypeVar("T")
 DEFAULT_POOL_SIZE = 2
 
 _pool: ProcessPoolExecutor | None = None
-_pool_lock = asyncio.Lock()
 
 
 def pool_enabled() -> bool:
@@ -98,13 +97,15 @@ async def run_cpu_bound(fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T
         logger.debug("cpu_pool: unpicklable callable %r; using thread path", fn)
         return await asyncio.to_thread(fn, *args, **kwargs)
 
-    loop = asyncio.get_running_loop()
     try:
         pool = _get_pool()
-        return await loop.run_in_executor(pool, payload)
+        # Submit explicitly so only a failure before a Future is returned can
+        # use the fallback. Once accepted, function/worker exceptions propagate.
+        submitted = pool.submit(payload)
     except Exception:
-        logger.warning("cpu_pool: falling back to thread path", exc_info=True)
+        logger.warning("cpu_pool: submission failed; using thread path", exc_info=True)
         return await asyncio.to_thread(fn, *args, **kwargs)
+    return await asyncio.wrap_future(submitted)
 
 
 __all__ = [

@@ -667,33 +667,64 @@ def make_wsgi_app(
             if m_v1_dl and method == "GET":
                 pack_id, asset_id = int(m_v1_dl.group(1)), int(m_v1_dl.group(2))
 
-                async def _get_v1_asset(
-                    db: Database,
-                ) -> tuple[bytes, str, str] | None:
+                async def _get_v1_asset(db: Database) -> dict[str, Any] | None:
                     asset = await db.study_packs.study_asset_get(user_id, asset_id)
                     if asset is None or int(asset["pack_id"]) != pack_id:
                         return None
-                    return await _read_asset(db, user_id, cfg, asset)
+                    return asset
 
-                return _serve_asset(
-                    start_response, asyncio.run(_with_db(cfg, _get_v1_asset))
-                )
+                asset = asyncio.run(_with_db(cfg, _get_v1_asset))
+                if asset is None:
+                    resolved = None
+                elif str(asset.get("source_kind") or "file") == "file":
+                    try:
+                        file_path = resolve_private_asset(
+                            _assets_root(cfg), str(asset["storage_path"])
+                        )
+                    except ValueError:
+                        resolved = None
+                    else:
+                        resolved = (
+                            (file_path.read_bytes(),
+                             str(asset.get("mime_type") or "application/octet-stream"),
+                             file_path.name)
+                            if file_path.is_file() else None
+                        )
+                else:
+                    resolved = asyncio.run(
+                        _with_db(cfg, lambda db: _read_asset(db, user_id, cfg, asset))
+                    )
+                return _serve_asset(start_response, resolved)
 
             m_dl = _ASSET_DL_RE.match(path)
             if m_dl and method == "GET":
                 asset_id = int(m_dl.group(1))
 
-                async def _get_asset(
-                    db: Database,
-                ) -> tuple[bytes, str, str] | None:
-                    asset = await db.study_packs.study_asset_get(user_id, asset_id)
-                    if asset is None:
-                        return None
-                    return await _read_asset(db, user_id, cfg, asset)
+                async def _get_asset(db: Database) -> dict[str, Any] | None:
+                    return await db.study_packs.study_asset_get(user_id, asset_id)
 
-                return _serve_asset(
-                    start_response, asyncio.run(_with_db(cfg, _get_asset))
-                )
+                asset = asyncio.run(_with_db(cfg, _get_asset))
+                if asset is None:
+                    resolved = None
+                elif str(asset.get("source_kind") or "file") == "file":
+                    try:
+                        file_path = resolve_private_asset(
+                            _assets_root(cfg), str(asset["storage_path"])
+                        )
+                    except ValueError:
+                        resolved = None
+                    else:
+                        resolved = (
+                            (file_path.read_bytes(),
+                             str(asset.get("mime_type") or "application/octet-stream"),
+                             file_path.name)
+                            if file_path.is_file() else None
+                        )
+                else:
+                    resolved = asyncio.run(
+                        _with_db(cfg, lambda db: _read_asset(db, user_id, cfg, asset))
+                    )
+                return _serve_asset(start_response, resolved)
 
             # ------------------------------------------------- Review APIs
             # Review is a Study Pack view: questions are read through the pack

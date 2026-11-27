@@ -394,6 +394,32 @@ class CpuPoolTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(os.environ, {"GAMAS_BUILD_POOL": "1"}):
             self.assertEqual(await cpu_pool.run_cpu_bound(_double, 21), 42)
 
+    async def test_submitted_application_failure_is_not_retried(self) -> None:
+        calls = []
+
+        def fail():
+            calls.append(1)
+            raise RuntimeError("application failure")
+
+        # Test thread-free executor lifecycle with a real concurrent future.
+        from concurrent.futures import Future
+        class Executor:
+            def submit(self, fn):
+                future = Future()
+                try:
+                    future.set_result(fn())
+                except Exception as exc:
+                    future.set_exception(exc)
+                return future
+
+        with (
+            mock.patch.dict(os.environ, {"GAMAS_BUILD_POOL": "1"}),
+            mock.patch.object(cpu_pool, "_get_pool", return_value=Executor()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "application failure"):
+                await cpu_pool.run_cpu_bound(fail)
+        self.assertEqual(len(calls), 1)
+
 
 class JobsReportTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:

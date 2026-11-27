@@ -65,20 +65,17 @@ syncs do not deactivate unrelated plans.
 | Action | Default cost |
 | --- | --- |
 | Quiz, 5 / 10 / 20 questions | 5 / 10 / 20 minutes (`QUIZ_COST_SECONDS_PER_QUESTION=60`) |
-| AI deck, 10 / 20 / 40 cards | 5 / 10 / 20 minutes (`FLASHCARD_AI_COST_SECONDS=300`, base size 10) |
-| Manual decks, Word/PDF export, re-download | free |
 | Office and document notes/exports | free to users; provider calls cost the operator |
 
-A paid generation debits before the provider call with a durable pending record.
-Saving finalizes; failure, cancel, 30-minute preview expiry or startup recovery
-refunds once. If fewer items are produced than requested, the shortfall is
-refunded pro rata in the same transaction that stores the artifact. At least 3
-questions or 5 cards are required for a valid result.
+Quiz admission and charging are implemented in the quiz session flow. The
+historical flashcard/deck tables remain for database compatibility and data
+preservation; AI deck generation, manual decks, and their former free-use and
+charge/refund flows are no longer active user-facing features. Do not infer
+current behavior from retained historical rows or schema columns.
 
-Admission is checked before the debit: one generation per user at a time, one
-active quiz, 3 new sessions per rolling hour, 30 stored decks. Each user keeps
-one free quiz and one free AI deck; unlimited users spend neither gifts nor
-credit.
+Quiz access checks include one active quiz and the configured rolling-hour
+session limit. A user's free quiz is tracked separately; paid quiz charges use
+the credit ledger. Unlimited users spend neither gifts nor credit.
 
 ## Purchases (card to card, manual review)
 
