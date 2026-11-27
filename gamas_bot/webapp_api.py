@@ -7,14 +7,11 @@ import gzip
 import json
 import logging
 import mimetypes
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, quote
-
-logger = logging.getLogger(__name__)
 
 from .config import PROJECT_DIR, Settings, from_env
 from .db import Database
@@ -28,6 +25,8 @@ from .explore_sources import row_source_payload
 from .rewards import REWARD_CATALOG as _REWARD_CATALOG
 from .study_storage import resolve_private_asset
 from .telegram_auth import InitDataError, validate_init_data
+
+logger = logging.getLogger(__name__)
 
 _PACK_RE = re.compile(r"^/api/packs/(\d+)$")
 _ASSET_DL_RE = re.compile(r"^/api/assets/(\d+)/download$")

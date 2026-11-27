@@ -20,7 +20,7 @@ import unittest
 from pathlib import Path
 
 from gamas_bot.db import Database
-from gamas_bot.explore_bank import BANK, TOPICS
+from gamas_bot.explore_bank import BANK
 from gamas_bot.explore_recommender import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
@@ -32,7 +32,6 @@ from gamas_bot.explore_seed import seed_explore_questions
 from gamas_bot.explore_sources import (
     EVIDENCE_LEVELS,
     SOURCES,
-    get_source,
     is_safe_source_url,
     row_source_payload,
     validate_catalog,
@@ -450,7 +449,7 @@ class ExploreFeedDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_verified_sources_outrank_unverified_ones(self) -> None:
         """Two identical questions, one sourced: the sourced one wins."""
-        for index, sourced in enumerate((False, True)):
+        for sourced in (False, True):
             if sourced:
                 await self.db.db.execute(
                     "INSERT INTO explore_questions(topic, difficulty, question_text, "

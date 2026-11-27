@@ -72,7 +72,7 @@ def audit() -> dict:
         "sources": len(SOURCES),
         # Catalog-level problems surface on their own (they carry a source key,
         # not a question key), so the report separates them for readability.
-        "catalog_errors": [e for e in validate_catalog()],
+        "catalog_errors": list(validate_catalog()),
         "errors": errors,
         "warnings": warnings,
         "tiers": dict(tiers),
