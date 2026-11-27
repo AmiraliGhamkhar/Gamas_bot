@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api, PublicationStatus, ReviewQuestion } from "../../api";
 import { formatRelative, toFa } from "../../lib/format";
 import { haptic } from "../../lib/telegram";
-import { useAsync } from "../../lib/useAsync";
+import { describeError, useAsync } from "../../lib/useAsync";
 import { Icon } from "../../ui/Icon";
 import {
   Button,
@@ -30,7 +30,11 @@ const SOURCE_LABELS: Record<string, string> = {
   video: "ویدیو",
   pdf: "PDF",
   docx: "Word",
+  pptx: "پاورپوینت",
+  presentation: "پاورپوینت",
   document: "سند",
+  booklet: "جزوه",
+  upload: "فایل",
   office: "آفیس",
   text: "متن",
 };
@@ -83,7 +87,7 @@ function QuestionView({
       haptic("success");
     } catch (error) {
       haptic("error");
-      setShareError((error as Error).message || "ثبت پاسخ انجام نشد؛ دوباره تلاش کنید.");
+      setShareError(describeError(error) || "ثبت پاسخ انجام نشد؛ دوباره تلاش کنید.");
     } finally {
       setBusy(false);
     }
@@ -99,7 +103,7 @@ function QuestionView({
       haptic("success");
     } catch (error) {
       haptic("error");
-      setShareError((error as Error).message || "ارسال این سؤال انجام نشد.");
+      setShareError(describeError(error) || "ارسال این سؤال انجام نشد.");
     } finally {
       setShareBusy(false);
     }
@@ -281,6 +285,13 @@ function GroupView({
         }
       />
 
+      {questions.data && questions.data.total > list.length && (
+        <InlineNote>
+          {toFa(questions.data.total - list.length)} سؤال دیگر از این گروه هنوز بارگذاری
+          نشده است.
+        </InlineNote>
+      )}
+
       <div key={current.question_id} className="animate-fade space-y-3">
         <QuestionView
           question={current}
@@ -328,7 +339,7 @@ export function ReviewTab({
   initialPackId: number | null;
   onConsumedInitial: () => void;
 }) {
-  const groups = useAsync(() => api.getReviewGroups(50), []);
+  const groups = useAsync(() => api.getReviewGroups(), []);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [activeTitle, setActiveTitle] = useState("");
 

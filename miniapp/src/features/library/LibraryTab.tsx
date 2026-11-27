@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api, saveBlob, StudyAsset, StudyPack } from "../../api";
 import { formatDate, formatRelative, formatSize, toFa } from "../../lib/format";
 import { haptic } from "../../lib/telegram";
-import { useAsync } from "../../lib/useAsync";
+import { describeError, useAsync } from "../../lib/useAsync";
 import { EcgLoader } from "../../ui/Ecg";
 import { Icon, IconName } from "../../ui/Icon";
 import {
@@ -59,6 +59,33 @@ const ASSET_META: Record<string, { label: string; icon: IconName }> = {
 
 function assetMeta(kind: string): { label: string; icon: IconName } {
   return ASSET_META[kind] ?? { label: kind, icon: "doc" };
+}
+
+const MIME_EXTENSIONS: Record<string, string> = {
+  "application/pdf": ".pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+  "text/plain": ".txt",
+  "text/html": ".html",
+  "text/csv": ".csv",
+  "audio/mpeg": ".mp3",
+  "audio/ogg": ".ogg",
+  "video/mp4": ".mp4",
+  "application/zip": ".zip",
+};
+
+/**
+ * Fallback download name when the server sent no filename: the Persian asset
+ * title alone has no extension, so the OS would not know how to open it.
+ */
+function fallbackAssetName(asset: StudyAsset): string {
+  const base =
+    (asset.title || "").replace(/[\\/:*?"<>|]/g, "_").trim() ||
+    `gamas-${asset.kind}`;
+  if (/\.[A-Za-z0-9]{1,8}$/.test(base)) return base;
+  const ext = MIME_EXTENSIONS[(asset.mime_type || "").split(";")[0].trim()] ?? "";
+  return ext ? `${base}${ext}` : base;
 }
 
 function sourceLabel(pack: StudyPack): string {
@@ -127,12 +154,12 @@ function AssetRow({
     setBusy(true);
     haptic("tap");
     try {
-      const blob = await api.downloadAsset(packId, asset.asset_id);
-      saveBlob(blob, asset.title || `gamas-${asset.kind}`);
+      const result = await api.downloadAsset(packId, asset.asset_id);
+      saveBlob(result.blob, result.filename || fallbackAssetName(asset));
       haptic("success");
     } catch (error) {
       haptic("error");
-      onError((error as Error).message || "دریافت فایل انجام نشد.");
+      onError(describeError(error) || "دریافت فایل انجام نشد.");
     } finally {
       setBusy(false);
     }
@@ -198,7 +225,7 @@ function PackDetail({
       onBack();
     } catch (error) {
       haptic("error");
-      setActionError((error as Error).message || "حذف بسته انجام نشد.");
+      setActionError(describeError(error) || "حذف بسته انجام نشد.");
       setDeleting(false);
       setConfirmDelete(false);
     }

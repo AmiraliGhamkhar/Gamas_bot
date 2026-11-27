@@ -747,7 +747,7 @@ def make_wsgi_app(
                 body = _read_json_body(environ)
                 qid = body.get("question_id")
                 action = str(body.get("action") or "").strip()
-                if not isinstance(qid, int) or action not in {"approve", "reject"}:
+                if isinstance(qid, bool) or not isinstance(qid, int) or action not in {"approve", "reject"}:
                     return _json_response(
                         start_response, "400 Bad Request", {"error": "invalid payload"}
                     )
@@ -782,8 +782,18 @@ def make_wsgi_app(
             if path in {"/api/v1/explore/impressions", "/api/v1/explore/engagement"} and method == "POST":
                 body = _read_json_body(environ)
                 qid = body.get("question_id")
-                dwell_ms = int(body.get("dwell_ms") or 0)
-                if not isinstance(qid, int) or dwell_ms < 0:
+                raw_dwell = body.get("dwell_ms")
+                if isinstance(raw_dwell, (bool, float)):
+                    return _json_response(
+                        start_response, "400 Bad Request", {"error": "invalid payload"}
+                    )
+                try:
+                    dwell_ms = int(raw_dwell or 0)
+                except (TypeError, ValueError):
+                    return _json_response(
+                        start_response, "400 Bad Request", {"error": "invalid payload"}
+                    )
+                if isinstance(qid, bool) or not isinstance(qid, int) or dwell_ms < 0:
                     return _json_response(
                         start_response, "400 Bad Request", {"error": "invalid payload"}
                     )
@@ -816,8 +826,25 @@ def make_wsgi_app(
                 body = _read_json_body(environ)
                 qid = body.get("question_id")
                 chosen = body.get("chosen_index")
-                dwell_ms = int(body.get("dwell_ms") or 0)
-                if not isinstance(qid, int) or not isinstance(chosen, int) or chosen < 0 or chosen > 3:
+                raw_dwell = body.get("dwell_ms")
+                if isinstance(raw_dwell, (bool, float)):
+                    return _json_response(
+                        start_response, "400 Bad Request", {"error": "invalid payload"}
+                    )
+                try:
+                    dwell_ms = int(raw_dwell or 0)
+                except (TypeError, ValueError):
+                    return _json_response(
+                        start_response, "400 Bad Request", {"error": "invalid payload"}
+                    )
+                if (
+                    isinstance(qid, bool)
+                    or not isinstance(qid, int)
+                    or isinstance(chosen, bool)
+                    or not isinstance(chosen, int)
+                    or chosen < 0
+                    or chosen > 3
+                ):
                     return _json_response(
                         start_response, "400 Bad Request", {"error": "invalid payload"}
                     )
@@ -999,6 +1026,18 @@ def make_wsgi_app(
                     not candidate.is_relative_to(dist_dir.resolve())
                     or not candidate.is_file()
                 ):
+                    # A missing *file* request must 404 — a <script> or <img>
+                    # request must never receive the HTML shell (and the
+                    # Telegram SDK loader needs a real failure to trigger its
+                    # fallback). Only extension-less view paths fall back to
+                    # the SPA entry.
+                    if Path(rel).suffix:
+                        return _json_response(
+                            start_response,
+                            "404 Not Found",
+                            {"error": "not found"},
+                            method=method,
+                        )
                     candidate = (dist_dir / "index.html").resolve()
                     spa_fallback = True
                 if candidate.is_file():

@@ -6,7 +6,17 @@
     <meta name="theme-color" content="#03181F" />
     <meta name="color-scheme" content="dark" />
     <title>گاماس</title>
-    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <!--
+      The Telegram WebApp SDK. `telegram.org` is unreachable on some networks
+      (notably Iranian ISPs), so a failed load falls back to a self-hosted copy
+      served next to the SPA at /app/telegram-web-app.js (see DEPLOY_MINIAPP.md).
+      Both loads are parser-blocking, so window.Telegram always exists before
+      the deferred app module runs.
+    -->
+    <script
+      src="https://telegram.org/js/telegram-web-app.js"
+      onerror="document.write('<script src=&quot;/app/telegram-web-app.js&quot; onerror=&quot;window.__tgSdkMissing=true&quot;><\/script>')"
+    ></script>
   </head>
   <body class="bg-bg text-text antialiased">
     <div id="root"></div>

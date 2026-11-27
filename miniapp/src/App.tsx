@@ -5,10 +5,11 @@ import { AccountTab } from "./features/account/AccountTab";
 import { ExploreTab } from "./features/explore/ExploreTab";
 import { LibraryTab } from "./features/library/LibraryTab";
 import { ReviewTab } from "./features/review/ReviewTab";
-import { haptic, isInsideTelegram } from "./lib/telegram";
+import { haptic, isInsideTelegram, isInsideTelegramClient } from "./lib/telegram";
 import { useAsync } from "./lib/useAsync";
 import { EcgLoader } from "./ui/Ecg";
 import { Icon, IconName } from "./ui/Icon";
+import { Button } from "./ui/primitives";
 import { ErrorState } from "./ui/states";
 
 type Tab = "review" | "library" | "explore" | "account";
@@ -127,6 +128,34 @@ export default function App() {
     // Outside Telegram there is no initData to authenticate with, so this is a
     // destination, not a failure: the app never asks for credentials itself.
     if (!isInsideTelegram()) {
+      // Inside a Telegram client with no WebApp SDK means the script never
+      // loaded (telegram.org unreachable and no self-hosted fallback): say
+      // exactly that instead of telling an in-Telegram user to open Telegram.
+      if (isInsideTelegramClient()) {
+        return (
+          <div className="mx-auto w-full max-w-md px-6 py-16 text-center">
+            <span className="mx-auto flex">
+              <Monogram />
+            </span>
+            <p className="mt-5 text-base font-semibold text-text">
+              ابزار تلگرام بارگذاری نشد
+            </p>
+            <p className="mx-auto mt-2 max-w-[32ch] text-xs leading-6 text-faint">
+              گاماس داخل تلگرام باز شده است اما اسکریپت وب‌اپ تلگرام در دسترس نبود.
+              اینترنت خود را بررسی کنید و دوباره تلاش کنید.
+            </p>
+            <div className="mt-5 flex justify-center">
+              <Button
+                variant="secondary"
+                icon="refresh"
+                onClick={() => window.location.reload()}
+              >
+                تلاش دوباره
+              </Button>
+            </div>
+          </div>
+        );
+      }
       return (
         <div className="mx-auto w-full max-w-md px-6 py-16 text-center">
           <span className="mx-auto flex">

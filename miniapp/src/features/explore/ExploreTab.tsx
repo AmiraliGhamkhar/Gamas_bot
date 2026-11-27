@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, ExploreAnswerResult, ExploreItem } from "../../api";
 import { toFa } from "../../lib/format";
 import { haptic } from "../../lib/telegram";
-import { useAsync } from "../../lib/useAsync";
+import { describeError, useAsync } from "../../lib/useAsync";
 import { EcgLoader } from "../../ui/Ecg";
 import { Icon } from "../../ui/Icon";
 import {
@@ -48,8 +48,6 @@ const DIFFICULTY_LABELS: Record<string, string> = {
   hard: "دشوار",
 };
 
-const MIN_DWELL_MS = 800;
-
 export function ExploreTab({ onReward }: { onReward: () => void }) {
   const feed = useAsync(api.getExploreFeed, []);
   const [index, setIndex] = useState(0);
@@ -73,15 +71,18 @@ export function ExploreTab({ onReward }: { onReward: () => void }) {
     setJustEarned(null);
   }, [current?.question_id]);
 
+  // A skipped card must still leave an impression — the server's seen-filter
+  // and the recommender's bounce signal both depend on it — so this fires on
+  // every skip regardless of dwell. An answered card already recorded its
+  // impression inside `submitExploreAnswer` and is never sent twice.
   const recordEngagement = (questionId: number) => {
-    const dwell = Date.now() - enteredAt.current;
-    if (dwell < MIN_DWELL_MS) return;
+    const dwell = Math.max(0, Date.now() - enteredAt.current);
     // Fire-and-forget: the feed must never wait on an analytics write.
     void api.sendExploreEngagement(questionId, dwell).catch(() => undefined);
   };
 
   const advance = () => {
-    if (current) recordEngagement(current.question_id);
+    if (current && !answers[current.question_id]) recordEngagement(current.question_id);
     haptic("select");
     setIndex((i) => (i + 1 >= items.length ? i : i + 1));
   };
@@ -111,7 +112,7 @@ export function ExploreTab({ onReward }: { onReward: () => void }) {
       }
     } catch (err) {
       haptic("error");
-      setError((err as Error).message || "ثبت پاسخ انجام نشد؛ دوباره تلاش کنید.");
+      setError(describeError(err) || "ثبت پاسخ انجام نشد؛ دوباره تلاش کنید.");
     } finally {
       setSubmitting(false);
     }
@@ -166,9 +167,9 @@ export function ExploreTab({ onReward }: { onReward: () => void }) {
       <div key={current.question_id} className="animate-rise space-y-3">
         <PaperCard tone={result ? (result.is_correct ? "ok" : "bad") : "brand"} className="space-y-4">
           <div className="flex items-center justify-between gap-2">
-            <div className="flex items-center gap-1.5">
-              <Chip tone="brand" onPaper>
-                {topicLabel(current.topic)}
+            <div className="flex min-w-0 items-center gap-1.5">
+              <Chip tone="brand" onPaper className="max-w-[16ch] overflow-hidden">
+                <span className="truncate">{topicLabel(current.topic)}</span>
               </Chip>
               <Chip onPaper>{DIFFICULTY_LABELS[current.difficulty] ?? current.difficulty}</Chip>
             </div>

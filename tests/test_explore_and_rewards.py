@@ -71,6 +71,26 @@ class ExploreAndRewardsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(s.startswith("200"))
         self.assertEqual(json.loads(body)["balance"], 0)
 
+    async def test_malformed_explore_payloads_are_400_not_500(self) -> None:
+        alice = {"X-Telegram-Init-Data": _sign_init_data(101)}
+        for path, payload in (
+            ("/api/v1/explore/engagement", {"question_id": 1, "dwell_ms": "abc"}),
+            ("/api/v1/explore/engagement", {"question_id": True, "dwell_ms": 10}),
+            ("/api/v1/explore/engagement", {"question_id": 1, "dwell_ms": 10.5}),
+            ("/api/v1/explore/answers", {"question_id": 1, "chosen_index": 0, "dwell_ms": "abc"}),
+            ("/api/v1/explore/answers", {"question_id": True, "chosen_index": 0}),
+            ("/api/v1/explore/answers", {"question_id": 1, "chosen_index": True}),
+        ):
+            s, _ = await asyncio.to_thread(
+                _call_wsgi,
+                self.app,
+                "POST",
+                path,
+                headers=alice,
+                body=json.dumps(payload).encode(),
+            )
+            self.assertTrue(s.startswith("400"), (path, payload, s))
+
     def test_topic_affinity_smoothing_and_determinism(self) -> None:
         from datetime import datetime, timezone
 

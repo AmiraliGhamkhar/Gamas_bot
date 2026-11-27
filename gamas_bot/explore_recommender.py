@@ -96,20 +96,26 @@ async def recommend_explore_feed(
         (int(user_id),),
     )
     impressions = [dict(r) for r in imp_rows]
-    seen_ids = {int(r["question_id"]) for r in impressions}
     affinities = compute_topic_affinities(impressions, now=current, config=config)
 
+    # Seen questions are excluded in SQL — never in a post-filter over a capped
+    # window — so a question the user has already met can not consume a slot,
+    # and newly published questions stay reachable no matter how large the
+    # approved bank grows. The 5000 cap is only a runaway guard.
     cand_rows = await db.db.execute_fetchall(
         """
         SELECT question_id, topic, difficulty, question_text, options_json, created_at
         FROM explore_questions
         WHERE status = 'approved' AND question_id > ?
+          AND question_id NOT IN (
+              SELECT question_id FROM explore_impressions WHERE user_id = ?
+          )
         ORDER BY question_id ASC
-        LIMIT 250
+        LIMIT 5000
         """,
-        (int(cursor),),
+        (int(cursor), int(user_id)),
     )
-    candidates = [dict(r) for r in cand_rows if int(r["question_id"]) not in seen_ids]
+    candidates = [dict(r) for r in cand_rows]
     if not candidates:
         return []
 
