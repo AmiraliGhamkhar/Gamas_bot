@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 from gamas_bot import notes as n
 from gamas_bot.booklet_synthesis import _finalize_global_learning_materials
 from gamas_bot.booklet_verification import _present_dimensions, verify_booklet

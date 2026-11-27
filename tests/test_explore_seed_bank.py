@@ -19,7 +19,7 @@ from pathlib import Path
 
 from gamas_bot.db import Database
 from gamas_bot.explore_bank import BANK, TOPICS, SeedQuestion
-from gamas_bot.explore_recommender import recommend_explore_feed
+from gamas_bot.explore_recommender import DEFAULT_PAGE_SIZE, recommend_explore_feed
 from gamas_bot.explore_seed import (
     CONCEPT_SIMILARITY_LIMIT,
     _main,
@@ -471,13 +471,29 @@ class SeedBankDatabaseTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(status.startswith("200"))
         payload = json.loads(body)
-        self.assertEqual(set(payload), {"items"})
-        self.assertEqual(len(payload["items"]), 10)
+        # The paginated feed envelope: items plus the cursor that continues the
+        # session. There is deliberately no total/count field.
+        self.assertEqual(set(payload), {"items", "next_cursor", "has_more"})
+        self.assertEqual(len(payload["items"]), DEFAULT_PAGE_SIZE)
         for item in payload["items"]:
             self.assertEqual(
-                set(item), {"question_id", "topic", "difficulty", "question_text", "options"}
+                set(item),
+                {
+                    "question_id",
+                    "topic",
+                    "difficulty",
+                    "question_text",
+                    "options",
+                    "source",
+                    "verified",
+                    "explain",
+                },
             )
-        # No count, progress, index or seed terminology anywhere in the payload.
+            # Every seeded question carries a real, verified academic source.
+            self.assertTrue(item["verified"])
+            self.assertEqual(item["source"]["verified"], "true")
+            self.assertTrue(item["source"]["source_url"].startswith("https://"))
+        # No count, progress, index or seed terminology in the payload.
         text = json.dumps(payload, ensure_ascii=False)
         for leak in ("200", "total", "count", "progress", "seed", "index"):
             self.assertNotIn(leak, text.lower().replace("question_text", ""))

@@ -28,7 +28,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Any, Awaitable, Callable, TypeVar
+from typing import Awaitable, Callable, TypeVar
 
 from .db import Database
 

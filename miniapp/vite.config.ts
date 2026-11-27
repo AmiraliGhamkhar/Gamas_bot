@@ -27,6 +27,12 @@ export default defineConfig(({ command }) => ({
     allowedHosts: [".e2b.app", "localhost"],
     proxy: {
       "/api": "http://127.0.0.1:8000",
+      // The dev preview page talks to the API through /preview/api so its
+      // rewritten calls never collide with the production /api path.
+      "/preview/api": {
+        target: "http://127.0.0.1:8000",
+        changeOrigin: false,
+      },
     },
   },
 }));

@@ -130,12 +130,27 @@ const ROUTES: Record<string, unknown> = {
     items: [
       {
         question_id: 900,
-        topic: "biology",
+        topic: "زیست‌شناسی",
         difficulty: "easy",
         question_text: "واحد ساختاری بدن چیست؟",
         options: ["سلول", "بافت", "عضو", "دستگاه"],
+        source: {
+          source_type: "textbook",
+          source_title: "Biology 2e",
+          source_author: "OpenStax",
+          source_institution: "Rice University",
+          source_url: "https://openstax.org/details/books/biology-2e",
+          source_year: "2018",
+          source_page_or_section: "Chapters on cells",
+          evidence_level: "textbook",
+          verified: "true",
+        },
+        verified: true,
+        explain: { affinity: 0.5, quality: 1, freshness: 0.9, discovery: 0.2, score: 0.7 },
       },
     ],
+    next_cursor: "next-page-token",
+    has_more: true,
   },
 };
 
@@ -159,12 +174,15 @@ function installFetch() {
           correct_index: 0,
           explanation: "سلول واحد ساختاری بدن است.",
           points_awarded: 10,
+          source: null,
+          verified: true,
         });
       }
       if (url === "/api/v1/explore/engagement") return Response.json({ recorded: true });
       return Response.json({ ok: true });
     }
-    const payload = ROUTES[url];
+    // Route table is keyed by path; the Explore feed adds a cursor/limit query.
+    const payload = ROUTES[url] ?? ROUTES[url.split("?")[0]];
     if (payload === undefined) {
       return Response.json({ error: `unmapped ${url}` }, { status: 404 });
     }

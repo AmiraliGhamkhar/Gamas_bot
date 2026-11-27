@@ -12,8 +12,14 @@ questions). This module owns everything about *putting it in the database*:
   are machine-made duplicates of ten facts, so they are demoted out of the feed
   (``status='rejected'``) rather than deleted: no impression, reward or audit row
   is touched, and an admin can restore one if they wish;
+* academic source metadata (migration 044): every inserted question carries the
+  real textbook / institutional source its fact comes from, and rows seeded
+  before 044 are backfilled from the catalog. Only NULL source columns are ever
+  filled - an existing value is never overwritten - so a curator's correction
+  survives every re-run;
 * validation, so a malformed bank fails the test suite and the CLI instead of
-  reaching production.
+  reaching production. A question without a real, safe, known-tier source is a
+  validation error, not a warning: unsourced trivia must not reach the feed.
 
 Nothing here resets a database, deletes a row, or touches a question that a user
 or an admin created (``created_by IS NOT NULL``).
@@ -31,6 +37,7 @@ from functools import lru_cache
 from typing import Any, Iterable
 
 from .explore_bank import BANK, TOPICS, SeedQuestion
+from .explore_sources import validate_catalog, validate_source
 
 #: Any pair of questions whose normalized token sets overlap at least this much
 #: is treated as a conceptual duplicate (Jaccard). The real bank stays far below
@@ -134,7 +141,7 @@ def _is_legacy_generated(text: str) -> bool:
 def validate_seed_bank(bank: Iterable[SeedQuestion] = BANK) -> list[str]:
     """Return every structural or uniqueness problem in *bank* (empty = valid)."""
     items = list(bank)
-    errors: list[str] = []
+    errors: list[str] = list(validate_catalog())
     if len(items) != 200:
         errors.append(f"expected 200 questions, found {len(items)}")
 
@@ -176,6 +183,12 @@ def validate_seed_bank(bank: Iterable[SeedQuestion] = BANK) -> list[str]:
         if not item.explanation.strip():
             errors.append(f"{where}: empty explanation")
 
+        source = item.source
+        if source is None:
+            errors.append(f"{where}: unknown academic source key {item.source_key!r}")
+        else:
+            errors.extend(validate_source(source))
+
     for index, first in enumerate(items):
         for second in items[index + 1:]:
             similarity = question_similarity(first.text, second.text)
@@ -193,6 +206,31 @@ def topic_distribution(bank: Iterable[SeedQuestion] = BANK) -> dict[str, int]:
     for item in bank:
         counts[item.topic] = counts.get(item.topic, 0) + 1
     return counts
+
+
+def source_columns(item: SeedQuestion, verified_at: str) -> tuple[str, ...]:
+    """The source metadata columns for *item*, in migration 044 order.
+
+    Raises ``ValueError`` when the question has no resolvable, valid source:
+    a question may not enter the feed with a missing or unsafe citation.
+    """
+    source = item.source
+    if source is None:
+        raise ValueError(f"{item.key}: unknown academic source {item.source_key!r}")
+    problems = validate_source(source)
+    if problems:
+        raise ValueError("; ".join(problems))
+    return (
+        source.source_type,
+        source.title,
+        source.author,
+        source.institution,
+        source.url,
+        source.year,
+        source.section,
+        source.evidence_level,
+        verified_at,
+    )
 
 
 async def seed_explore_questions(
@@ -218,6 +256,7 @@ async def seed_explore_questions(
         "skipped_existing": 0,
         "skipped_duplicate": 0,
         "retired_legacy": 0,
+        "sources_backfilled": 0,
         "dry_run": bool(dry_run),
         "topics": topic_distribution(),
     }
@@ -278,8 +317,13 @@ async def seed_explore_questions(
                 INSERT INTO explore_questions(
                     topic, difficulty, question_text, options_json,
                     correct_index, explanation, status, created_by, created_at,
-                    seed_key
-                ) VALUES (?, 'easy', ?, ?, ?, ?, 'approved', NULL, ?, ?)
+                    seed_key, source_type, source_title, source_author,
+                    source_institution, source_url, source_year,
+                    source_page_or_section, evidence_level, verified_at, updated_at
+                ) VALUES (
+                    ?, 'easy', ?, ?, ?, ?, 'approved', NULL, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 """,
                 (
                     item.topic,
@@ -289,11 +333,38 @@ async def seed_explore_questions(
                     item.explanation,
                     created,
                     item.key,
+                    *source_columns(item, created),
+                    created,
                 ),
             )
             existing_keys.add(item.key)
             existing_texts.add(normalized)
             report["inserted"] += 1
+        # Backfill: rows seeded before migration 044 have no source. Fill only
+        # the empty columns of curated (seed_key) rows, so a re-run repairs the
+        # archive without touching a question an admin or user authored.
+        for item in BANK:
+            cursor = await db.db.execute(
+                """
+                UPDATE explore_questions SET
+                    source_type = COALESCE(NULLIF(source_type, ''), ?),
+                    source_title = COALESCE(NULLIF(source_title, ''), ?),
+                    source_author = COALESCE(NULLIF(source_author, ''), ?),
+                    source_institution = COALESCE(NULLIF(source_institution, ''), ?),
+                    source_url = COALESCE(NULLIF(source_url, ''), ?),
+                    source_year = COALESCE(NULLIF(source_year, ''), ?),
+                    source_page_or_section = COALESCE(
+                        NULLIF(source_page_or_section, ''), ?),
+                    evidence_level = COALESCE(NULLIF(evidence_level, ''), ?),
+                    verified_at = COALESCE(NULLIF(verified_at, ''), ?),
+                    updated_at = ?
+                WHERE seed_key = ?
+                  AND (source_title IS NULL OR source_title = '')
+                """,
+                (*source_columns(item, created), created, item.key),
+            )
+            report["sources_backfilled"] += max(int(getattr(cursor, "rowcount", 0) or 0), 0)
+
         if dry_run:
             raise _DryRunRollback
         return report
@@ -312,6 +383,7 @@ def _format_report(report: dict[str, Any]) -> str:
         f"skipped (already seeded): {report['skipped_existing']}",
         f"skipped (duplicate text): {report['skipped_duplicate']}",
         f"retired legacy placeholders: {report['retired_legacy']}",
+        f"source metadata backfilled: {report['sources_backfilled']}",
         "topics:",
     ]
     for topic, count in report.get("topics", {}).items():

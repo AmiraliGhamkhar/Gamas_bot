@@ -10,6 +10,7 @@ from pathlib import Path
 
 from gamas_bot.db import Database
 from gamas_bot.explore_recommender import (
+    DEFAULT_PAGE_SIZE,
     classify_engagement,
     compute_topic_affinities,
 )
@@ -51,7 +52,12 @@ class ExploreAndRewardsTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(s.startswith("200"))
         data = json.loads(body)
-        self.assertEqual(len(data["items"]), 10)
+        # Default page is the continuous-feed page size (10-15 cards), and every
+        # page carries the cursor that continues the session.
+        self.assertEqual(len(data["items"]), DEFAULT_PAGE_SIZE)
+        self.assertTrue(10 <= DEFAULT_PAGE_SIZE <= 15)
+        self.assertIn("next_cursor", data)
+        self.assertIn("has_more", data)
         self.assertNotIn("total", data)
         self.assertNotIn("index", data["items"][0])
 

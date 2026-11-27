@@ -32,7 +32,10 @@ export type IconName =
   | "wallet"
   | "search"
   | "trash"
-  | "send";
+  | "send"
+  | "info"
+  | "chevron-up"
+  | "chevron-down";
 
 const PATHS: Record<IconName, JSX.Element> = {
   account: (
@@ -188,6 +191,15 @@ const PATHS: Record<IconName, JSX.Element> = {
       <path d="M7 7.5l.8 11a1.6 1.6 0 0 0 1.6 1.5h5.2a1.6 1.6 0 0 0 1.6-1.5l.8-11" />
     </>
   ),
+  info: (
+    <>
+      <circle cx="12" cy="12" r="8" />
+      <path d="M12 11v5.4" />
+      <circle cx="12" cy="8" r="0.6" fill="currentColor" stroke="none" />
+    </>
+  ),
+  "chevron-up": <path d="M6.5 14.5L12 9l5.5 5.5" />,
+  "chevron-down": <path d="M6.5 9.5L12 15l5.5-5.5" />,
   send: (
     <>
       <path d="M19.5 4.5L4.8 10.6l5.3 2.3 2.3 5.3z" />

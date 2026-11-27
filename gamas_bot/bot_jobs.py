@@ -2001,6 +2001,9 @@ class JobPipelineMixin:
             else "partial"
         )
         status_error = (notice + internal_notice).strip() or None
+        # The kind is absent for a fully successful job; the branches below
+        # assign a concrete string on every failure path.
+        status_kind: str | None
         if notice_kind and internal_notice_kind:
             status_kind = (
                 notice_kind
