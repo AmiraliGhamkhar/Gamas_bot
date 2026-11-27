@@ -47,6 +47,15 @@ function root(): TelegramWebApp | undefined {
 
 /** Raw initData, forwarded to the server on every authenticated call. */
 export function getInitData(): string {
+  // Dev preview only (`vite dev`, never a deployed build): the preview page
+  // passes a signed initData in the URL because there is no Telegram handshake
+  // in a plain browser. The server still verifies the HMAC, and `import.meta.env.DEV`
+  // is statically false in production, so a crafted URL can never override the
+  // real Telegram session.
+  if (import.meta.env.DEV && typeof window !== "undefined") {
+    const fromUrl = new URLSearchParams(window.location.search).get("initData");
+    if (fromUrl) return fromUrl;
+  }
   return root()?.initData ?? "";
 }
 
