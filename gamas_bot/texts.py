@@ -126,8 +126,6 @@ BTN_CHANNEL_JOIN: Final = "🔗 عضویت در کانال"
 BTN_CHANNEL_CHECK: Final = "✅ بررسی عضویت"
 
 # ----------------------------------------------------------------- start/menu
-MINI_APP_BUTTON: Final = "🚀 ورود به مینی‌اپ گاماس"
-
 
 def main_screen(
     *,
@@ -153,9 +151,10 @@ def main_screen(
     return f"{action}\n\nصوت، ویدیو، PDF، Word یا PowerPoint"
 
 
-#: What a retried legacy label gets: one line and the Mini App, nothing else.
+#: A retried legacy label points to the chat menu rather than an inline URL.
 MINI_APP_REDIRECT: Final = (
-    "حساب، اعتبار، اشتراک، پرداخت‌ها، کتابخانه و کاوش در مینی‌اپ گاماس است."
+    "برای دسترسی به حساب، اعتبار، اشتراک، پرداخت‌ها، کتابخانه و کاوش، "
+    "مینی‌اپ گاماس را از منوی ربات باز کنید."
 )
 
 

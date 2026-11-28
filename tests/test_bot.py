@@ -1551,13 +1551,9 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
         self._tmp.cleanup()
 
-    def test_the_menu_is_one_mini_app_button_and_the_admin_entry(self):
+    def test_the_only_menu_button_is_the_admin_entry(self):
         self.bot.settings = replace(self.settings, webapp_url="https://gamas.example")
-        user_rows = self.bot._user_menu(is_admin=False)
-        # Exactly one row with one URL button: the Mini App owns the account.
-        self.assertEqual(len(user_rows), 1)
-        self.assertEqual(len(user_rows[0]), 1)
-        self.assertEqual(user_rows[0][0].type.url, "https://gamas.example/app")
+        self.assertIsNone(self.bot._user_menu(is_admin=False))
         # The second navigation layer is gone, not hidden.
         self.assertFalse(hasattr(self.bot, "_more_menu"))
         self.assertFalse(hasattr(self.bot, "_reply_keyboard"))
@@ -1578,7 +1574,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
 
     def test_a_deployment_without_a_public_url_shows_no_menu_button(self):
         self.bot.settings = replace(self.settings, webapp_url="")
-        self.assertEqual(self.bot._user_menu(is_admin=False), [])
+        self.assertIsNone(self.bot._user_menu(is_admin=False))
 
     def test_admin_menu_is_its_own_panel_with_way_back(self):
         payloads = menu_payloads(self.bot._admin_menu())
@@ -1613,15 +1609,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertEqual(menu_payloads(buttons), {b"adm:home"})
-        self.assertEqual(
-            [
-                button.type.url
-                for row in buttons
-                for button in row
-                if getattr(button.type, "url", None)
-            ],
-            ["https://gamas.example/app"],
-        )
+        self.assertEqual([button.text for row in buttons for button in row], [texts.BTN_ADMIN])
 
     async def test_raw_only_learning_screens_do_not_offer_ai_generation(self):
         await self.db.ensure_user(self.user_id)
@@ -2295,6 +2283,7 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_is_one_short_message_and_no_keyboard(self):
         """/start asks for a file. There is no second navigation layer to learn."""
+        self.bot.settings = replace(self.bot.settings, webapp_url="https://gamas.example/")
         start = FakeMessageEvent(501, "/start")
         await self.bot._handle_message(start)
         self.assertEqual(len(start.replies), 1)
@@ -2310,16 +2299,7 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         sent = start.client.texts[0]
         # No reply keyboard is ever attached: the message box is the only input.
         self.assertNotIn("reply_markup", sent)
-        self.assertEqual(menu_payloads(sent.get("buttons")), set())
-
-    async def test_start_offers_the_mini_app_when_it_is_deployed(self):
-        self.bot.settings = replace(self.bot.settings, webapp_url="https://gamas.example/")
-        start = FakeMessageEvent(501, "/start")
-        await self.bot._handle_message(start)
-        rows = start.client.texts[0]["buttons"]
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][0].text, texts.MINI_APP_BUTTON)
-        self.assertEqual(rows[0][0].type.url, "https://gamas.example/app")
+        self.assertIsNone(sent["buttons"])
 
     async def test_media_upload_without_a_mode_tap_persists_booklet_outputs(self):
         """The file alone starts the pipeline and records both final formats."""
@@ -2687,15 +2667,7 @@ class RetiredKeyboardRoutingTests(BotPipelineTestCase):
             self.bot.client = event.client
             await self.bot._handle_message(event)
             self.assertEqual(event.replies, [texts.MINI_APP_REDIRECT], label)
-            self.assertEqual(
-                [
-                    b.type.url
-                    for row in event.client.texts[0]["buttons"]
-                    for b in row
-                ],
-                ["https://gamas.example/app"],
-                label,
-            )
+            self.assertIsNone(event.client.texts[0]["buttons"], label)
 
     async def test_account_labels_no_longer_open_the_bot_screens(self):
         event = FakeMessageEvent(USER_ID, texts.BTN_LIBRARY)
@@ -2865,9 +2837,9 @@ class ReviewSheetDeliveryTests(BotPipelineTestCase):
         self.assertEqual(inspect_review_html(html_text.encode("utf-8")).errors, ())
         self.assertTrue(str(review["filename"]).endswith(".html"))
         self.assertEqual(review["content_type"], "text/html")
-        results = [text for text in event.replies if texts.BOOKLET_READY in text]
-        self.assertTrue(results)
-        self.assertIn(texts.BOOKLET_REFERRAL_CTA, results[-1])
+        result = next(msg for msg in event.client.texts if texts.BOOKLET_REFERRAL_CTA in msg["text"])
+        self.assertIn(texts.BOOKLET_READY, result["text"])
+        self.assertIn(b"ref:result", menu_payloads(result["buttons"]))
 
     async def test_a_failing_review_renderer_keeps_pdf_and_docx_and_says_so(self):
         event, submission, _planner = await self._completed_job_with_review(

@@ -619,20 +619,12 @@ class GamasBot(
                     )
 
     # ----------------------------------------------------------------- menus
-    def _user_menu(self, *, is_admin: bool = False) -> list:
-        """Minimal primary menu: Mini App launch (if configured) and admin entry."""
-        rows: list[list] = []
-        webapp_url = getattr(self.settings, "webapp_url", "") or getattr(
-            self.settings, "public_url", ""
-        )
-        if webapp_url:
-            url = str(webapp_url).rstrip("/")
-            if not url.endswith("/app"):
-                url = f"{url}/app"
-            rows.append([Button.url(texts.MINI_APP_BUTTON, url)])
+    def _user_menu(self, *, is_admin: bool = False) -> list | None:
+        """Only admins get a panel button. The Mini App uses Telegram's chat menu."""
         if is_admin:
-            rows.append([Button.inline(texts.BTN_ADMIN, b"adm:home")])
-        return rows
+            return [[Button.inline(texts.BTN_ADMIN, b"adm:home")]]
+        # Telethon turns [] into an empty reply keyboard, not absent markup.
+        return None
 
     def _admin_menu(self) -> list:
         """The admin panel: three hubs, unrelated sections, and the way back."""
@@ -665,15 +657,12 @@ class GamasBot(
             office_enabled=self.settings.office_enabled,
             notes_configured=self.settings.note_configured,
         )
-        # One screen, one row: the Mini App (plus the admin panel for admins).
-        # No reply keyboard and no reply_markup: nothing in the bot competes
-        # with the message box for "send your file here".
         await self._edit_or_reply(
             event, text, self._user_menu(is_admin=self._is_admin(user_id))
         )
 
     async def _redirect_to_mini_app(self, event) -> None:
-        """Answer a retired navigation label: one line and the Mini App.
+        """Point retired navigation labels to the Mini App in Telegram's menu.
 
         Library, results, referrals, credits and subscription are owned by the
         Mini App. The bot keeps the inline screens reachable through their

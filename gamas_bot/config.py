@@ -698,11 +698,8 @@ class Settings:
     subscription_timeout_seconds: float = 20.0
     #: Bot API base URL (overridable for a mirror or an offline test).
     telegram_api_base_url: str = "https://api.telegram.org"
-    #: Public HTTPS base URL of this deployment (no trailing slash). The Mini
-    #: App is served from the same host at ``/app``, so the bot's only menu
-    #: button is ``{webapp_url}/app``. Empty means "not deployed behind a public
-    #: URL": the button is then omitted rather than pointing nowhere, and the
-    #: bot still works as a pure file interface.
+    #: Legacy deployment origin. Accepted for compatibility; the Mini App's
+    #: Telegram menu URL is set in BotFather, not in message keyboards.
     webapp_url: str = ""
     #: Bot username without ``@``. The Mini App builds its invite, share,
     #: support and purchase deep links from this instead of hardcoding a name

@@ -10,13 +10,12 @@ that path in backups.
 
 ## Public URL and the Mini App
 
-Two optional values connect the bot to the Mini App; both default to "not
-deployed", where the bot is a pure file interface and no button points at a
-dead URL.
+Configure the Mini App launcher in BotFather's **Menu Button** settings, not
+in the bot's inline keyboards.
 
 | Setting | Meaning |
 | --- | --- |
-| `WEBAPP_URL` | Bare origin of this deployment (for example `https://gamas.example`). The bot appends `/app` itself and strips a trailing slash; empty means no Mini App button. |
+| `WEBAPP_URL` | Legacy deployment origin, accepted for compatibility. Setting it does not add a button to bot messages. |
 | `BOT_USERNAME` | Bot username without the `@` (default `Gamas_bot`). The Mini App builds its invite, share, support and credit-purchase deep links from it. |
 
 The Mini App is served by the same Passenger application at `/app`, so its

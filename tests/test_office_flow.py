@@ -503,7 +503,7 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.capture.file_payloads, [])
 
     async def test_office_button_hidden_but_existing_callbacks_still_work(self):
-        for menu in (self.bot._user_menu(), self.bot._admin_menu()):
+        for menu in (self.bot._user_menu() or [], self.bot._admin_menu()):
             payloads = {
                 getattr(button.type, "data", None) for row in menu for button in row
             }
@@ -515,12 +515,7 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disabled_office_hides_menu_and_rejects_stale_callback(self):
         self.bot.settings = replace(self.settings, office_enabled=False)
-        payloads = {
-            button.type.data
-            for row in self.bot._user_menu()
-            for button in row
-        }
-        self.assertNotIn(b"office:start", payloads)
+        self.assertIsNone(self.bot._user_menu())
         callback = self.callback("office:start")
         await self.bot._handle_callback(callback)
         self.assertEqual(callback.answers[-1], ("آفیس رایگان در تنظیمات سرور غیرفعال است.", True))
