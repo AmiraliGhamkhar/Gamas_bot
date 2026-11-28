@@ -458,7 +458,9 @@ class JobsReportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(newest["success_rate"], 0.5)
         totals = report["totals"]
         self.assertEqual(totals["total"], 4)
-        self.assertEqual(totals["succeeded"], 3)
+        self.assertEqual(totals["succeeded"], 2)
+        self.assertEqual(totals["partial"], 1)
+        self.assertEqual(totals["delivered"], 3)
         self.assertEqual(totals["p50_duration_s"], 30)
         self.assertEqual(totals["p95_duration_s"], 50)
 
@@ -486,7 +488,9 @@ class JobsReportTests(unittest.IsolatedAsyncioTestCase):
         report = await fetch_daily_job_report(self.db, days=7)
         self.assertEqual(report["totals"]["total"], 3)
         self.assertEqual(report["totals"]["terminal"], 3)
-        self.assertEqual(report["totals"]["succeeded"], 2)
+        self.assertEqual(report["totals"]["succeeded"], 1)
+        self.assertEqual(report["totals"]["partial"], 1)
+        self.assertEqual(report["totals"]["delivered"], 2)
         self.assertEqual(report["days"][0]["day"], today)
 
 
