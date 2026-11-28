@@ -75,14 +75,12 @@ class StartScreenTests(BotPipelineTestCase):
         await self.bot._handle_message(again)
         self.assertEqual(first.replies, again.replies)
 
-    async def test_start_offers_the_mini_app_as_the_only_button(self):
+    async def test_start_has_no_launcher_even_when_the_mini_app_is_deployed(self):
         self.bot.settings = replace(self.bot.settings, webapp_url="https://gamas.example")
         start = FakeMessageEvent(USER_ID, "/start")
         await self.bot._handle_message(start)
 
-        buttons = start.client.texts[0]["buttons"]
-        self.assertEqual(button_urls(buttons), ["https://gamas.example/app"])
-        self.assertEqual(menu_payloads(buttons), set())
+        self.assertIsNone(start.client.texts[0]["buttons"])
         # No reply keyboard is attached: nothing competes with the message box.
         self.assertNotIn("reply_markup", start.client.texts[0])
 
@@ -93,7 +91,7 @@ class StartScreenTests(BotPipelineTestCase):
 
         buttons = start.client.texts[0]["buttons"]
         self.assertEqual(menu_payloads(buttons), {b"adm:home"})
-        self.assertEqual(button_urls(buttons), ["https://gamas.example/app"])
+        self.assertEqual(button_urls(buttons), [])
 
     async def test_start_without_a_public_url_shows_no_menu_button(self):
         self.bot.settings = replace(self.bot.settings, webapp_url="")
@@ -101,14 +99,12 @@ class StartScreenTests(BotPipelineTestCase):
         await self.bot._handle_message(start)
         self.assertFalse(start.client.texts[0].get("buttons"))
 
-    async def test_a_bare_message_repeats_the_request_and_the_app_button(self):
+    async def test_a_bare_message_repeats_the_request_without_a_keyboard(self):
         self.bot.settings = replace(self.bot.settings, webapp_url="https://gamas.example")
         event = FakeMessageEvent(USER_ID, "سلام")
         await self.bot._handle_message(event)
         self.assertEqual(event.replies, [texts.UPLOAD_HINT])
-        self.assertEqual(
-            button_urls(event.client.texts[0]["buttons"]), ["https://gamas.example/app"]
-        )
+        self.assertIsNone(event.client.texts[0]["buttons"])
 
 
 class FileSubmissionTests(BotPipelineTestCase):
@@ -206,7 +202,7 @@ class FileSubmissionTests(BotPipelineTestCase):
 class DeliveryContractTests(BotPipelineTestCase):
     """What the finished file offers: transcript, PDF, Word, 20 questions."""
 
-    def test_the_completed_message_offers_exactly_the_student_outputs(self):
+    def test_the_booklet_keyboard_offers_downloads_quiz_and_invite(self):
         markup = delivery_markup(
             reference="GMS-1",
             speakers=1,
@@ -225,8 +221,11 @@ class DeliveryContractTests(BotPipelineTestCase):
         labels = [button.text for row in markup for button in row]
         self.assertIn(texts.BTN_QUIZ_FROM_BOOKLET, labels)
         self.assertIn("۲۰", texts.BTN_QUIZ_FROM_BOOKLET)
-        # No account navigation and no second menu on a finished file.
-        self.assertNotIn(b"ref:result", payloads)
+        self.assertEqual(
+            [button.type.data for row in markup for button in row if button.text == texts.BTN_REFERRALS],
+            [b"ref:result"],
+        )
+        self.assertEqual(button_urls(markup), [])
         self.assertNotIn(b"menu:main", payloads)
 
     def test_the_completed_message_hides_artifacts_that_do_not_exist(self):
@@ -290,7 +289,7 @@ class DeliveryContractTests(BotPipelineTestCase):
         )
         delivery = "\n".join(event.replies)
         self.assertIn(texts.DELIVERY_READY_HEADER.split("{")[0], delivery)
-        # Every button in the completion screen points at a persisted artifact.
+        # A transcript-only result has no booklet invitation.
         buttons = menu_payloads(event.client.texts[-1].get("buttons"))
         self.assertTrue(buttons, delivery)
         for data in buttons:

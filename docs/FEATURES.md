@@ -62,7 +62,9 @@ links without rewriting the factual body. See
   Recovered, unverified, or too-thin booklets do not get a review sheet.
   Downloading it is free and never re-renders the file.
 - Nothing is pushed automatically: the final message lists what was produced and
-  offers one button per artifact. Re-downloading is free and never re-renders.
+  offers one button per artifact. When a PDF or Word booklet is available,
+  «🤝 دعوت دوستان» opens the invite screen without replacing the downloads.
+  Re-downloading is free and never re-renders.
 - Quality gates (`NOTE_STRICT_GROUNDING`, `NOTE_QUALITY_GATE`,
   `NOTE_COMPLETENESS_FILL`) repair and re-audit claims, remove unsupported local
   spans (whole high-risk medical clauses when needed), and use a deterministic

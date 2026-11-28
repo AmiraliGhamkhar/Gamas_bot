@@ -182,20 +182,18 @@ def delivery_markup(
     * 🌐 دریافت جزوه مرور تعاملی HTML  (when the review sheet is available)
     * 🧪 ۲۰ سؤال نمونه  (opens the quiz start screen; the size and its price are
       confirmed there, nothing is spent by this tap)
+    * 🤝 دعوت دوستان  (when a PDF or Word booklet is available; opens a new
+      message so the download buttons stay in place)
 
-    There is no referral or "back to menu" row: the completed file is the whole
-    screen, and account navigation belongs to the Mini App.
-
-    Nothing appears here unless it really exists: ``kinds`` comes from the
-    central submission artifact registry. Every button retrieves a persisted
-    artifact and is free/idempotent — no button triggers transcription or
-    booklet regeneration.
+    Artifact buttons only retrieve persisted outputs; no button triggers
+    transcription or booklet regeneration.
     """
     from telethon import Button
 
     rows: list[list[Any]] = []
     # PDF is the primary student deliverable; it gets its own row.
-    if has_booklet and KIND_BOOKLET in kinds:
+    has_pdf = has_booklet and KIND_BOOKLET in kinds
+    if has_pdf:
         rows.append(
             [Button.inline(texts.BTN_GET_BOOKLET, callback_for(reference, KIND_BOOKLET))]
         )
@@ -245,4 +243,6 @@ def delivery_markup(
         )
     if learning:
         rows.append(learning)
+    if has_pdf or KIND_DOCX in kinds:
+        rows.append([Button.inline(texts.BTN_REFERRALS, b"ref:result")])
     return rows

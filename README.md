@@ -75,10 +75,11 @@ or deployment compatibility is implied by offline tests. See
 ## Features
 
 The bot asks for a file and nothing else: `/start` is one line, sending a
-supported file starts the pipeline, and the completion screen offers only what
-that file produced. Account screens (credit, subscription, payments, referrals,
-library, review, explore) live in the Mini App, which is the one button on that
-screen; `/buy` and `/support` reach the two things the Mini App cannot do.
+supported file starts the pipeline, and the completion screen offers the outputs.
+When a PDF or Word booklet is ready, «🤝 دعوت دوستان» opens the student's invite
+link in a separate message. Account screens are in the Mini App, available from
+Telegram's chat menu rather than an inline button; `/buy` and `/support` still
+work in the bot.
 
 | Input | Result |
 | --- | --- |

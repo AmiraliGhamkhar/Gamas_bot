@@ -4,6 +4,11 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Booklet delivery buttons.** PDF and Word booklet results now include
+«🤝 دعوت دوستان». It opens the referral screen in a separate message, leaving
+the downloads in place. Bot messages no longer include a Mini App launch button;
+Telegram's menu button configured in BotFather is unchanged.
+
 **Booklet request efficiency is measured, and the optional editor is now
 conditional.** Every booklet job emits one failure-safe telemetry line with
 source/unit sizes, per-stage LLM request and retry counts, provider token usage

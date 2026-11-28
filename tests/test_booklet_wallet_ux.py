@@ -25,24 +25,21 @@ class RoundingTests(unittest.TestCase):
             self.assertEqual(round_display_credits(original), displayed)
         self.assertEqual(seconds_to_credits(10 * 3600), 333_334)
 
-    def test_the_delivery_keyboard_is_only_artifacts_and_the_quiz(self):
-        """No referral or menu row: a finished file is the whole screen."""
-        for kinds, has_booklet in [
+    def test_only_pdf_or_word_deliveries_include_an_invite(self):
+        for kinds, expect_invite in [
             ({KIND_BOOKLET, KIND_TRANSCRIPT}, True),
-            ({KIND_DOCX, KIND_TRANSCRIPT}, False),
+            ({KIND_DOCX, KIND_TRANSCRIPT}, True),
+            ({KIND_BOOKLET, KIND_DOCX}, True),
             ({KIND_TRANSCRIPT}, False),
         ]:
-            rows = delivery_markup(reference="GMS-1", speakers=0,
-                                   has_booklet=has_booklet, kinds=kinds)
-            data = payloads(rows)
-            self.assertNotIn(b"ref:result", data)
-            self.assertNotIn(b"menu:main", data)
-            self.assertTrue(
-                all(value.startswith(b"art:") or value.startswith(b"quiz:") for value in data),
-                data,
-            )
-            if has_booklet:
-                self.assertTrue(any(value.startswith(b"art:") for value in data))
+            with self.subTest(kinds=kinds):
+                rows = delivery_markup(
+                    reference="GMS-1", speakers=0, has_booklet=KIND_BOOKLET in kinds, kinds=kinds,
+                )
+                expected = [f"art:GMS-1:{kind}".encode("ascii") for kind in kinds]
+                if expect_invite:
+                    expected.append(b"ref:result")
+                self.assertCountEqual(payloads(rows), expected)
 
 
 class WalletPresentationTests(unittest.IsolatedAsyncioTestCase):

@@ -52,7 +52,6 @@ Configure these in `/home/USER/gamas_bot/.env` (never in `public_html`):
 | `TELEGRAM_API_HASH` | yes | Telegram API hash for the bot client. |
 | `ADMIN_IDS` | yes | Comma-separated numeric Telegram admin IDs. |
 | `BOT_USERNAME` | recommended | Bot username without `@` (default `Gamas_bot`). Mini App builds invite/support/purchase links from it. |
-| `WEBAPP_URL` | recommended | Public HTTPS origin, e.g. `https://gamasrobot.ir`. The bot appends `/app` for the menu button. Leave empty only if the Mini App is not deployed. |
 | `SUBSCRIPTION_CHANNEL` | as configured | Mandatory channel (`@gamas_AI` or numeric id). |
 | `SUBSCRIPTION_REQUIRED` | as configured | `true` to enforce membership gate. |
 
@@ -135,15 +134,13 @@ the cPanel Restart button is the supported path.
 2. **Bot Settings** → **Menu Button** (or **Configure Mini App** / **Main Mini App** depending on BotFather UI).
 3. Set Menu Button URL to: `https://gamasrobot.ir/app/`
 4. If configuring a Main Mini App, use the same URL.
-5. Ensure `WEBAPP_URL=https://gamasrobot.ir` is set in `.env` so the bot’s
-   `/start` button also opens the Mini App.
 
 ## 9. Smoke test checklist
 
 1. `GET /api/v1/health` returns HTTP 200 and `{"status":"ok"}`.
 2. `GET /app/` loads the Mini App in a browser and Telegram WebView.
-3. Open the bot in Telegram, send `/start`, press the Gamas button; app opens on
-   **مرور**.
+3. In the bot chat, open the Mini App from the Telegram menu button configured
+   above (not from the `/start` message). The app opens on **مرور**.
 4. **حساب من** shows identity/balance; «کیف پول» shows plans/rewards/payments/referrals.
 5. **کتابخانه** lists Study Packs and downloads an asset.
 6. **مرور** groups questions by Study Pack and records answers.
